@@ -2,6 +2,7 @@
 LISTEN_QUEUE_LENGTH :: 10;
 
 HTTP_EOL :: "\r\n";
+WHITESPACE :: " \t";
 
 Accept_Handler_Entry :: struct {
     socket:       Socket;
@@ -83,25 +84,170 @@ Request_Header :: struct {
     value: string;
 }
 
-Request_Verb :: enum u8 {
+Request_Method :: enum u8 {
     GET;
     POST;
-    HEAD;
     PUT;
+    PATCH;
+    DELETE;
+    HEAD;
+    OPTIONS;
+    CONNECT;
+    TRACE;
 };
 
-Request :: struct {
-    socket:      Socket;
-    verb:        Request_Verb;
-    target_raw:  []string;
-    version_raw: []string;
-    header_raw:  []u8;
-    body_offset: u32;
-    headers:     []Request_Header;
+Method_Map :: struct {
+    name: string;
+    method: Request_Method;
 }
+
+generate_method_map :: () -> string {
+    method_map_ti := cast(*Type_Info_Enum) type_info(Request_Method);
+    builder: String_Builder;
+
+    print_to_builder(*builder, "Method_Map.[\n");
+    for method_map_ti.values {
+        name := method_map_ti.names[it_index]; 
+        print_to_builder(*builder, "{ \"%\", .% },\n", name, name);
+    }
+    print_to_builder(*builder, "];");
+
+    result := builder_to_string(*builder);
+
+    return result;
+}
+
+method_map :: #insert #run generate_method_map();
+
+Request :: struct {
+    socket:           Socket;
+    data_raw:         []u8;
+    request_line_raw: []u8;
+    header_raw:       []u8;
+    body_begin_raw:   []u8; 
+    body_offset:      s64;
+    method:           Request_Method;
+    method_raw:       string;
+    path_raw:         string;
+    version_raw:      string;
+    headers:          []Request_Header;
+}
+
+Advance_Result :: enum u8 {
+    OK;
+    EOL;
+    EOB;
+};
+
 
 Response :: struct {
     
+}
+
+advance_array :: inline (array: [] u8, bytes: s64) -> result: [] u8 {
+    assert(array.count >= bytes);
+
+    result := array;
+    result.data  += bytes;
+    result.count -= bytes;
+
+    return result;
+}
+
+
+is_eol :: inline (array: [] u8) -> (ok: bool, result: [] u8) {
+    if array.count < 2 return false, array;
+    if array[0] == #char "\r" && array[1] == #char "\n" return true, advance_array(array, 2);
+    return false, array;
+}
+
+is_eol_at :: inline (array: [] u8, at: s64) -> bool {
+    if (array.count - at) < 2 return false;
+    if array[at] == #char "\r" && array[at+1] == #char "\n" return true;
+    return false;
+}
+
+advance_past_whitespace :: (buffer: []u8) -> (capture: string, result: Advance_Result, remaining: []u8) {
+    cursor := 0;
+    remaining := buffer;
+    while cursor < buffer.count {
+        if is_any(buffer[cursor], WHITESPACE) {
+            cursor += 1;
+            continue;
+        };
+        remaining = advance_array(buffer,cursor);
+        iseol, rem := is_eol(remaining);
+        if iseol return "", .EOL, rem;
+        break;
+    }
+    if remaining.count == 0 return "", .EOB, remaining;
+    cursor = 0;
+    capture := cast(string) remaining;
+    while cursor < remaining.count {
+        if is_any(remaining[cursor], WHITESPACE) {
+            capture.count = cursor;
+            return capture, .OK, advance_array(remaining, cursor);
+        };
+        if is_eol_at(remaining, cursor) {
+            capture.count = cursor;
+            return capture, .EOL, advance_array(remaining, cursor+HTTP_EOL.count);
+        }
+        cursor += 1;
+    }
+    capture.count = cursor;
+    return capture, .EOB, advance_array(remaining, cursor);
+}
+
+parse_request_line :: (buffer: []u8, request: *Request) -> (ok: bool, remaining: []u8) {
+    method: string;
+    path: string;
+    version: string;
+    res: Advance_Result;
+    nb: []u8;
+    method, res, nb = advance_past_whitespace(buffer);
+    if res != .OK {
+        log_error("Could not parse method");
+        return false, buffer;
+    }
+    request.request_line_raw = buffer;
+    for method_map {
+        if it.name == method {
+            request.method_raw = method;
+            request.method = it.method;
+            break;
+        }
+    }
+    if request.method_raw.count == 0 {
+        log_error("Could not decode method");
+        return false, buffer;
+    }
+    path, res, nb = advance_past_whitespace(nb);
+    if res != .OK {
+        log_error("Could not parse path");
+        return false, buffer;
+    }
+    request.path_raw = path;
+    version, res, nb = advance_past_whitespace(nb);
+    if res != .EOL {
+        log_error("Could not parse version");
+        return false, buffer;
+    }
+    request.version_raw = version;
+    request.request_line_raw.count = cast(s64)(nb.data) - cast(s64)(buffer.data) - HTTP_EOL.count;
+    return true, nb;
+}
+
+parse_request_from_buffer :: (buffer: []u8, request: *Request) -> (ok: bool) {
+    return false;
+}
+
+parse_request :: (max_header_size: int ,accept_data: *Accept_Handler_Entry, request: *Request) -> (ok: bool) {
+    request.data_raw.data = alloc(max_header_size);
+    request.data_raw.count = max_header_size;
+    memset(request.data_raw.data, 0, max_header_size);
+    actually_read := read(accept_data.socket, request.data_raw.data, xx request.data_raw.count);
+    print("data: %\n", cast(string) request.data_raw);
+    return false;
 }
 
 default_handler :: (server: *Server, accept_data: *Accept_Handler_Entry, data: *void) {
@@ -109,6 +255,8 @@ default_handler :: (server: *Server, accept_data: *Accept_Handler_Entry, data: *
     log("handler called with %", accept_data);
     if accept_data.socket == 0
       log("WTF: %", accept_data.socket);
+    request: Request;
+    parse_request(handler_data.max_header_size, accept_data, *request);
     close_and_reset(*accept_data.socket);
 }
 
@@ -135,13 +283,14 @@ init_server :: (using server: *Server, backlog_size: u32 = 256, thread_count: s1
         server := cast(*Server) thread.data;
         handler := server.handler_proc;
         handler_data := server.handler_data;
-
+        
         raw_request: Accept_Handler_Entry = ---;
         ok: bool = ---;
         while (1) {
             raw_request, ok = try_consume(server);
             if !ok continue;
-            handler(server, *raw_request, handler_data);
+            handler(server, *raw_request, handler_data,, allocator=temp);
+            reset_temporary_storage();
         }
         return 0;
     }
@@ -209,3 +358,5 @@ listen :: (using server: *Server, address: string, port: u16) -> bool {
 #import "Machine_X64";
 #import "Atomics";
 #import "Basic";
+#import "String";
+#import "POSIX";
