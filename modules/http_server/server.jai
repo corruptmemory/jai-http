@@ -4,118 +4,92 @@ LISTEN_QUEUE_LENGTH :: 10;
 HTTP_EOL :: "\r\n";
 WHITESPACE :: " \t";
 
+Channel :: struct(T: Type) {
+    data_to_free: *void;
+    items:        [] T;
+    head:         int;
+    tail:         int;
+    lock:         Mutex;
+    read_cond:    Condition_Variable;
+    write_cond:   Condition_Variable;
+    closed:       bool;
+}
+
+destroy :: (using channel: *Channel($T)) {
+    assert(data_to_free != null);
+    free(data_to_free);
+    data_to_free = null;
+    destroy(*lock);
+    destroy(*read_cond);
+    destroy(*write_cond);
+}
+
+init :: (using channel: *Channel($T), count: int) {
+    assert(count > 0);
+    items, data_to_free = Basic.NewArray(count, T, true);
+    init(*lock);
+    init(*read_cond);
+    init(*write_cond);
+}
+
+send :: (channel: *Channel($T), item: T) {
+    defer unlock(*channel.lock);
+    defer wake(*channel.read_cond);
+    lock(*channel.lock);
+
+    if channel.closed return;
+    while channel.tail-channel.head == channel.items.count {
+        wait(*channel.write_cond, *channel.lock);        
+    }
+    channel.items[channel.tail % channel.items.count] = item;
+    channel.tail += 1;
+}
+
+receive :: (channel: *Channel($T)) -> T {
+    defer unlock(*channel.lock);
+    defer wake(*channel.write_cond);
+    lock(*channel.lock);
+
+    if channel.closed return .{};    
+    while channel.head == channel.tail {
+        wait(*channel.read_cond, *channel.lock);        
+    }
+    item := channel.items[channel.head];
+    channel.head += 1;
+    if channel.head >= channel.items.count {
+        channel.head -= channel.items.count;
+        channel.tail -= channel.items.count;
+    }
+    return item;
+}
+
 Accept_Handler_Entry :: struct {
     socket:       Socket;
     remote:       sockaddr_in;
 }
 
-Slot_State :: enum u8 {
-    AVAILABLE    :: 0;
-    READY        :: 1;
-    LOCKED       :: 2;
-}
-
-Accept_Handler_Entry_Padded :: struct {
-    using base:     Accept_Handler_Entry;
-    state:          Slot_State #align CACHE_LINE_SIZE;    
-    BASE_SIZE    :: size_of(type_of(base));
-    PADDING_SIZE :: #run Basic.align_forward(BASE_SIZE, CACHE_LINE_SIZE) - BASE_SIZE;
-        
-    padding: [PADDING_SIZE] u8;
-}
-
 Accept_Handler :: #type (server: *Server, handler_data: *Accept_Handler_Entry, data: *void);
 
 Server :: struct {
+    allocator:                   Allocator;
     listen_socket:               Socket;
     handler_data:                *void;
     handler_proc:                Accept_Handler;
-    allocator:                   Allocator;
     listening_thread:            Thread;
     threads:                     [] Thread;
     threads_data_to_free:        *void;
-    accept_handler_data_to_free: *void;
-    mask:                        u64 #align CACHE_LINE_SIZE;
-    running:                     int #align CACHE_LINE_SIZE;
-    last_written_index:          s64 #align CACHE_LINE_SIZE;
-    entries:                     [] Accept_Handler_Entry_Padded #align CACHE_LINE_SIZE;
+    channel:                     Channel(Accept_Handler_Entry);
 }
 
-Backoff :: struct {
-    spin_iters  : u32;
-    yield_iters : u32;
-    base_ns     : u64;
-    max_ns      : u64;
-
-    failures    : u32;
-    phase       : u32;
-    prng        : u64;
-}
-
-backoff_reset :: (b: *Backoff) {
-    b.failures = 0;
-    b.phase    = 0;
-}
-
-backoff_wait :: (b: *Backoff) {
-    if (b.phase < b.spin_iters) {
-        b.phase += 1;
-        pause();
-        return;
-    }
-    if (b.phase < b.spin_iters + b.yield_iters) {
-        b.phase += 1;
-        sched_yield();
-        return;
-    }
-
-    k := b.failures;
-    if k > 30 k = 30;
-
-    delay := b.base_ns << k;
-    if delay > b.max_ns delay = b.max_ns;
-
-    req: timespec;
-    req.tv_sec = 0;
-    req.tv_nsec = xx delay;
-    nanosleep(*req, null);
-    b.failures += 1;
-}
-
-is_power_of_2 :: (n: u32) -> bool {
-    return n && !(n & (n - 1));
-}
-
-try_add_work :: (s: *Server, socket: Socket, remote: sockaddr_in) -> bool {
-    last_written_index := atomic_read(*s.last_written_index);
-
-    for < 0..s.entries.count-1 {
-        index := (last_written_index+it) & xx s.mask;
-        state := atomic_read(*s.entries[index].state);
-        if state != .AVAILABLE continue;
-        s.entries[index].base = .{
+add_work :: (s: *Server, socket: Socket, remote: sockaddr_in) {
+    send(*s.channel, .{
             socket = socket,
             remote = remote
-        };
-        atomic_write(*s.entries[index].state, .READY);
-        atomic_write(*s.last_written_index, index);
-        return true;
-    }
-    return false;
+        });
 }
 
-try_consume :: (s: *Server) -> (result: Accept_Handler_Entry, ok: bool) {
-    last_written_index := atomic_read(*s.last_written_index);
-
-    for 0..s.entries.count-1 {
-        index := (last_written_index+it) & xx s.mask;
-        if compare_and_swap(*s.entries[index].state, .READY, .LOCKED) {
-            result := s.entries[index].base;
-            atomic_write(*s.entries[index].state, .AVAILABLE);
-            return result, true;
-        }
-    }
-    return .{}, false;
+consume :: (s: *Server) -> Accept_Handler_Entry {
+    return receive(*s.channel);
 }
 
 Default_Handler_Data :: struct {
@@ -337,39 +311,21 @@ init_server :: (using server: *Server, backlog_size: u32 = 256, thread_count: s1
     if thread_count <= 0 {
         thread_count = cast(s16) get_number_of_processors(type=.ALL_PHYSICAL) - 1;
     }
-    assert(is_power_of_2(backlog_size));
     Basic.remember_allocators(server);
-    entries, accept_handler_data_to_free = Basic.NewArray(backlog_size, Accept_Handler_Entry_Padded, true, alignment=CACHE_LINE_SIZE,, server.allocator);
+    init(*channel, backlog_size);
     threads, threads_data_to_free = Basic.NewArray(thread_count, Thread, true, alignment=CACHE_LINE_SIZE,, server.allocator);
     handler_data = in_handler_data;
     handler_proc = in_handler_proc;
-    assert((cast(u64) *last_written_index) % cast(u64) CACHE_LINE_SIZE == 0);
-    assert((cast(u64) *mask) % cast(u64) CACHE_LINE_SIZE == 0);
-    mask = backlog_size - 1;
-    atomic_write(*last_written_index, 0);
-    atomic_write(*running, 0);
 
     thread_proc :: (thread: *Thread) -> s64 {
         server := cast(*Server) thread.data;
         handler := server.handler_proc;
         handler_data := server.handler_data;
-        backoff := Backoff.{
-            spin_iters  = 100,
-            yield_iters = 1000,
-            base_ns     = 10,
-            max_ns      = 10000000,
-        };
 
         raw_request: Accept_Handler_Entry = ---;
         ok: bool = ---;
-        backoff_reset(*backoff);
         while (1) {
-            raw_request, ok = try_consume(server);
-            if !ok {
-                backoff_wait(*backoff);
-                continue;
-            }
-            backoff_reset(*backoff);
+            raw_request = consume(server);
             handler(server, *raw_request, handler_data,, allocator=temp);
             reset_temporary_storage();
         }
@@ -404,12 +360,6 @@ listen :: (using server: *Server, address: string, port: u16) -> bool {
     }
     listen_socket = s;
     listen_proc :: (thread: *Thread) -> s64 {
-        backoff := Backoff.{
-            spin_iters  = 100,
-            yield_iters = 1000,
-            base_ns     = 10,
-            max_ns      = 10000000,
-        };
         server := cast(*Server) thread.data;
         defer close_and_reset(*server.listen_socket);
         if listen(server.listen_socket, LISTEN_QUEUE_LENGTH) < 0 {
@@ -425,10 +375,7 @@ listen :: (using server: *Server, address: string, port: u16) -> bool {
                 continue;
             }
             // log("accepted!");
-            backoff_reset(*backoff);
-            while !try_add_work(server, accept_socket, in_addr) {
-                backoff_wait(*backoff);
-            }
+            add_work(server, accept_socket, in_addr);
         }
         return 0;
     }
