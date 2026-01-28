@@ -1,8 +1,8 @@
 
-LISTEN_QUEUE_LENGTH :: 10;
-
 HTTP_EOL :: "\r\n";
 WHITESPACE :: " \t";
+MAX_EVENTS :: 1024;
+LISTEN_QUEUE_LENGTH :: 1024;
 
 Channel :: struct(T: Type) {
     data_to_free: *void;
@@ -72,6 +72,7 @@ Accept_Handler :: #type (server: *Server, handler_data: *Accept_Handler_Entry, d
 
 Server :: struct {
     allocator:                   Allocator;
+    epoll_fd:                    s32;
     listen_socket:               Socket;
     handler_data:                *void;
     handler_proc:                Accept_Handler;
@@ -260,28 +261,41 @@ parse_request_from_buffer :: (buffer: []u8, request: *Request) -> (ok: bool) {
     return false;
 }
 
+drain :: (socket: Socket, target: []u8) -> bool {
+    current := target;
+    while true {
+        count := read(socket, current.data, xx current.count);
+        if count == -1 {
+            if (get_last_socket_error() != EAGAIN) {
+                return false;
+            }
+            break;
+        } else if (count == 0) {
+            return false;
+        }
+        current = advance_array(current, count);
+    }
+    return true;
+}
+
 parse_request :: (max_header_size: int ,accept_data: *Accept_Handler_Entry, request: *Request) -> (ok: bool) {
     request.data_raw = Basic.NewArray(max_header_size, u8, true);
-    actually_read := read(accept_data.socket, request.data_raw.data, xx request.data_raw.count);
+    ok := drain(accept_data.socket, request.data_raw);
+    if !ok return false;
     // print("data: %\n", cast(string) request.data_raw);
-    return false;
+    return true;
 }
 
 response :: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, World!";
 
 send_hello_world :: (client_fd: s32) -> bool {
-    // 1. Define the response with explicit CRLF (\r\n)
-    // The Content-Length is 13 ("Hello, World!" is 13 characters)
-
     remaining := response.count;
     offset    := 0;
 
-    // 2. Loop until all bytes are sent (Handling partial writes)
     while remaining > 0 {
         bytes_sent := write(client_fd, response.data + offset, xx remaining);
 
         if bytes_sent < 0 {
-            // Handle error (e.g., connection reset or interrupted)
             error_code := errno();
             if error_code == EINTR continue; // Interrupted by signal, try again
             
@@ -301,9 +315,18 @@ default_handler :: (server: *Server, accept_data: *Accept_Handler_Entry, data: *
     if accept_data.socket == 0
       log("WTF: %", accept_data.socket);
     request: Request;
-    parse_request(handler_data.max_header_size, accept_data, *request);
+    ok := parse_request(handler_data.max_header_size, accept_data, *request);
+    // log("%\n", cast(string)request.data_raw);
     send_hello_world(accept_data.socket);
-    close_and_reset(*accept_data.socket);
+    if ok {
+        ev := epoll_event.{
+            events = EPOLLIN | EPOLLET | EPOLLRDHUP,
+            data.fd = accept_data.socket,
+        };
+        epoll_ctl(server.epoll_fd, Epoll_Ctl.ADD, accept_data.socket, *ev);        
+    } else {
+        close_and_reset(*accept_data.socket);    
+    }
 }
 
 
@@ -339,43 +362,120 @@ init_server :: (using server: *Server, backlog_size: u32 = 256, thread_count: s1
     
 }
 
+Accept_Address :: struct {
+    conn_fd: s32;
+    addr: sockaddr_in;
+}
+
+push_accept_address :: (store: []Accept_Address, conn_fd: s32, addr: sockaddr_in) {
+    for * store {
+        if it.conn_fd == 0 {
+            it.conn_fd = conn_fd;
+            it.addr = addr;
+            return;
+        }
+    }
+    log_error("error: could not record accept address");
+    exit(-1);
+}
+
+pop_accept_address :: (store: []Accept_Address, conn_fd: s32) -> sockaddr_in {
+    for * store {
+        if it.conn_fd == conn_fd {
+            it.conn_fd = 0;
+            return it.addr;
+        }
+    }
+    log_error("error: could not find record address");
+    exit(-1);
+    return .{};
+}
+
 
 listen :: (using server: *Server, address: string, port: u16) -> bool {
-    s := socket(AF_INET, .SOCK_STREAM, 0);
+    epoll_fd = epoll_create1(0);
+    if epoll_fd == -1 {
+        log_error("error creating epoll fd\n");
+        return false;
+    }
+    s := socket(AF_INET, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, 0);
     if s == 0 {
-        log("error getting socket: %", get_error_string(get_last_socket_error()));
+        log_error("error getting socket: %\n", get_error_string(get_last_socket_error()));
         close_and_reset(*s);
         return false;
     }
     opt := cast(s32)1;
     if setsockopt(s, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, xx *opt, size_of(type_of(opt))) < 0 {
-        log("error setting socket options: %", get_error_string(get_last_socket_error()));
+        log_error("error setting socket options: %\n", get_error_string(get_last_socket_error()));
         close_and_reset(*s);
         return false;
     }
     if bind(s, address, port) < 0 {
-        log("error binding socket: %", get_error_string(get_last_socket_error()));
+        log_error("error binding socket: %\n", get_error_string(get_last_socket_error()));
         close_and_reset(*s);
         return false;
     }
+    ev := epoll_event.{
+        events = EPOLLIN | EPOLLET,
+        data.fd   = s, 
+    };
     listen_socket = s;
+    if epoll_ctl(epoll_fd, Epoll_Ctl.ADD, s, *ev) {
+        log_error("error adding listen socket to epoll fd\n");
+        close_and_reset(*s);
+        return false;
+    };
     listen_proc :: (thread: *Thread) -> s64 {
         server := cast(*Server) thread.data;
+        defer close_and_reset(*server.epoll_fd);
         defer close_and_reset(*server.listen_socket);
+        defer log("listen proc exiting\n");
+        events: [MAX_EVENTS]epoll_event;
+        accepted_addresses: []Accept_Address;
+        accepted_addresses_data_to_free: *void;
+        accepted_addresses, accepted_addresses_data_to_free = Basic.NewArray(4096, Accept_Address, true);
+        defer free(accepted_addresses_data_to_free);
+        // log("listening...\n");
         if listen(server.listen_socket, LISTEN_QUEUE_LENGTH) < 0 {
-            log("error binding socket: %", get_error_string(get_last_socket_error()));
+            log_error("error binding socket: %\n", get_error_string(get_last_socket_error()));
             return -1;
         }
-        log("listening...");
-        while (1) {
-            // log("waiting to accept...");
-            accept_socket, in_addr := accept(server.listen_socket);
-            if accept_socket < 0 {
-                log("error accepting connection: %", get_error_string(get_last_socket_error()));
+
+        ev: epoll_event;
+        
+        while true {
+            // log("beginning epoll_wait\n");
+            nfds := epoll_wait(server.epoll_fd, events.data, MAX_EVENTS, -1);
+            // log("got something: %\n", nfds);
+            if nfds < 0 {
+                log_error("failure to get epoll events\n");
                 continue;
+//                return -1;
             }
-            // log("accepted!");
-            add_work(server, accept_socket, in_addr);
+            for i: 0..nfds-1 {
+                if events[i].data.fd == server.listen_socket {
+                    // log("listen socket\n");
+                    while true {
+                        addr: sockaddr_in;
+                        addrlen: u32 = size_of(sockaddr_in);
+                        conn_fd := accept4(server.listen_socket,cast(*sockaddr)*addr, xx *addrlen, .NONBLOCK | .CLOEXEC);
+                        // log("accepted: %\n", conn_fd);
+                        if (conn_fd < 0) break;
+//                        push_accept_address(accepted_addresses, conn_fd, addr);
+                        
+                        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+                        ev.data.fd = conn_fd;
+                        epoll_ctl(server.epoll_fd, Epoll_Ctl.ADD, conn_fd, *ev);
+                    }
+                } else {
+                    // log("accept socket has data\n");
+                    // Connection ready - remove from epoll and hand to thread pool
+                    conn_fd := events[i].data.fd;
+                    epoll_ctl(server.epoll_fd, Epoll_Ctl.DEL, conn_fd, null);
+                    //addr := pop_accept_address(accepted_addresses, conn_fd);
+                    add_work(server, conn_fd, .{});
+                }
+            }
         }
         return 0;
     }
@@ -398,3 +498,4 @@ listen :: (using server: *Server, address: string, port: u16) -> bool {
 #import "String";
 #import "POSIX";
 #import "Machine_X64";
+#import "Linux";
