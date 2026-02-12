@@ -38,7 +38,7 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 ## Jai Toolchain
 
-**IMPORTANT:** Before writing or modifying Jai code, read `.claude/jai-reference.md` for a comprehensive language reference covering syntax, semantics, and patterns.
+**IMPORTANT:** Before writing or modifying Jai code, read `.claude/jai-reference.md` for a comprehensive language reference covering syntax, semantics, and patterns. Also read `.claude/jai-stdlib-reference.md` for a cheat-sheet of all standard library modules and their key APIs.
 
 The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not exist, ask the user where the Jai distribution is located on this machine. Standard library modules are at `<jai>/modules/` — consult these when using or understanding Jai standard library APIs (Socket, Thread, POSIX, Linux, Atomics, etc.). The `<jai>/how_to/` directory contains detailed annotated examples of every language feature.
 
