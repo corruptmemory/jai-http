@@ -8,7 +8,7 @@ Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Fea
 
 **Current status:** The server is in an intermediate/non-working state. The goal is nginx-level performance with epoll support.
 
-**Performance reference:** nginx source is checked out at `~/projects/nginx/` — we are reverse-engineering its epoll event loop and connection handling as the performance target for this server.
+**Performance reference:** nginx source is checked out at `~/projects/nginx/` — we are reverse-engineering its epoll event loop and connection handling as the performance target for this server. Read `.claude/nginx-reference.md` for a comprehensive cheat-sheet of nginx internals (epoll, connections, pools, buffers, process model, and patterns to replicate).
 
 ## Build Commands
 
