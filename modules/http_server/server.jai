@@ -1,6 +1,4 @@
 
-LISTEN_BACKLOG :: 1024;
-
 Worker :: struct {
     engine:       Event_Engine;
     pool:         Connection_Pool;
