@@ -192,6 +192,7 @@ dispatch :: (router: *Router, req: *Request, resp: *Response) {
 
 // Segment-by-segment pattern matching.
 // Literal segments must match exactly. `:name` segments match any non-empty segment and capture into params.
+// `*name` segments match the rest of the path (greedy) and capture into params. Must be the last segment.
 match_pattern :: (pattern: string, path: string, params: *[MAX_PARAMS] Param, param_count: *s32) -> bool {
     pi := 0;   // pattern index
     ai := 0;   // path (actual) index
@@ -209,19 +210,38 @@ match_pattern :: (pattern: string, path: string, params: *[MAX_PARAMS] Param, pa
         while pi < pattern.count && pattern[pi] != #char "/" {
             pi += 1;
         }
+
+        pat_seg_start := ps;
+        pat_seg_end   := pi;
+        pat_seg_len   := pat_seg_end - pat_seg_start;
+
+        // Wildcard segment — matches everything remaining in the path
+        if pat_seg_len > 0 && pattern[pat_seg_start] == #char "*" {
+            // Must have at least one character remaining in path
+            if ai >= path.count return false;
+
+            if param_count.* < MAX_PARAMS {
+                p := *params.*[param_count.*];
+                // Name is everything after the '*'
+                p.name.data = pattern.data + pat_seg_start + 1;
+                p.name.count = pat_seg_len - 1;
+                // Value is everything remaining in the path
+                p.value.data = path.data + ai;
+                p.value.count = path.count - ai;
+                param_count.* += 1;
+            }
+            return true;  // Wildcard consumes the rest — always a match
+        }
+
         // Find end of path segment
         as := ai;
         while ai < path.count && path[ai] != #char "/" {
             ai += 1;
         }
 
-        pat_seg_start := ps;
-        pat_seg_end   := pi;
         path_seg_start := as;
         path_seg_end   := ai;
-
-        pat_seg_len  := pat_seg_end - pat_seg_start;
-        path_seg_len := path_seg_end - path_seg_start;
+        path_seg_len   := path_seg_end - path_seg_start;
 
         if pat_seg_len > 0 && pattern[pat_seg_start] == #char ":" {
             // Param segment — must match at least one character

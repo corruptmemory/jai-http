@@ -505,6 +505,84 @@ test_match_no_match :: () {
     print("  PASS: test_match_no_match\n");
 }
 
+// -- Router: wildcard pattern matching tests --
+
+test_match_wildcard_basic :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/static/*filepath", "/static/style.css", *params, *pc) == true, "Wildcard should match single segment");
+    assert(pc == 1, "Should capture 1 param, got %", pc);
+    assert(string_equals(params[0].name, "filepath"), "Param name should be 'filepath', got '%'", params[0].name);
+    assert(string_equals(params[0].value, "style.css"), "Param value should be 'style.css', got '%'", params[0].value);
+
+    print("  PASS: test_match_wildcard_basic\n");
+}
+
+test_match_wildcard_deep_path :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/static/*filepath", "/static/css/main/style.css", *params, *pc) == true, "Wildcard should match deep path");
+    assert(pc == 1);
+    assert(string_equals(params[0].name, "filepath"));
+    assert(string_equals(params[0].value, "css/main/style.css"), "Should capture full remaining path, got '%'", params[0].value);
+
+    print("  PASS: test_match_wildcard_deep_path\n");
+}
+
+test_match_wildcard_with_prefix_params :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/repos/:owner/*rest", "/repos/jim/blob/main/README.md", *params, *pc) == true);
+    assert(pc == 2, "Should capture 2 params, got %", pc);
+    assert(string_equals(params[0].name, "owner"));
+    assert(string_equals(params[0].value, "jim"));
+    assert(string_equals(params[1].name, "rest"));
+    assert(string_equals(params[1].value, "blob/main/README.md"), "Wildcard should capture rest, got '%'", params[1].value);
+
+    print("  PASS: test_match_wildcard_with_prefix_params\n");
+}
+
+test_match_wildcard_no_match :: () {
+    // Wildcard needs at least one character after the prefix
+    assert(match_pattern("/static/*filepath", "/static/") == false, "Trailing slash only should not match wildcard");
+    assert(match_pattern("/static/*filepath", "/static") == false, "No trailing content should not match wildcard");
+    // Wrong prefix
+    assert(match_pattern("/static/*filepath", "/assets/style.css") == false, "Wrong prefix should not match");
+
+    print("  PASS: test_match_wildcard_no_match\n");
+}
+
+// -- Router: wildcard dispatch tests --
+
+wildcard_captured_path: string;
+
+wildcard_handler :: (req: *Request, resp: *Response) {
+    fp, found := param("filepath");
+    assert(found, "Should find wildcard param 'filepath'");
+    wildcard_captured_path = fp;
+    resp.status_code = 200;
+}
+
+test_dispatch_wildcard :: () {
+    router: Router;
+    get(*router, "/static/*filepath", wildcard_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/static/js/app.min.js";
+    resp: Response;
+
+    wildcard_captured_path = "";
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 200, "Should match wildcard route");
+    assert(string_equals(wildcard_captured_path, "js/app.min.js"), "Should capture 'js/app.min.js', got '%'", wildcard_captured_path);
+
+    print("  PASS: test_dispatch_wildcard\n");
+}
+
 // -- Router: dispatch tests --
 
 test_handler_called: bool;
@@ -1161,7 +1239,14 @@ main :: () {
     test_match_multi_param();
     test_match_no_match();
 
+    print("\nRouter - wildcard matching:\n");
+    test_match_wildcard_basic();
+    test_match_wildcard_deep_path();
+    test_match_wildcard_with_prefix_params();
+    test_match_wildcard_no_match();
+
     print("\nRouter - dispatch:\n");
+    test_dispatch_wildcard();
     test_dispatch_basic();
     test_dispatch_404();
     test_dispatch_405();

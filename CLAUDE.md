@@ -4,13 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool, cache-line aware blocking channel for work distribution, and stream-based HTTP request parsing.
+Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 2 complete with full HTTP features — multi-threaded SO_REUSEPORT workers (16 threads, shared-nothing), zero-copy incremental HTTP parser with header lookup, query string separation, request body parsing, and custom response headers. Achieving ~2.5M req/s at 32t/2000c. Next: routing.
+**Current status:** Milestone 3 (routing + helpers) complete. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. 62 tests passing. ~1.6M req/s at 32t/2000c with routing overhead.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
 **Performance reference:** nginx source is checked out at `~/projects/nginx/` — we are reverse-engineering its epoll event loop and connection handling as the performance target for this server. Read `.claude/nginx-reference.md` for a comprehensive cheat-sheet of nginx internals (epoll, connections, pools, buffers, process model, and patterns to replicate).
+
+**Practical application target:** `~/projects/weather-station/` is a Go web application (Ambient Weather WS-2902 receiver) that serves as the milestone for "useful infrastructure." It uses chi router, templ templates, htmx polling, CSV date-partitioned storage, actor-pattern collector goroutine, downsample aggregation, uPlot charts, embedded static files, and TOML config. Rebuilding it with this Jai HTTP library is the next major goal — it exercises routing, static file serving, JSON APIs, shared state via actor pattern, and file I/O.
 
 ## Build Commands
 
@@ -30,19 +32,21 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 **Build metaprogram** (`first.jai`): Creates three compiler workspaces (server, client, tests). The `modules/` directory is added to the import path for all workspaces. Tests are auto-executed after compilation via `Autorun`.
 
 **HTTP Server module** (`modules/http_server/`):
-- `module.jai` — Module definition, parameterized with `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`
-- `http.jai` — HTTP types (Request, Response, Header), zero-copy incremental parser, response serializer, string helpers
-- `connection.jai` — Connection struct with per-connection read buffer, parse state, and request; connection pool with free list
-- `event.jai` — Event_Engine wrapping epoll, connection pointer + instance bit encoding for stale event detection
-- `server.jai` — Worker/Server structs, SO_REUSEPORT per-worker sockets, edge-triggered epoll event loop, handler callback
+- `module.jai` — Module definition with compile-time parameters: `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`, `MAX_ROUTES`, `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS`, `MAX_FORM_VALUES`, `MAX_MULTIPART_PARTS`. Imports Basic, Pool, POSIX, Linux, Socket, Thread.
+- `http.jai` — HTTP types (Request, Response, Header, Parse_State, Parse_Result), zero-copy incremental parser, response serializer, string helpers (string_equals, string_equals_ci, to_lower). `to_lower` is `#scope_module` so helpers.jai can use it without conflicting with `Basic.to_lower` for importers.
+- `connection.jai` — Connection struct with per-connection read buffer, parse state, and request; connection pool with free list and instance-bit recycling.
+- `event.jai` — Event_Engine wrapping epoll, connection pointer + instance bit encoding for stale event detection.
+- `router.jai` — Chi-style router: `#add_context http: *HTTP_Context`, route types (Route, Router, Mount_Point), route registration (get/post/put/http_delete/route), middleware chains (use/proceed), sub-router mounting (mount), path param access (param), and dispatch with per-request context setup. Pattern matching supports literal segments, `:name` param capture, and `*name` wildcard (rest-of-path) segments.
+- `helpers.jai` — Response helpers (json/text/html/redirect), url_decode with zero-copy fast path, query_param lookup, form body parsing (Form_Data/parse_form/form_value), and multipart/form-data parsing (Multipart_Data/parse_multipart/multipart_value).
+- `server.jai` — Worker/Server structs, SO_REUSEPORT per-worker sockets, edge-triggered epoll event loop, per-request Pool allocator (reset after each dispatch via `push_context`).
 
 **Channel module** (`modules/channel/`):
 - Standalone generic typed blocking queue (`Channel(T)`) using mutex/condition variables
 - Cache-line aware padding for contiguous array items
-- Preserved from original implementation for future use
+- Preserved for shared state via actor pattern (see "Shared State Architecture" below)
 
 **Entry points:**
-- `server/main.jai` — Configures and starts the HTTP server
+- `server/main.jai` — Configures router with routes and starts the HTTP server
 - `client/main.jai` — Client stub
 
 ## Jai Toolchain
@@ -53,11 +57,37 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 
 ## Key Patterns
 
-- No external dependencies — uses only Jai standard library modules (Basic, Socket, Thread, POSIX, Linux, Atomics, Machine_X64)
-- Compile-time string building for method dispatch table generation
-- Cache-line aligned padding in channel items for performance
-- Workers use `reset_temporary_storage()` per request for memory efficiency
-- Epoll for scalable I/O multiplexing; connections flow from accept thread → Channel → worker threads
+- No external dependencies — uses only Jai standard library modules (Basic, Pool, Socket, Thread, POSIX, Linux, Atomics, Machine_X64)
+- **Per-request pool allocator:** Each Worker owns a `Pool` (from `#import "Pool"` — NOT `Flat_Pool`). Before dispatch, `push_context` swaps `context.allocator` to the pool. After dispatch, `Pool_Module.reset()` bulk-frees all per-request allocations. Handler code uses `alloc()`, `New()`, etc. with automatic per-request cleanup.
+- **Why Pool, not Flat_Pool:** Flat_Pool reserves large contiguous virtual address space via mmap (default 256MB). With 16 workers that's 4GB VIRT — misleading in htop. Pool allocates 64KB heap blocks on demand, recycles on reset(), only shows actual RSS.
+- **Module scoping gotchas:** `#scope_file` restricts to the file, `#scope_module` makes visible within the module but not to importers, default scope exports to importers. When utility functions are needed across module files but shouldn't conflict with standard library names (e.g. `to_lower`), use `#scope_module`.
+- **Module parameters aren't exported:** Importers can't reference `MAX_PARAMS` etc. In test code, use `type_of(HTTP_Context.params)` to get the array type instead.
+- Workers use `reset_temporary_storage()` per epoll iteration for memory efficiency
+- Epoll for scalable I/O multiplexing; each worker has its own listen socket via SO_REUSEPORT (shared-nothing, no inter-worker communication)
+- Zero-copy parsing throughout: HTTP parser, URL decoder, form parser, multipart parser all use string views into the connection buffer where possible
+
+## Shared State Architecture
+
+The 16 SO_REUSEPORT workers are shared-nothing — they don't communicate with each other. For application state that must be shared across workers (e.g. latest weather observation, in-memory data store):
+
+- **Actor pattern via Channel:** A single owner thread holds all mutable state. Workers send typed commands via `Channel(Command)` where `Command` is a tagged union of all message types (new observation, query latest, query history, flush to disk, etc.). The owner thread blocks on `receive()`, switches on command type, and replies through a response channel when needed.
+- **No need for Go's `select`:** A single `Channel(Command)` with tagged union eliminates multi-channel multiplexing. The collector thread just blocks on one channel.
+- **Future enhancement:** `try_send`/`try_receive` (non-blocking) could enable polling multiple channels, but would spin. A condition-variable-based approach (like epoll for channels) would be ideal for true `select` semantics, but this is not a blocker for current application targets.
+
+## Remaining Library Gaps
+
+Before the weather station app can be rebuilt in Jai, these library-level features are needed:
+
+1. **Static file serving handler** — Thin wrapper: map wildcard path to embedded bytes (via `#run read_entire_file()`), set Content-Type from file extension, write body. Wildcard routes (`*filepath`) are already implemented.
+2. **JSON serialization** — At minimum, serialize structs to JSON strings for API endpoints. Jai's compile-time introspection (`type_info`) makes reflection-based serialization feasible.
+
+**NOT gaps** (already covered):
+- Routing: chi-style router with params, wildcards, middleware, mounting ✓
+- Static file embedding: Jai's `#run read_entire_file()` at compile time ✓
+- File I/O: Jai's `File` standard library module ✓
+- Shared state: Channel module + actor pattern ✓
+- Form/multipart parsing: helpers.jai ✓
+- Query params: helpers.jai ✓
 
 ## Future Considerations
 
@@ -75,6 +105,7 @@ wrk -t1 -c10 -d10s http://localhost:9090/
 wrk -t4 -c100 -d10s http://localhost:9090/
 wrk -t8 -c500 -d10s http://localhost:9090/
 wrk -t16 -c1000 -d10s http://localhost:9090/
+wrk -t32 -c2000 -d10s http://localhost:9090/
 kill %1
 ```
 
@@ -112,3 +143,10 @@ kill %1
 | 8 | 500 | 689,251 | 4.4ms |
 | 16 | 1000 | 1,360,520 | 4.4ms |
 | 32 | 2000 | 2,489,878 | 4.2ms |
+
+**Milestone 3** (16 workers, chi-style router + middleware + pool allocator, Hello World):
+| wrk Threads | Connections | Req/sec | Avg Latency |
+|-------------|------------|---------|-------------|
+| 32 | 2000 | ~1,600,000 | ~4ms |
+
+Router dispatch adds ~36% overhead at 32t/2000c vs raw handler callback (2.49M → 1.6M). Investigated: pool allocator is NOT the cause (same numbers with/without it). The overhead is from push_context, match_pattern segment scanning, and middleware chain setup. Acceptable cost for routing functionality — optimization opportunity for later (e.g. radix tree, compiled dispatch table).
