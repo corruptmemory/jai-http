@@ -416,6 +416,39 @@ using Math :: #import "Math";       // Using import: sin() directly
 #load "other_file.jai";             // Load file into current scope
 ```
 
+### Module Parameters
+
+**One of Jai's killer features.** Module parameters are compile-time constants that can be configured at import time. Any plausible tunable constant should be exposed as a module parameter — "one never knows" what the consumer will need to adjust.
+
+```jai
+// In module.jai — declare parameters with defaults:
+#module_parameters (
+    CACHE_LINE_SIZE  : s32 = 64,
+    READ_BUFFER_SIZE : s32 = 4096,
+    MAX_HEADERS      : s32 = 64    // No trailing comma on last param
+);
+
+// These are compile-time constants within the module — use them anywhere:
+buf: [READ_BUFFER_SIZE] u8;
+headers: [MAX_HEADERS] Header;
+```
+
+```jai
+// At the import site — override any defaults:
+#import "http_server"(READ_BUFFER_SIZE = 8192, MAX_HEADERS = 128);
+
+// Or use all defaults:
+#import "http_server";
+```
+
+**Key points:**
+- Values are resolved at compile time — zero runtime overhead
+- Works with any compile-time-known type (integers, bools, types, etc.)
+- The module code uses them exactly like constants (`::` declarations)
+- Unlike C preprocessor macros: scoped, typed, and shown in error messages
+- Unlike runtime config: no branches, no indirection, enables static array sizes
+- **Design rule:** If a constant could plausibly vary between consumers, make it a module parameter
+
 ### Visibility
 ```jai
 #scope_export    // Declarations visible to importers (default in modules)
@@ -491,6 +524,191 @@ info.runtime_size;                // Size in bytes
 si := cast(*Type_Info_Struct) info;
 for si.members { ... }           // Iterate struct fields
 ```
+
+## Unions
+
+### Untagged unions
+```jai
+Value :: union {
+    as_u64:     u64;
+    as_float64: float64;
+}
+// All fields share memory. Size = max field size. Like C unions.
+```
+
+### Tagged unions (beta 0.2.023+, bindings 0.2.025+)
+A tag field is declared inline after `union`. The tag becomes the first member; all other fields are packed after it respecting alignment.
+
+```jai
+Value_Kind :: enum u8 {
+    SCALAR :: 0;
+    VECTOR :: 1;
+    STRING :: 2;
+}
+
+Value :: union kind: Value_Kind {
+    scalar: float64;
+    vector: Vector4;
+    _string: string;
+}
+```
+
+Tag-to-field bindings (0.2.025+) — associate each enum value with a specific field:
+```jai
+Fruit :: enum u8 {
+    APPLE  :: 0;
+    BANANA :: 1;
+    ORANGE :: 2;
+}
+
+Thing :: union fruit: Fruit {
+    .APPLE  ,, x: int;
+    .BANANA ,, y: float;
+    .ORANGE ,, z := "default";
+}
+```
+
+The bindings are exported via `Type_Info_Struct.tagged_union_bindings` (array of `Type_Info_Tagged_Union_Binding`), enabling compile-time introspection for safe unwrap macros.
+
+Tag type must be integer or `Type`. No built-in unwrap/match semantics yet — use manual `if tag ==` checks. `using` on a tagged union promotes tag and fields into the enclosing struct's namespace.
+
+**Note:** Field addresses may differ within the union due to alignment. If the tag is `u8` and one field is `u8` (offset 1) but another is a pointer (offset 8), they won't overlap at the same address.
+
+### Union inside struct (common pattern)
+```jai
+Connection :: struct {
+    using data: union state: Connection_State {
+        .FREE   ,, next_free: *Connection;
+        .ACTIVE ,, request:   *HTTP_Request;
+    };
+    fd: s32;
+    // connection.state, connection.next_free, connection.request all accessible directly
+}
+```
+
+## Struct Layout Control
+
+### `#align N` (field alignment)
+Force a struct member to a specific byte alignment:
+```jai
+Thread_Data :: struct {
+    name: string;
+    ts: Temporary_Storage;
+    ts_data: [4096] u8 #align 64;   // Cache-line aligned
+}
+```
+The field (and all subsequent fields, by default) will be placed at an offset that is a multiple of N. Commonly used with cache-line boundaries (`#align 64`).
+
+### `#no_padding` (packed structs)
+Remove all inter-field padding — fields are packed tightly with no alignment gaps:
+```jai
+WAV_Header :: struct {
+    chunk_id:    [4] u8;
+    chunk_size:  u32;
+    format:      [4] u8;
+} #no_padding;
+```
+Use for binary file formats, network protocols, or C interop where layout must match exactly.
+
+### `#overlay` (field aliasing, replaces deprecated `#place`)
+Declare an alternate view of existing fields starting at a given member's offset. Does not add to struct size — it's a zero-cost alias:
+```jai
+Vector4 :: struct {
+    x, y, z, w: float;
+
+    #overlay (x) xy:  Vector2;     // xy.x aliases x, xy.y aliases y
+    #overlay (x) xyz: Vector3;     // xyz overlays x,y,z
+    #overlay (y) yzw: Vector3;     // yzw overlays y,z,w
+    #overlay (x) component: [4] float;  // Array view of all 4
+}
+
+Plane3 :: struct {
+    a, b, c, d: float;
+    #overlay (a) #as vector4: Vector4;  // #as enables implicit cast
+    #overlay (a) normal: Vector3;
+}
+```
+`#overlay` members are recognized as aliases by print, serialization, etc. — they won't be double-processed. `#place` is deprecated (warning in 0.2.021, removal imminent).
+
+### Zero-size alignment trick
+Force overall struct alignment without adding to its size:
+```jai
+AMX_State :: struct {
+    data: [64] [64] u8;
+    _: [0] u8 #align 64;   // Forces struct alignment to 64 bytes
+}
+```
+
+### Compile-time cache-line padding (polymorphic)
+
+Pad any polymorphic struct's items to a cache-line boundary using compile-time math. Works generically for any `T`:
+
+```jai
+Channel :: struct(T: Type) {
+    Item :: struct {
+        value: T;
+        BASE_SIZE    :: size_of(T);
+        PADDING_SIZE :: #run Basic.align_forward(BASE_SIZE, CACHE_LINE_SIZE) - BASE_SIZE;
+        padding: [PADDING_SIZE] u8;
+    }
+    items: [] Item;   // Every Item is exactly cache-line sized
+}
+```
+
+`size_of(T)` and `align_forward` are evaluated at compile time via `#run`. The padding array is computed per-polymorphic-instantiation — `Channel(int)` gets different padding than `Channel(My_Big_Struct)`. Zero runtime cost, works with any `T`, far cleaner than C's `__attribute__((aligned(64)))` or `_Alignas` hacks. Use this pattern anywhere items in contiguous arrays must not share cache lines (ring buffers, connection pools, per-thread slots).
+
+## Testing
+
+Jai has **no built-in test framework**. Tests are just another program.
+
+### Convention
+Write test procedures full of `assert()` calls. Build a separate test executable via the metaprogram. If it exits 0, tests pass.
+
+```jai
+// tests/test.jai
+test_connection_pool :: () {
+    pool: Connection_Pool;
+    init(*pool, 16);
+    defer destroy(*pool);
+
+    c := get_connection(*pool);
+    assert(c != null);
+    assert(c.state == .ACTIVE);
+
+    free_connection(*pool, c);
+    assert(c.state == .FREE);
+}
+
+main :: () {
+    test_connection_pool();
+    print("All tests passed.\n");
+}
+
+#import "Basic";
+#import "http_server";
+```
+
+### Build integration
+Use a dedicated workspace in `first.jai` with `Autorun` to compile and auto-run:
+```jai
+build_tests :: (options: Build_Options) {
+    w := compiler_create_workspace("tests");
+    // ... set options, add import paths ...
+    add_build_file("modules/http_server/tests/test.jai", w);
+    // Intercept completion, then:
+    Autorun.run_build_result(w);   // Run immediately after compile
+}
+```
+Invoked with: `~/jai/jai/bin/jai-linux first.jai -- test`
+
+### Key primitives
+- **`assert(condition, format, args..)`** — from `Basic`. Crashes with message + `#caller_location` on failure.
+- **`#assert condition`** — compile-time static assertion (e.g., `#assert size_of(T) == 8`).
+- **`@test` note** — informal annotation convention on test procedures. Not processed by the compiler, but a metaprogram could intercept `@test`-annotated procedures via `Message_Typechecked` and auto-generate `#run` calls for them.
+- **`#run test_something()`** — run a test at compile time. Catches failures before a binary is produced.
+
+### No built-in facilities for
+- Test discovery/runner, pass/fail counts, test isolation, mocking, assertions library. Roll your own as needed.
 
 ## Key Differences from C/C++
 

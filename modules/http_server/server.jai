@@ -1,444 +1,297 @@
 
-HTTP_EOL :: "\r\n";
-WHITESPACE :: " \t";
-MAX_EVENTS :: 1024;
-LISTEN_QUEUE_LENGTH :: 1024;
+LISTEN_BACKLOG :: 1024;
 
-
-Accept_Handler_Entry :: struct {
-    socket:       Socket;
-    remote:       sockaddr_in;
+Worker :: struct {
+    engine:       Event_Engine;
+    pool:         Connection_Pool;
+    listen_fd:    s32 = -1;
+    listen_conn:  *Connection;     // Sentinel connection for the listen socket
+    running:      bool;
+    id:           s32;
+    router:       *Router;
+    request_pool: Pool_Module.Pool;  // Per-request allocator, reset after each dispatch
+    thread:       Thread;
 }
-
-Accept_Handler :: #type (server: *Server, handler_data: *Accept_Handler_Entry, data: *void);
 
 Server :: struct {
-    allocator:                   Allocator;
-    epoll_fd:                    s32;
-    listen_socket:               Socket;
-    handler_data:                *void;
-    handler_proc:                Accept_Handler;
-    listening_thread:            Thread;
-    threads:                     [] Thread;
-    threads_data_to_free:        *void;
-    channel:                     Channel(Accept_Handler_Entry);
+    workers:       [] Worker;
+    num_workers:   s32;
+    running:       bool;
+    router:        *Router;
+    data_to_free:  *void;
 }
 
-add_work :: (s: *Server, socket: Socket, remote: sockaddr_in) {
-    send(*s.channel, .{
-            socket = socket,
-            remote = remote
-        });
-}
+init_server :: (server: *Server, num_workers: s32 = 16, pool_size: s64 = 1024) -> bool {
+    server.num_workers = num_workers;
+    server.workers, server.data_to_free = Basic.NewArray(cast(s64) num_workers, Worker, true);
 
-consume :: (s: *Server) -> Accept_Handler_Entry {
-    return receive(*s.channel);
-}
+    for i: 0..cast(s64) num_workers - 1 {
+        w := *server.workers[i];
+        w.id = cast(s32) i;
 
-Default_Handler_Data :: struct {
-    max_header_size: u32 = 64*1024;
-}
-
-DEFAULT_HANDLER_DATA: Default_Handler_Data = .{};
-
-Request_Header :: struct {
-    name: string;
-    value: string;
-}
-
-Request_Method :: enum u8 {
-    GET;
-    POST;
-    PUT;
-    PATCH;
-    DELETE;
-    HEAD;
-    OPTIONS;
-    CONNECT;
-    TRACE;
-};
-
-Method_Map :: struct {
-    name: string;
-    method: Request_Method;
-}
-
-generate_method_map :: () -> string {
-    method_map_ti := cast(*Type_Info_Enum) type_info(Request_Method);
-    builder: String_Builder;
-
-    print_to_builder(*builder, "Method_Map.[\n");
-    for method_map_ti.values {
-        name := method_map_ti.names[it_index]; 
-        print_to_builder(*builder, "{ \"%\", .% },\n", name, name);
-    }
-    print_to_builder(*builder, "];");
-
-    result := builder_to_string(*builder);
-
-    return result;
-}
-
-method_map :: #insert #run generate_method_map();
-
-Request :: struct {
-    socket:           Socket;
-    data_raw:         []u8;
-    request_line_raw: []u8;
-    header_raw:       []u8;
-    body_begin_raw:   []u8; 
-    body_offset:      s64;
-    method:           Request_Method;
-    method_raw:       string;
-    path_raw:         string;
-    version_raw:      string;
-    headers:          []Request_Header;
-}
-
-Advance_Result :: enum u8 {
-    OK;
-    EOL;
-    EOB;
-};
-
-
-Response :: struct {
-    
-}
-
-advance_array :: inline (array: [] u8, bytes: s64) -> result: [] u8 {
-    assert(array.count >= bytes);
-
-    result := array;
-    result.data  += bytes;
-    result.count -= bytes;
-
-    return result;
-}
-
-
-is_eol :: inline (array: [] u8) -> (ok: bool, result: [] u8) {
-    if array.count < 2 return false, array;
-    if array[0] == #char "\r" && array[1] == #char "\n" return true, advance_array(array, 2);
-    return false, array;
-}
-
-is_eol_at :: inline (array: [] u8, at: s64) -> bool {
-    if (array.count - at) < 2 return false;
-    if array[at] == #char "\r" && array[at+1] == #char "\n" return true;
-    return false;
-}
-
-advance_past_whitespace :: (buffer: []u8) -> (capture: string, result: Advance_Result, remaining: []u8) {
-    cursor := 0;
-    remaining := buffer;
-    while cursor < buffer.count {
-        if is_any(buffer[cursor], WHITESPACE) {
-            cursor += 1;
-            continue;
-        };
-        remaining = advance_array(buffer,cursor);
-        iseol, rem := is_eol(remaining);
-        if iseol return "", .EOL, rem;
-        break;
-    }
-    if remaining.count == 0 return "", .EOB, remaining;
-    cursor = 0;
-    capture := cast(string) remaining;
-    while cursor < remaining.count {
-        if is_any(remaining[cursor], WHITESPACE) {
-            capture.count = cursor;
-            return capture, .OK, advance_array(remaining, cursor);
-        };
-        if is_eol_at(remaining, cursor) {
-            capture.count = cursor;
-            return capture, .EOL, advance_array(remaining, cursor+HTTP_EOL.count);
-        }
-        cursor += 1;
-    }
-    capture.count = cursor;
-    return capture, .EOB, advance_array(remaining, cursor);
-}
-
-parse_request_line :: (buffer: []u8, request: *Request) -> (ok: bool, remaining: []u8) {
-    method: string;
-    path: string;
-    version: string;
-    res: Advance_Result;
-    nb: []u8;
-    method, res, nb = advance_past_whitespace(buffer);
-    if res != .OK {
-        log_error("Could not parse method");
-        return false, buffer;
-    }
-    request.request_line_raw = buffer;
-    for method_map {
-        if it.name == method {
-            request.method_raw = method;
-            request.method = it.method;
-            break;
-        }
-    }
-    if request.method_raw.count == 0 {
-        log_error("Could not decode method");
-        return false, buffer;
-    }
-    path, res, nb = advance_past_whitespace(nb);
-    if res != .OK {
-        log_error("Could not parse path");
-        return false, buffer;
-    }
-    request.path_raw = path;
-    version, res, nb = advance_past_whitespace(nb);
-    if res != .EOL {
-        log_error("Could not parse version");
-        return false, buffer;
-    }
-    request.version_raw = version;
-    request.request_line_raw.count = cast(s64)(nb.data) - cast(s64)(buffer.data) - HTTP_EOL.count;
-    return true, nb;
-}
-
-parse_request_from_buffer :: (buffer: []u8, request: *Request) -> (ok: bool) {
-    return false;
-}
-
-drain :: (socket: Socket, target: []u8) -> bool {
-    current := target;
-    while true {
-        count := read(socket, current.data, xx current.count);
-        if count == -1 {
-            if (get_last_socket_error() != EAGAIN) {
-                return false;
+        ok := init_event_engine(*w.engine);
+        if !ok {
+            Basic.log_error("Failed to init event engine for worker %", i);
+            j := i - 1;
+            while j >= 0 {
+                destroy_worker(*server.workers[j]);
+                j -= 1;
             }
-            break;
-        } else if (count == 0) {
-            return false;
-        }
-        current = advance_array(current, count);
-    }
-    return true;
-}
-
-parse_request :: (max_header_size: int ,accept_data: *Accept_Handler_Entry, request: *Request) -> (ok: bool) {
-    request.data_raw = Basic.NewArray(max_header_size, u8, true);
-    ok := drain(accept_data.socket, request.data_raw);
-    if !ok return false;
-    // print("data: %\n", cast(string) request.data_raw);
-    return true;
-}
-
-response :: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, World!";
-
-send_hello_world :: (client_fd: s32) -> bool {
-    remaining := response.count;
-    offset    := 0;
-
-    while remaining > 0 {
-        bytes_sent := write(client_fd, response.data + offset, xx remaining);
-
-        if bytes_sent < 0 {
-            error_code := errno();
-            if error_code == EINTR continue; // Interrupted by signal, try again
-            
-            log_error("Write failed with errno: %", error_code);
             return false;
         }
 
-        remaining -= bytes_sent;
-        offset    += bytes_sent;
+        // +1 for the listen socket sentinel
+        init_pool(*w.pool, pool_size + 1);
+
+        // Set up the per-request pool allocator's backing allocator
+        Pool_Module.set_allocators(*w.request_pool);
     }
 
     return true;
 }
 
-default_handler :: (server: *Server, accept_data: *Accept_Handler_Entry, data: *void) {
-    handler_data := cast(*Default_Handler_Data)data;
-    if accept_data.socket == 0
-      log("WTF: %", accept_data.socket);
-    request: Request;
-    ok := parse_request(handler_data.max_header_size, accept_data, *request);
-    // log("%\n", cast(string)request.data_raw);
-    send_hello_world(accept_data.socket);
-    if ok {
-        ev := epoll_event.{
-            events = EPOLLIN | EPOLLET | EPOLLRDHUP,
-            data.fd = accept_data.socket,
-        };
-        epoll_ctl(server.epoll_fd, Epoll_Ctl.ADD, accept_data.socket, *ev);        
-    } else {
-        close_and_reset(*accept_data.socket);    
+serve :: (server: *Server, router: *Router) {
+    server.router = router;
+}
+
+destroy_server :: (server: *Server) {
+    for i: 0..cast(s64) server.num_workers - 1 {
+        destroy_worker(*server.workers[i]);
+    }
+    if server.data_to_free {
+        Basic.free(server.data_to_free);
+        server.data_to_free = null;
     }
 }
 
-
-init_server :: (using server: *Server, backlog_size: u32 = 256, thread_count: s16 = 0, in_handler_proc: Accept_Handler = default_handler, in_handler_data: *void = *DEFAULT_HANDLER_DATA) {
-    if thread_count <= 0 {
-        thread_count = cast(s16) get_number_of_processors(type=.ALL_PHYSICAL) - 1;
-    }
-    Basic.remember_allocators(server);
-    init(*channel, backlog_size);
-    threads, threads_data_to_free = Basic.NewArray(thread_count, Thread, true, alignment=CACHE_LINE_SIZE,, server.allocator);
-    handler_data = in_handler_data;
-    handler_proc = in_handler_proc;
-
-    thread_proc :: (thread: *Thread) -> s64 {
-        server := cast(*Server) thread.data;
-        handler := server.handler_proc;
-        handler_data := server.handler_data;
-
-        raw_request: Accept_Handler_Entry = ---;
-        ok: bool = ---;
-        while (1) {
-            raw_request = consume(server);
-            handler(server, *raw_request, handler_data,, allocator=temp);
-            reset_temporary_storage();
-        }
-        return 0;
-    }
-
-    for * threads {
-        it.data = server;
-        thread_init(it, thread_proc);
-    }
-    
-}
-
-Accept_Address :: struct {
-    conn_fd: s32;
-    addr: sockaddr_in;
-}
-
-push_accept_address :: (store: []Accept_Address, conn_fd: s32, addr: sockaddr_in) {
-    for * store {
-        if it.conn_fd == 0 {
-            it.conn_fd = conn_fd;
-            it.addr = addr;
-            return;
+// Each worker creates its own socket with SO_REUSEPORT, binds, and listens.
+// The kernel distributes incoming connections across workers.
+server_listen :: (server: *Server, address: string, port: u16) -> bool {
+    for i: 0..cast(s64) server.num_workers - 1 {
+        ok := worker_listen(*server.workers[i], address, port);
+        if !ok {
+            Basic.log_error("Worker % failed to listen", i);
+            return false;
         }
     }
-    log_error("error: could not record accept address");
-    exit(-1);
+
+    Basic.print("Listening on %:% with % workers\n", address, port, server.num_workers);
+    return true;
 }
 
-pop_accept_address :: (store: []Accept_Address, conn_fd: s32) -> sockaddr_in {
-    for * store {
-        if it.conn_fd == conn_fd {
-            it.conn_fd = 0;
-            return it.addr;
-        }
+// Start all worker threads and block until shutdown.
+// Worker 0 runs on the main thread; workers 1..N-1 get their own threads.
+server_run :: (server: *Server) {
+    server.running = true;
+
+    // Copy router to all workers
+    for i: 0..cast(s64) server.num_workers - 1 {
+        server.workers[i].router = server.router;
     }
-    log_error("error: could not find record address");
-    exit(-1);
-    return .{};
+
+    // Start worker threads (workers 1..N-1)
+    for i: 1..cast(s64) server.num_workers - 1 {
+        w := *server.workers[i];
+        w.running = true;
+        thread_init(*w.thread, worker_thread_proc);
+        w.thread.data = w;
+        thread_start(*w.thread);
+    }
+
+    // Worker 0 runs on the main thread
+    server.workers[0].running = true;
+    worker_run(*server.workers[0]);
+
+    // Wait for all worker threads to finish
+    for i: 1..cast(s64) server.num_workers - 1 {
+        w := *server.workers[i];
+        thread_is_done(*w.thread, -1);
+        thread_deinit(*w.thread);
+    }
 }
 
+#scope_file
 
-listen :: (using server: *Server, address: string, port: u16) -> bool {
-    epoll_fd = epoll_create1(0);
-    if epoll_fd == -1 {
-        log_error("error creating epoll fd\n");
-        return false;
-    }
+worker_thread_proc :: (thread: *Thread) -> s64 {
+    w := cast(*Worker) thread.data;
+    worker_run(w);
+    return 0;
+}
+
+worker_listen :: (w: *Worker, address: string, port: u16) -> bool {
     s := socket(AF_INET, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, 0);
-    if s == 0 {
-        log_error("error getting socket: %\n", get_error_string(get_last_socket_error()));
-        close_and_reset(*s);
+    if s == INVALID_SOCKET {
+        Basic.log_error("Worker %: socket() failed: %", w.id, get_error_string(get_last_socket_error()));
         return false;
     }
-    opt := cast(s32)1;
+
+    opt: s32 = 1;
     if setsockopt(s, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, xx *opt, size_of(type_of(opt))) < 0 {
-        log_error("error setting socket options: %\n", get_error_string(get_last_socket_error()));
+        Basic.log_error("Worker %: setsockopt failed: %", w.id, get_error_string(get_last_socket_error()));
         close_and_reset(*s);
         return false;
     }
+
     if bind(s, address, port) < 0 {
-        log_error("error binding socket: %\n", get_error_string(get_last_socket_error()));
+        Basic.log_error("Worker %: bind failed: %", w.id, get_error_string(get_last_socket_error()));
         close_and_reset(*s);
         return false;
     }
-    ev := epoll_event.{
-        events = EPOLLIN | EPOLLET,
-        data.fd   = s, 
-    };
-    listen_socket = s;
-    if epoll_ctl(epoll_fd, Epoll_Ctl.ADD, s, *ev) {
-        log_error("error adding listen socket to epoll fd\n");
+
+    if listen(s, LISTEN_BACKLOG) < 0 {
+        Basic.log_error("Worker %: listen failed: %", w.id, get_error_string(get_last_socket_error()));
         close_and_reset(*s);
         return false;
-    };
-    listen_proc :: (thread: *Thread) -> s64 {
-        server := cast(*Server) thread.data;
-        defer close_and_reset(*server.epoll_fd);
-        defer close_and_reset(*server.listen_socket);
-        defer log("listen proc exiting\n");
-        events: [MAX_EVENTS]epoll_event;
-        accepted_addresses: []Accept_Address;
-        accepted_addresses_data_to_free: *void;
-        accepted_addresses, accepted_addresses_data_to_free = Basic.NewArray(4096, Accept_Address, true);
-        defer free(accepted_addresses_data_to_free);
-        // log("listening...\n");
-        if listen(server.listen_socket, LISTEN_QUEUE_LENGTH) < 0 {
-            log_error("error binding socket: %\n", get_error_string(get_last_socket_error()));
-            return -1;
+    }
+
+    // Use a pool connection as sentinel for the listen socket
+    w.listen_conn = get_connection(*w.pool);
+    if w.listen_conn == null {
+        Basic.log_error("Worker %: no connections available for listen socket", w.id);
+        close_and_reset(*s);
+        return false;
+    }
+    w.listen_conn.fd = s;
+    w.listen_fd = s;
+
+    // Register listen socket with epoll (edge-triggered)
+    ok := epoll_add_connection(*w.engine, w.listen_conn, EPOLLIN | EPOLLET);
+    if !ok {
+        close_and_reset(*s);
+        return false;
+    }
+
+    return true;
+}
+
+worker_run :: (w: *Worker) {
+    while w.running {
+        nfds := epoll_process_events(*w.engine, timeout_ms = -1);
+        if nfds < 0 {
+            err := errno();
+            if err == EINTR continue;
+            Basic.log_error("Worker %: epoll_wait failed: %", w.id, err);
+            continue;
         }
 
-        ev: epoll_event;
-        
-        while true {
-            // log("beginning epoll_wait\n");
-            nfds := epoll_wait(server.epoll_fd, events.data, MAX_EVENTS, -1);
-            // log("got something: %\n", nfds);
-            if nfds < 0 {
-                log_error("failure to get epoll events\n");
-                continue;
-//                return -1;
+        for i: 0..nfds-1 {
+            ev := *w.engine.events[i];
+            c, event_instance := decode_connection_ptr(ev.data.ptr);
+
+            // Stale event check
+            if event_instance != c.instance continue;
+
+            if c == w.listen_conn {
+                accept_connections(w);
+            } else {
+                handle_client(w, c, ev.events);
             }
-            for i: 0..nfds-1 {
-                if events[i].data.fd == server.listen_socket {
-                    // log("listen socket\n");
-                    while true {
-                        addr: sockaddr_in;
-                        addrlen: u32 = size_of(sockaddr_in);
-                        conn_fd := accept4(server.listen_socket,cast(*sockaddr)*addr, xx *addrlen, .NONBLOCK | .CLOEXEC);
-                        // log("accepted: %\n", conn_fd);
-                        if (conn_fd < 0) break;
-//                        push_accept_address(accepted_addresses, conn_fd, addr);
-                        
-                        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-                        ev.data.fd = conn_fd;
-                        epoll_ctl(server.epoll_fd, Epoll_Ctl.ADD, conn_fd, *ev);
+        }
+        Basic.reset_temporary_storage();
+    }
+}
+
+destroy_worker :: (w: *Worker) {
+    if w.listen_fd != -1 {
+        close(w.listen_fd);
+        w.listen_fd = -1;
+    }
+    destroy_event_engine(*w.engine);
+    destroy_pool(*w.pool);
+    Pool_Module.release(*w.request_pool);
+}
+
+accept_connections :: (w: *Worker) {
+    while true {
+        addr: sockaddr_in;
+        addrlen: u32 = size_of(sockaddr_in);
+        conn_fd := accept4(w.listen_fd, cast(*sockaddr) *addr, xx *addrlen, .NONBLOCK | .CLOEXEC);
+
+        if conn_fd < 0 break;  // EAGAIN — no more pending
+
+        c := get_connection(*w.pool);
+        if c == null {
+            close(conn_fd);
+            continue;
+        }
+        c.fd = conn_fd;
+
+        ok := epoll_add_connection(*w.engine, c, EPOLLIN | EPOLLET | EPOLLRDHUP);
+        if !ok {
+            close(conn_fd);
+            free_connection(*w.pool, c);
+        }
+    }
+}
+
+handle_client :: (w: *Worker, c: *Connection, events: u32) {
+    // Error or hangup
+    if events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP) {
+        close_connection(w, c);
+        return;
+    }
+
+    if events & EPOLLIN {
+        // Edge-triggered: read until EAGAIN
+        while true {
+            available := READ_BUFFER_SIZE - c.bytes_used;
+            if available <= 0 {
+                // Buffer full but request incomplete — too large
+                close_connection(w, c);
+                return;
+            }
+
+            bytes_read := read(c.fd, c.buf.data + c.bytes_used, xx available);
+            if bytes_read < 0 {
+                err := errno();
+                if err == EAGAIN || err == EWOULDBLOCK break;
+                close_connection(w, c);
+                return;
+            }
+            if bytes_read == 0 {
+                close_connection(w, c);
+                return;
+            }
+
+            c.bytes_used += bytes_read;
+
+            // Process complete requests (handles pipelining)
+            while true {
+                result := parse_request(c);
+                if result == .COMPLETE {
+                    response: Response;
+
+                    // Dispatch through router with per-request pool allocator
+                    new_ctx := context;
+                    new_ctx.allocator = .{Pool_Module.pool_allocator_proc, *w.request_pool};
+                    push_context new_ctx {
+                        dispatch(w.router, *c.req, *response);
                     }
+                    Pool_Module.reset(*w.request_pool);
+
+                    write_response(c.fd, *response, c.req.keep_alive);
+
+                    if !c.req.keep_alive {
+                        close_connection(w, c);
+                        return;
+                    }
+
+                    reset_for_next_request(c);
+                } else if result == .ERROR {
+                    close_connection(w, c);
+                    return;
                 } else {
-                    // log("accept socket has data\n");
-                    // Connection ready - remove from epoll and hand to thread pool
-                    conn_fd := events[i].data.fd;
-                    epoll_ctl(server.epoll_fd, Epoll_Ctl.DEL, conn_fd, null);
-                    //addr := pop_accept_address(accepted_addresses, conn_fd);
-                    add_work(server, conn_fd, .{});
+                    break;  // INCOMPLETE — need more data
                 }
             }
         }
-        return 0;
     }
-    server.listening_thread.data = server;
-    thread_init(*server.listening_thread, listen_proc);
-    for * threads {
-        thread_start(it);
-    }
-    thread_start(*server.listening_thread);
-    return true;
 }
 
-#load "channel.jai";
+close_connection :: (w: *Worker, c: *Connection) {
+    epoll_del_connection(*w.engine, c);
+    close(c.fd);
+    free_connection(*w.pool, c);
+}
 
 #import "System";
-#import "Socket";
-#import "Thread";
-#import "Machine_X64";
-#import "Atomics";
-#import "Basic";
-#import "String";
-#import "POSIX";
-#import "Machine_X64";
-#import "Linux";
