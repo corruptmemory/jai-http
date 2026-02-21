@@ -25,6 +25,8 @@ The build system is Jai's compile-time metaprogramming via `first.jai`. All buil
 ```
 **Note:** Single dash `-` separates compiler args from metaprogram args. Double dash `--` is reserved for compiler developer options.
 
+**Compiler flags:** `-release` is deprecated as of 0.2.026. Use `-o` or `-optimized` for release builds, `-od` or `-optimized_debug` for optimized debug. Our build metaprogram handles this via its own `release`/`debug` args, so this only matters if invoking the compiler directly.
+
 Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 ## Architecture
@@ -32,7 +34,7 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 **Build metaprogram** (`first.jai`): Creates three compiler workspaces (server, client, tests). The `modules/` directory is added to the import path for all workspaces. Tests are auto-executed after compilation via `Autorun`.
 
 **HTTP Server module** (`modules/http_server/`):
-- `module.jai` — Module definition with compile-time parameters: `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`, `MAX_ROUTES`, `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS`, `MAX_FORM_VALUES`, `MAX_MULTIPART_PARTS`. Imports Basic, Pool, POSIX, Linux, Socket, Thread.
+- `module.jai` — Module definition with compile-time parameters: `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`, `MAX_ROUTES`, `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS`, `MAX_FORM_VALUES`, `MAX_MULTIPART_PARTS`, `LISTEN_BACKLOG`. Imports Basic, Pool, POSIX, Linux, Socket, Thread.
 - `http.jai` — HTTP types (Request, Response, Header, Parse_State, Parse_Result), zero-copy incremental parser, response serializer, string helpers (string_equals, string_equals_ci, to_lower). `to_lower` is `#scope_module` so helpers.jai can use it without conflicting with `Basic.to_lower` for importers.
 - `connection.jai` — Connection struct with per-connection read buffer, parse state, and request; connection pool with free list and instance-bit recycling.
 - `event.jai` — Event_Engine wrapping epoll, connection pointer + instance bit encoding for stale event detection.
@@ -53,6 +55,8 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 **IMPORTANT:** Before writing or modifying Jai code, read `.claude/jai-reference.md` for a comprehensive language reference covering syntax, semantics, and patterns. Also read `.claude/jai-stdlib-reference.md` for a cheat-sheet of all standard library modules and their key APIs.
 
+**Jai compiler version:** Codebase targets beta 0.2.026. When the compiler is updated, check `~/jai/jai/CHANGELOG.txt` (top of file) for breaking changes — especially renamed APIs, deprecated syntax, and removed modules.
+
 The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not exist, ask the user where the Jai distribution is located on this machine. Standard library modules are at `<jai>/modules/` — consult these when using or understanding Jai standard library APIs (Socket, Thread, POSIX, Linux, Atomics, etc.). The `<jai>/how_to/` directory contains detailed annotated examples of every language feature.
 
 ## Key Patterns
@@ -65,6 +69,7 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 - Workers use `reset_temporary_storage()` per epoll iteration for memory efficiency
 - Epoll for scalable I/O multiplexing; each worker has its own listen socket via SO_REUSEPORT (shared-nothing, no inter-worker communication)
 - Zero-copy parsing throughout: HTTP parser, URL decoder, form parser, multipart parser all use string views into the connection buffer where possible
+- **Idiomatic Jai patterns:** `ifx` for conditional expressions, `#specified` on enums with explicit values (enforces all variants have assigned values), named return values for self-documenting multi-return APIs (e.g. `-> (value: string, found: bool)`)
 
 ## Shared State Architecture
 

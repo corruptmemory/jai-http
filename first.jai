@@ -93,7 +93,7 @@ build_tests :: (options: Build_Options, build_dir: string = "build_tests") {
         }
     }
     compiler_end_intercept(w);
-    Autorun.run_build_result(w);
+    Autorun.run_build_result_of_workspace(w);
     
     set_build_options_dc(.{do_output=false});    
 }

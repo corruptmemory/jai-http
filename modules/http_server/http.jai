@@ -26,7 +26,7 @@ Response :: struct {
 
 Handler :: #type (request: *Request, response: *Response);
 
-Parse_State :: enum u8 {
+Parse_State :: enum u8 #specified {
     REQUEST_LINE :: 0;
     HEADERS      :: 1;
     BODY         :: 2;
@@ -34,14 +34,14 @@ Parse_State :: enum u8 {
     ERROR        :: 4;
 }
 
-Parse_Result :: enum u8 {
+Parse_Result :: enum u8 #specified {
     INCOMPLETE :: 0;
     COMPLETE   :: 1;
     ERROR      :: 2;
 }
 
 // Look up a request header by name (case-insensitive).
-get_header :: (request: *Request, name: string) -> string, bool {
+get_header :: (request: *Request, name: string) -> (value: string, found: bool) {
     for i: 0..cast(s64) request.header_count - 1 {
         if string_equals_ci(request.headers[i].name, name) {
             return request.headers[i].value, true;
@@ -182,9 +182,7 @@ reset_for_next_request :: (c: *Connection) {
 
 // Serialize and write a response to the fd.
 write_response :: (fd: s32, response: *Response, keep_alive: bool) {
-    conn_str: string;
-    if keep_alive conn_str = "keep-alive";
-    else conn_str = "close";
+    conn_str := ifx keep_alive then "keep-alive" else "close";
 
     if response.header_count == 0 {
         // Fast path: no custom headers
@@ -216,12 +214,25 @@ status_text :: (code: u16) -> string {
         case 201; return "Created";
         case 204; return "No Content";
         case 301; return "Moved Permanently";
+        case 302; return "Found";
+        case 303; return "See Other";
+        case 304; return "Not Modified";
+        case 307; return "Temporary Redirect";
+        case 308; return "Permanent Redirect";
         case 400; return "Bad Request";
+        case 401; return "Unauthorized";
         case 403; return "Forbidden";
         case 404; return "Not Found";
         case 405; return "Method Not Allowed";
+        case 409; return "Conflict";
+        case 413; return "Payload Too Large";
+        case 415; return "Unsupported Media Type";
+        case 422; return "Unprocessable Entity";
+        case 429; return "Too Many Requests";
         case 500; return "Internal Server Error";
+        case 502; return "Bad Gateway";
         case 503; return "Service Unavailable";
+        case 504; return "Gateway Timeout";
         case; return "Unknown";
     }
 }

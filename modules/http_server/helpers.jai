@@ -73,7 +73,7 @@ url_decode :: (s: string) -> string {
 
 // Look up a query parameter by name from the request's query string.
 // Returns the URL-decoded value. Allocates from context allocator only if decoding is needed.
-query_param :: (req: *Request, name: string) -> string, bool {
+query_param :: (req: *Request, name: string) -> (value: string, found: bool) {
     qs := req.query_string;
     if qs.count == 0 {
         result: string;
@@ -173,7 +173,7 @@ parse_form :: (req: *Request) -> Form_Data {
 }
 
 // Look up a form value by name.
-form_value :: (form: *Form_Data, name: string) -> string, bool {
+form_value :: (form: *Form_Data, name: string) -> (value: string, found: bool) {
     for i: 0..cast(s64) form.count - 1 {
         if string_equals(form.values[i].name, name) {
             return form.values[i].value, true;
@@ -199,7 +199,7 @@ Multipart_Data :: struct {
 
 // Parse a multipart/form-data body. Returns the parsed data and true on success.
 // All strings are zero-copy views into the request body buffer.
-parse_multipart :: (req: *Request) -> Multipart_Data, bool {
+parse_multipart :: (req: *Request) -> (data: Multipart_Data, ok: bool) {
     data: Multipart_Data;
 
     // Extract boundary from Content-Type header

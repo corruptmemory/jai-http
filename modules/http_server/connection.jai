@@ -1,5 +1,5 @@
 
-Connection_State :: enum u8 {
+Connection_State :: enum u8 #specified {
     FREE   :: 0;
     ACTIVE :: 1;
 }

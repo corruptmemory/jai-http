@@ -105,7 +105,7 @@ proceed :: (ctx: *HTTP_Context) {
 
 // -- Path parameter access (reads from context.http) --
 
-param :: (name: string) -> string, bool {
+param :: (name: string) -> (value: string, found: bool) {
     ctx := context.http;
     if ctx == null {
         result: string;
