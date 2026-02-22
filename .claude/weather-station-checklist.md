@@ -37,6 +37,7 @@ Updated across sessions. Check items as they're completed and committed.
 - [x] CSV reader: map fields to struct via header (`read_row` with `parse_field_value` type dispatch)
 - [x] CSV column naming via `@"csv:NAME"` notes, `@"csv:-"` to skip fields
 - [x] Compile-time validated write overrides (`make_override` with `#assert`)
+- [ ] Read overrides: custom parse functions per field (symmetric with write overrides)
 - [x] Tests for write/read round-trip (16 tests)
 - [ ] Date-partitioned file paths (`data/YYYY-MM-DD/observations.csv`) — app-level concern
 - [ ] File rotation on date rollover — app-level concern

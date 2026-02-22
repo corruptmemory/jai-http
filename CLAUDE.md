@@ -112,6 +112,7 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 
 1. **Static file serving handler** — Thin wrapper: map wildcard path to embedded bytes (via `#run read_entire_file()`), set Content-Type from file extension, write body. Wildcard routes (`*filepath`) are already implemented.
 2. **JSON serialization** — At minimum, serialize structs to JSON strings for API endpoints. Jai's compile-time introspection (`type_info`) makes reflection-based serialization feasible.
+3. **CSV read overrides** — `read_row` has no override mechanism (write path has `#code` overrides). Needed for custom parse functions per field (e.g., percentage strings, custom date formats). Should be symmetric with write overrides.
 
 **NOT gaps** (already covered):
 - Routing: chi-style router with params, wildcards, middleware, mounting ✓
