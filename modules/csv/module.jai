@@ -259,4 +259,79 @@ write_default_field :: (field_ptr: *void, field_type: *Type_Info, builder: *Stri
     }
 }
 
+parse_field_value :: (field_str: string, field_type: *Type_Info, field_ptr: *void) -> bool {
+    if field_type.type == {
+        case .STRING;
+            (cast(*string) field_ptr).* = field_str;
+            return true;
+        case .FLOAT;
+            if field_type.runtime_size == 8 {
+                val, success, _ := string_to_float64(field_str);
+                if !success return false;
+                (cast(*float64) field_ptr).* = val;
+            } else {
+                val, success, _ := string_to_float(field_str);
+                if !success return false;
+                (cast(*float32) field_ptr).* = val;
+            }
+            return true;
+        case .INTEGER;
+            val, success, _ := to_integer(field_str);
+            if !success return false;
+            ti_int := cast(*Type_Info_Integer) field_type;
+            if ti_int.signed {
+                if field_type.runtime_size == {
+                    case 8; (cast(*s64) field_ptr).* = val;
+                    case 4; (cast(*s32) field_ptr).* = cast(s32) val;
+                    case 2; (cast(*s16) field_ptr).* = cast(s16) val;
+                    case 1; (cast(*s8)  field_ptr).* = cast(s8)  val;
+                }
+            } else {
+                uval := cast(u64) val;
+                if field_type.runtime_size == {
+                    case 8; (cast(*u64) field_ptr).* = uval;
+                    case 4; (cast(*u32) field_ptr).* = cast(u32) uval;
+                    case 2; (cast(*u16) field_ptr).* = cast(u16) uval;
+                    case 1; (cast(*u8)  field_ptr).* = cast(u8)  uval;
+                }
+            }
+            return true;
+        case .BOOL;
+            if field_str == "true"  { (cast(*bool) field_ptr).* = true;  return true; }
+            if field_str == "false" { (cast(*bool) field_ptr).* = false; return true; }
+            return false;
+        case;
+            return false;
+    }
+}
+
 #scope_export
+
+read_row :: (row: CSV_Row, header: CSV_Header, $T: Type) -> (result: T, ok: bool) {
+    result: T;
+    ti := cast(*Type_Info_Struct) type_info(T);
+
+    for member: ti.members {
+        col_name, skip := csv_column_name(member);
+        if skip  continue;
+
+        // Find column index in header
+        col_index := -1;
+        for i: 0..header.count-1 {
+            if header.names[i] == col_name {
+                col_index = i;
+                break;
+            }
+        }
+
+        if col_index < 0  return .{}, false;  // required column missing
+        if col_index >= row.count  return .{}, false;  // row too short
+
+        field_ptr := cast(*void)(cast(*u8) *result + member.offset_in_bytes);
+        if !parse_field_value(row.fields[col_index], member.type, field_ptr) {
+            return .{}, false;  // parse failure
+        }
+    }
+
+    return result, true;
+}

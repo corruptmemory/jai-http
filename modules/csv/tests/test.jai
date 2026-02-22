@@ -144,6 +144,45 @@ test_write_row_with_override :: () {
     print("  PASS: test_write_row_with_override\n");
 }
 
+// Simple struct for read tests (no notes, to test basic functionality first)
+Simple_Record :: struct {
+    name:  string;
+    value: float64;
+    count: int;
+}
+
+test_read_row :: () {
+    header := parse_header("name,value,count");
+    row := split_line("sensor,72.5,10");
+    result, ok := read_row(row, header, Simple_Record);
+    assert(ok, "read_row should succeed");
+    assert(result.name == "sensor", "name: expected 'sensor', got '%'", result.name);
+    assert(result.value == 72.5, "value: expected 72.5, got %", result.value);
+    assert(result.count == 10, "count: expected 10, got %", result.count);
+    print("  PASS: test_read_row\n");
+}
+
+test_read_row_column_reorder :: () {
+    // Columns in different order than struct fields
+    header := parse_header("count,name,value");
+    row := split_line("10,sensor,72.5");
+    result, ok := read_row(row, header, Simple_Record);
+    assert(ok, "read_row should succeed with reordered columns");
+    assert(result.name == "sensor", "name: expected 'sensor', got '%'", result.name);
+    assert(result.value == 72.5, "value: expected 72.5, got %", result.value);
+    assert(result.count == 10, "count: expected 10, got %", result.count);
+    print("  PASS: test_read_row_column_reorder\n");
+}
+
+test_read_row_missing_column :: () {
+    // Header doesn't have 'count' column — should fail gracefully
+    header := parse_header("name,value");
+    row := split_line("sensor,72.5");
+    _, ok := read_row(row, header, Simple_Record);
+    assert(!ok, "read_row should fail when required column is missing");
+    print("  PASS: test_read_row_missing_column\n");
+}
+
 main :: () {
     print("Running CSV tests...\n\n");
 
@@ -168,6 +207,11 @@ main :: () {
     test_write_row_default();
     test_write_row_skip_field();
     test_write_row_with_override();
+
+    print("\nread_row:\n");
+    test_read_row();
+    test_read_row_column_reorder();
+    test_read_row_missing_column();
 
     print("\nAll CSV tests passed.\n");
 }
