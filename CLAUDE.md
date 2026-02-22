@@ -27,6 +27,12 @@ The build system is Jai's compile-time metaprogramming via `first.jai`. All buil
 
 **Compiler flags:** `-release` is deprecated as of 0.2.026. Use `-o` or `-optimized` for release builds, `-od` or `-optimized_debug` for optimized debug. Our build metaprogram handles this via its own `release`/`debug` args, so this only matters if invoking the compiler directly.
 
+Standalone experiments (not part of the build system):
+```bash
+~/jai/jai/bin/jai-linux experiments/csv_macro_test.jai    # Compile-time override validation
+~/jai/jai/bin/jai-linux experiments/csv_insert_test.jai   # #code AST rewriting experiment
+```
+
 Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 ## Architecture
@@ -54,6 +60,10 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 - `tests/test.jai` — 15 tests covering single-threaded ops, multi-threaded producer/consumer, and close behavior
 - Used for shared state via actor pattern (see "Shared State Architecture" below)
 
+**Experiments** (`experiments/`):
+- `csv_macro_test.jai` — Compile-time override validation via `#expand` macro. Proves "constructor validates, value dispatches" pattern: `$`-baked params in `make_override` give compile-time `#assert` (field existence + signature matching), return value carries type-erased `*void` fn pointer for runtime dispatch. Overrides array is runtime (`:=`), validation is compile-time.
+- `csv_insert_test.jai` — Builds on above with `#code` AST rewriting to eliminate struct type boilerplate. User writes `csv_write_row(*builder, *sample, #code .[ make_override("field", fn) ])` — no struct type anywhere. Macro walks Code AST via `compiler_get_nodes`, validates field names against `type_info(T)`, generates `make_override_internal(StructType, ...)` calls via string `#insert,scope()`. Two-phase compile-time validation: AST walk (field names) + polymorph generation (signatures).
+
 **Entry points:**
 - `server/main.jai` — Configures router with routes and starts the HTTP server
 - `client/main.jai` — Client stub
@@ -79,6 +89,8 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 - Zero-copy parsing throughout: HTTP parser, URL decoder, form parser, multipart parser all use string views into the connection buffer where possible
 - **Idiomatic Jai patterns:** `ifx` for conditional expressions, `#specified` on enums with explicit values (enforces all variants have assigned values), named return values for self-documenting multi-return APIs (e.g. `-> (value: string, found: bool)`)
 - **Thread API vs Thread_Group:** Raw `Thread` (`thread_init`, `thread_start`, `thread_is_done`, `thread_deinit`) is for one-shot threads with custom procs. `Thread_Group` is a work-stealing thread pool — all threads run the same callback, work is dispatched via `add_work()` / `get_completed_work()`. Use raw Thread for actor/consumer patterns; Thread_Group for parallel data processing.
+- **"Constructor validates, value dispatches" pattern:** When you need compile-time validation + runtime dispatch, put all validation in a function with `$`-baked params (`$S: Type, $name: string, $fn: $F`). `#assert` fires at compile time during polymorph generation. The return value carries runtime data (e.g. `cast(*void) fn`). The overrides array is `:=` (runtime), not `::` (constant), because function pointers aren't compile-time constants.
+- **`#code` AST rewriting pattern:** `#import "Compiler"` gives access to `compiler_get_nodes(code)` which returns a flat list of all AST nodes. Define a helper inside an `#expand` macro, call it with `#run`, walk/modify the AST or generate a string, and `#insert,scope()` the result. `#code` delays name resolution — identifiers don't need to exist until insertion. This enables "phantom function" patterns where user writes a clean API in `#code` and the macro rewrites it. See `experiments/csv_insert_test.jai`.
 
 ## Shared State Architecture
 
@@ -104,6 +116,7 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 - Query params: helpers.jai ✓
 - Time/date handling: datetime module (RFC3339 parsing, date formatting, Unix epoch, start-of-day, relative time, duration bucketing) ✓
 - Float formatting: `formatFloat(value, trailing_width=1, zero_removal=.NO)` ✓
+- CSV serialization: compile-time validated, type-info-based struct→CSV with per-field override support (experiments prove the pattern; module not yet extracted) ✓
 
 ## Future Considerations
 

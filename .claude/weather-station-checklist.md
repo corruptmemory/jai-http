@@ -99,3 +99,4 @@ Record what was accomplished each session for continuity.
 |------|---------|-------------|
 | 2026-02-21 | Initial | Gap analysis complete, checklist created |
 | 2026-02-21 | Datetime | `modules/datetime/` — parse_rfc3339, format_date, to_unix/from_unix, start_of_day, hours_ago/days_ago, bucket_start. 19 tests. Extracted `build_and_run_test` helper in first.jai. Float formatting verified. |
+| 2026-02-21 | Channel | Fixed 3 bugs in `modules/channel/`: added `close()`, fixed `send()` recheck after wake, fixed `receive()` to return `(T, bool)` and drain buffered items. Fixed latent named-import compilation bug. 15 tests (single-threaded, multi-threaded, close behavior). 96 tests total. |
