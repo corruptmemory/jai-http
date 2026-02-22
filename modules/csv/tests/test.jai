@@ -126,6 +126,24 @@ test_write_row_skip_field :: () {
     print("  PASS: test_write_row_skip_field\n");
 }
 
+write_value_fixed :: (value: *float64, builder: *String_Builder) {
+    print_to_builder(builder, "%", formatFloat(value.*, trailing_width=1, zero_removal=.NO));
+}
+
+test_write_row_with_override :: () {
+    record := Test_Record.{name = "sensor", value = 72.5, count = 10, label = "outdoor", internal = 999};
+    builder: String_Builder;
+    csv_write_row(*builder, *record, overrides = .[
+        make_override(Test_Record, "value", write_value_fixed),
+    ]);
+    result := builder_to_string(*builder);
+    print("  write_row_with_override result: '%'\n", result);
+    // The override should format value as "72.5" (fixed 1 decimal)
+    // Expected: "sensor",72.5,10,"outdoor"
+    assert(result == "\"sensor\",72.5,10,\"outdoor\"", "Expected '\"sensor\",72.5,10,\"outdoor\"', got '%'", result);
+    print("  PASS: test_write_row_with_override\n");
+}
+
 main :: () {
     print("Running CSV tests...\n\n");
 
@@ -149,6 +167,7 @@ main :: () {
     print("\ncsv_write_row:\n");
     test_write_row_default();
     test_write_row_skip_field();
+    test_write_row_with_override();
 
     print("\nAll CSV tests passed.\n");
 }
