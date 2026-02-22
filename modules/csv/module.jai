@@ -107,3 +107,13 @@ split_line :: (line: string) -> CSV_Row() {
 
     return row;
 }
+
+parse_header :: (line: string) -> CSV_Header() {
+    row := split_line(line);
+    header: CSV_Header();
+    header.count = row.count;
+    for i: 0..row.count-1 {
+        header.names[i] = row.fields[i];
+    }
+    return header;
+}

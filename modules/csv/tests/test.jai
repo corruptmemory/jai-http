@@ -71,6 +71,18 @@ test_split_line_empty_fields :: () {
     print("  PASS: test_split_line_empty_fields\n");
 }
 
+// -- parse_header tests --
+
+test_parse_header :: () {
+    header := parse_header("name,value,count,Label");
+    assert(header.count == 4, "Expected 4 columns, got %", header.count);
+    assert(header.names[0] == "name", "Col 0: expected 'name', got '%'", header.names[0]);
+    assert(header.names[1] == "value");
+    assert(header.names[2] == "count");
+    assert(header.names[3] == "Label", "Col 3: expected 'Label', got '%'", header.names[3]);
+    print("  PASS: test_parse_header\n");
+}
+
 main :: () {
     print("Running CSV tests...\n\n");
 
@@ -84,6 +96,9 @@ main :: () {
     test_split_line_quoted();
     test_split_line_escaped_quotes();
     test_split_line_empty_fields();
+
+    print("\nparse_header:\n");
+    test_parse_header();
 
     print("\nAll CSV tests passed.\n");
 }
