@@ -93,6 +93,39 @@ test_write_header :: () {
     print("  PASS: test_write_header\n");
 }
 
+// -- csv_write_row tests --
+
+test_write_row_default :: () {
+    record := Test_Record.{name = "sensor", value = 72.5, count = 10, label = "outdoor", internal = 999};
+    builder: String_Builder;
+    csv_write_row(*builder, *record);
+    result := builder_to_string(*builder);
+    // internal (csv:-) should be omitted. Strings are quoted. Expect:
+    // "sensor",72.5,10,"outdoor"
+    print("  write_row_default result: '%'\n", result);
+    // Check structural correctness: 4 fields, 3 commas
+    comma_count := 0;
+    for i: 0..result.count-1 {
+        if result.data[i] == #char ","  comma_count += 1;
+    }
+    assert(comma_count == 3, "Expected 3 commas (4 fields), got % commas", comma_count);
+    print("  PASS: test_write_row_default\n");
+}
+
+test_write_row_skip_field :: () {
+    record := Test_Record.{name = "a", value = 1.0, count = 2, label = "b", internal = 42};
+    builder: String_Builder;
+    csv_write_row(*builder, *record);
+    result := builder_to_string(*builder);
+    // Should have exactly 3 commas (4 fields), not 4 commas (5 fields)
+    comma_count := 0;
+    for i: 0..result.count-1 {
+        if result.data[i] == #char ","  comma_count += 1;
+    }
+    assert(comma_count == 3, "Expected 3 commas (4 fields), got % commas", comma_count);
+    print("  PASS: test_write_row_skip_field\n");
+}
+
 main :: () {
     print("Running CSV tests...\n\n");
 
@@ -112,6 +145,10 @@ main :: () {
 
     print("\nwrite_header:\n");
     test_write_header();
+
+    print("\ncsv_write_row:\n");
+    test_write_row_default();
+    test_write_row_skip_field();
 
     print("\nAll CSV tests passed.\n");
 }
