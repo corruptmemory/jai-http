@@ -31,12 +31,15 @@ Updated across sessions. Check items as they're completed and committed.
 - [x] Tests for parse/format round-trip and arithmetic (19 tests)
 
 ### CSV Read/Write
-- [ ] CSV writer: format row, handle quoting
-- [ ] CSV writer: auto-create file with header row
-- [ ] CSV reader: parse rows into field arrays
-- [ ] Date-partitioned file paths (`data/YYYY-MM-DD/observations.csv`)
-- [ ] File rotation on date rollover
-- [ ] Tests for write/read round-trip
+- [x] CSV writer: format row, handle quoting (`csv_write_row` with `write_default_field` type dispatch)
+- [x] CSV writer: header row from struct type (`write_header` with note-aware column names)
+- [x] CSV reader: parse rows into field arrays (`split_line` with RFC 4180 quoting support)
+- [x] CSV reader: map fields to struct via header (`read_row` with `parse_field_value` type dispatch)
+- [x] CSV column naming via `@"csv:NAME"` notes, `@"csv:-"` to skip fields
+- [x] Compile-time validated write overrides (`make_override` with `#assert`)
+- [x] Tests for write/read round-trip (16 tests)
+- [ ] Date-partitioned file paths (`data/YYYY-MM-DD/observations.csv`) — app-level concern
+- [ ] File rotation on date rollover — app-level concern
 
 ### HTML Response Building
 - [ ] Verify `tprint` + pool allocator works for HTML string building
@@ -100,3 +103,4 @@ Record what was accomplished each session for continuity.
 | 2026-02-21 | Initial | Gap analysis complete, checklist created |
 | 2026-02-21 | Datetime | `modules/datetime/` — parse_rfc3339, format_date, to_unix/from_unix, start_of_day, hours_ago/days_ago, bucket_start. 19 tests. Extracted `build_and_run_test` helper in first.jai. Float formatting verified. |
 | 2026-02-21 | Channel | Fixed 3 bugs in `modules/channel/`: added `close()`, fixed `send()` recheck after wake, fixed `receive()` to return `(T, bool)` and drain buffered items. Fixed latent named-import compilation bug. 15 tests (single-threaded, multi-threaded, close behavior). 96 tests total. |
+| 2026-02-21 | CSV | `modules/csv/` — write_header, csv_write_row (with type-erased overrides), split_line (RFC 4180), parse_header, read_row (header-mapped). Note-based column naming (`@"csv:NAME"`, `@"csv:-"`). Compile-time override validation via baked params + `#assert`. 16 tests. 112 tests total. |
