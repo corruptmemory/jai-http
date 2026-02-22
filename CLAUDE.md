@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 3 (routing + helpers) complete, plus datetime module. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. 81 tests passing (62 http_server + 19 datetime). ~1.6M req/s at 32t/2000c with routing overhead.
+**Current status:** Milestone 3 (routing + helpers) complete, plus datetime module. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. 96 tests passing (62 http_server + 19 datetime + 15 channel). ~1.6M req/s at 32t/2000c with routing overhead.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
@@ -21,7 +21,7 @@ The build system is Jai's compile-time metaprogramming via `first.jai`. All buil
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - debug    # Debug build → build_debug/server, build_debug/client
 ~/jai/jai/bin/jai-linux first.jai - release  # Release build → build_release/server, build_release/client
-~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/tests, build_tests/datetime_tests
+~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/tests, build_tests/datetime_tests, build_tests/channel_tests
 ```
 **Note:** Single dash `-` separates compiler args from metaprogram args. Double dash `--` is reserved for compiler developer options.
 
@@ -49,7 +49,10 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 **Channel module** (`modules/channel/`):
 - Standalone generic typed blocking queue (`Channel(T)`) using mutex/condition variables
 - Cache-line aware padding for contiguous array items
-- Preserved for shared state via actor pattern (see "Shared State Architecture" below)
+- API: `init`, `destroy`, `send` (blocks when full), `receive` (returns `(T, bool)` — blocks when empty, `ok=false` when closed+empty), `close` (wakes all blocked threads)
+- Proper shutdown semantics: `close` sets flag + broadcasts on both condition variables; `send` rechecks `closed` after waking from full-buffer wait; `receive` drains buffered items before reporting closure
+- `tests/test.jai` — 15 tests covering single-threaded ops, multi-threaded producer/consumer, and close behavior
+- Used for shared state via actor pattern (see "Shared State Architecture" below)
 
 **Entry points:**
 - `server/main.jai` — Configures router with routes and starts the HTTP server
@@ -69,12 +72,13 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 - **Per-request pool allocator:** Each Worker owns a `Pool` (from `#import "Pool"` — NOT `Flat_Pool`). Before dispatch, `push_context` swaps `context.allocator` to the pool. After dispatch, `Pool_Module.reset()` bulk-frees all per-request allocations. Handler code uses `alloc()`, `New()`, etc. with automatic per-request cleanup.
 - **Why Pool, not Flat_Pool:** Flat_Pool reserves large contiguous virtual address space via mmap (default 256MB). With 16 workers that's 4GB VIRT — misleading in htop. Pool allocates 64KB heap blocks on demand, recycles on reset(), only shows actual RSS.
 - **Module scoping gotchas:** `#scope_file` restricts to the file, `#scope_module` makes visible within the module but not to importers, default scope exports to importers. When utility functions are needed across module files but shouldn't conflict with standard library names (e.g. `to_lower`), use `#scope_module`.
-- **Named vs anonymous imports and operators:** A named import (`Basic :: #import "Basic"`) namespaces everything under `Basic.`, but operator overloads for types like `Apollo_Time` (inherited from `S128` via `#type,isa`) don't propagate through namespaces. If your module does arithmetic on `Apollo_Time`, use an anonymous import (`#import "Basic"`) to bring operators into scope. The http_server module uses a named import because it doesn't do Apollo_Time arithmetic; the datetime module uses anonymous because it does.
+- **Named vs anonymous imports and operators:** A named import (`Basic :: #import "Basic"`) namespaces everything under `Basic.`, meaning bare `assert`, `free`, `NewArray` etc. won't compile — they need `Basic.assert`, `Basic.free`, etc. Operator overloads for types like `Apollo_Time` (inherited from `S128` via `#type,isa`) also don't propagate through namespaces. **Prefer anonymous imports** (`#import "Basic"`) for modules that use Basic broadly (datetime, channel modules). Named imports are useful when you want to avoid polluting the namespace or only call a few qualified functions (http_server module).
 - **Module parameters aren't exported:** Importers can't reference `MAX_PARAMS` etc. In test code, use `type_of(HTTP_Context.params)` to get the array type instead.
 - Workers use `reset_temporary_storage()` per epoll iteration for memory efficiency
 - Epoll for scalable I/O multiplexing; each worker has its own listen socket via SO_REUSEPORT (shared-nothing, no inter-worker communication)
 - Zero-copy parsing throughout: HTTP parser, URL decoder, form parser, multipart parser all use string views into the connection buffer where possible
 - **Idiomatic Jai patterns:** `ifx` for conditional expressions, `#specified` on enums with explicit values (enforces all variants have assigned values), named return values for self-documenting multi-return APIs (e.g. `-> (value: string, found: bool)`)
+- **Thread API vs Thread_Group:** Raw `Thread` (`thread_init`, `thread_start`, `thread_is_done`, `thread_deinit`) is for one-shot threads with custom procs. `Thread_Group` is a work-stealing thread pool — all threads run the same callback, work is dispatched via `add_work()` / `get_completed_work()`. Use raw Thread for actor/consumer patterns; Thread_Group for parallel data processing.
 
 ## Shared State Architecture
 
