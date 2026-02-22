@@ -60,7 +60,7 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 ## Jai Toolchain
 
-**IMPORTANT:** Before writing or modifying Jai code, read `.claude/jai-reference.md` for a comprehensive language reference covering syntax, semantics, and patterns. Also read `.claude/jai-stdlib-reference.md` for a cheat-sheet of all standard library modules and their key APIs.
+**MANDATORY:** Before writing or modifying ANY Jai code — including in subagents, plan tasks, and background agents — you MUST first invoke the `jai-language` skill using the Skill tool. This loads the comprehensive language reference (syntax, semantics, import rules, operator overloading, named vs anonymous imports, and common pitfalls). This is NOT optional. Do not rely on prior knowledge of Jai; always load the skill first. Additionally, read `.claude/jai-stdlib-reference.md` for a cheat-sheet of all standard library modules and their key APIs.
 
 **Jai compiler version:** Codebase targets beta 0.2.026. When the compiler is updated, check `~/jai/jai/CHANGELOG.txt` (top of file) for breaking changes — especially renamed APIs, deprecated syntax, and removed modules.
 
