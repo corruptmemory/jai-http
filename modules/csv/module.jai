@@ -24,3 +24,17 @@ CSV_Override :: struct {
 
 // Type-erased writer signature for override dispatch
 Writer_Fn :: #type (*void, *String_Builder);
+
+csv_column_name :: (member: Type_Info_Struct_Member) -> (name: string, skip: bool) {
+    for note: member.notes {
+        if note.count >= 4 {
+            prefix := string.{4, note.data};
+            if prefix == "csv:" {
+                remainder := string.{note.count - 4, note.data + 4};
+                if remainder == "-"  return "", true;
+                return remainder, false;
+            }
+        }
+    }
+    return member.name, false;
+}
