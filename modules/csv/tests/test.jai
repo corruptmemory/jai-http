@@ -133,8 +133,8 @@ write_value_fixed :: (value: *float64, builder: *String_Builder) {
 test_write_row_with_override :: () {
     record := Test_Record.{name = "sensor", value = 72.5, count = 10, label = "outdoor", internal = 999};
     builder: String_Builder;
-    csv_write_row(*builder, *record, overrides = .[
-        make_override(Test_Record, "value", write_value_fixed),
+    csv_write_row(*builder, *record, #code .[
+        make_override("value", write_value_fixed),
     ]);
     result := builder_to_string(*builder);
     print("  write_row_with_override result: '%'\n", result);

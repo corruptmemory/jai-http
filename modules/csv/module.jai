@@ -1,6 +1,7 @@
 
 #scope_module
 #import "Basic";
+#import "Compiler";
 
 #scope_export
 
@@ -129,7 +130,83 @@ parse_header :: (line: string) -> CSV_Header() {
     return header;
 }
 
-csv_write_row :: (builder: *String_Builder, row: *$T, overrides: [] CSV_Override = .[]) {
+csv_write_row :: (builder: *String_Builder, row: *$T, override_code: Code = #code .[]) #expand {
+
+    // Compile-time AST walker: extracts make_override() calls from the #code,
+    // validates field names against type_info(T), and generates
+    // make_override_internal() calls with the struct type injected.
+    // Caller-scope identifiers (struct name, write functions) are backtick-prefixed
+    // so they resolve in the caller's scope across the module boundary.
+    generate_overrides_code :: (code: Code, struct_ti: *Type_Info) -> string {
+        si := cast(*Type_Info_Struct) struct_ti;
+        struct_name := si.name;
+
+        root, expressions := compiler_get_nodes(code);
+
+        sb: String_Builder;
+        append(*sb, "_csv_overrides := CSV_Override.[\n");
+
+        for expressions {
+            if it.kind != .PROCEDURE_CALL continue;
+            call := cast(*Code_Procedure_Call) it;
+
+            if call.procedure_expression.kind != .IDENT continue;
+            proc_ident := cast(*Code_Ident) call.procedure_expression;
+            if proc_ident.name != "make_override" continue;
+
+            args := call.arguments_unsorted;
+            if args.count != 2 {
+                compiler_report("make_override expects exactly 2 arguments: (field_name, write_fn)");
+                return "";
+            }
+
+            // Arg 0: string literal (field name)
+            field_expr := args[0].expression;
+            if field_expr.kind != .LITERAL {
+                compiler_report("make_override: first argument must be a string literal");
+                return "";
+            }
+            literal := cast(*Code_Literal) field_expr;
+            if literal.value_type != .STRING {
+                compiler_report("make_override: first argument must be a string literal");
+                return "";
+            }
+            field_name := literal._string;
+
+            // Validate field exists on the struct at compile time
+            field_found := false;
+            for member: si.members {
+                if member.name == field_name {
+                    field_found = true;
+                    break;
+                }
+            }
+            if !field_found {
+                compiler_report(sprint("CSV override error: field '%' does not exist on struct '%'",
+                    field_name, struct_name));
+                return "";
+            }
+
+            // Arg 1: identifier (function name)
+            fn_expr := args[1].expression;
+            if fn_expr.kind != .IDENT {
+                compiler_report("make_override: second argument must be a function identifier");
+                return "";
+            }
+            fn_ident := cast(*Code_Ident) fn_expr;
+
+            // Backtick-prefix caller-scope identifiers (struct name, write fn)
+            print_to_builder(*sb, "    make_override_internal(`%, \"%\", `%),\n",
+                struct_name, field_name, fn_ident.name);
+        }
+
+        append(*sb, "];\n");
+        return builder_to_string(*sb);
+    }
+
+    _gen :: #run generate_overrides_code(override_code, type_info(T));
+    #insert,scope() _gen;
+
     ti := cast(*Type_Info_Struct) type_info(T);
     first := true;
     for member: ti.members {
@@ -142,7 +219,7 @@ csv_write_row :: (builder: *String_Builder, row: *$T, overrides: [] CSV_Override
         field_ptr := cast(*void)(cast(*u8) row + member.offset_in_bytes);
 
         has_override := false;
-        for override: overrides {
+        for override: _csv_overrides {
             if member.name == override.field_name {
                 writer := cast,force(Writer_Fn) override.write_fn;
                 writer(field_ptr, builder);
@@ -157,9 +234,9 @@ csv_write_row :: (builder: *String_Builder, row: *$T, overrides: [] CSV_Override
     }
 }
 
-// Compile-time validated override constructor. All parameters are baked ($),
-// so field existence and signature checks happen at compile time via #assert.
-make_override :: ($S: Type, $name: string, $fn: $F) -> CSV_Override {
+// Internal override constructor — called from generated code, not directly by users.
+// All parameters are baked ($), so #assert fires at compile time.
+make_override_internal :: ($S: Type, $name: string, $fn: $F) -> CSV_Override {
     #assert check_field_exists(type_info(S), name)
         "CSV override error: field does not exist on struct";
     #assert check_signature(type_info(S), name, type_info(F))
