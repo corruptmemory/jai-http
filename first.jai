@@ -97,6 +97,7 @@ build_tests :: (options: Build_Options, build_dir: string = "build_tests") {
     build_and_run_test("tests", "tests", "modules/http_server/tests/test.jai", build_dir);
     build_and_run_test("datetime_tests", "datetime_tests", "modules/datetime/tests/test.jai", build_dir);
     build_and_run_test("channel_tests", "channel_tests", "modules/channel/tests/test.jai", build_dir);
+    build_and_run_test("csv_tests", "csv_tests", "modules/csv/tests/test.jai", build_dir);
     set_build_options_dc(.{do_output=false});
 }
 
