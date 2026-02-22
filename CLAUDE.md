@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 3 (routing + helpers) complete, plus datetime module. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. 96 tests passing (62 http_server + 19 datetime + 15 channel). ~1.6M req/s at 32t/2000c with routing overhead.
+**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. 119 tests passing (70 http_server + 19 datetime + 15 channel + 15 CSV). ~1.6M req/s at 32t/2000c with routing overhead.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
@@ -60,9 +60,14 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 - `tests/test.jai` — 15 tests covering single-threaded ops, multi-threaded producer/consumer, and close behavior
 - Used for shared state via actor pattern (see "Shared State Architecture" below)
 
+**CSV module** (`modules/csv/`):
+- `module.jai` — Compile-time validated CSV read/write. `@"csv:NAME"` notes for column naming, `@"csv:-"` to skip fields. `csv_write_row` is an `#expand` macro: accepts `#code .[ make_override("field", fn) ]`, walks AST at compile time via `compiler_get_nodes`, validates field names, generates `make_override_internal` calls with backtick-prefixed caller-scope identifiers. Two-phase validation: AST walk (field existence) + polymorph `#assert` (signature matching). Runtime: type-erased `Writer_Fn` dispatch. `read_row` maps CSV fields to struct via header column names. `split_line` handles RFC 4180 (quoted fields, escaped double-quotes).
+- `tests/test.jai` — 15 tests covering note parsing, split_line edge cases, write/read paths, overrides.
+
 **Experiments** (`experiments/`):
-- `csv_macro_test.jai` — Compile-time override validation via `#expand` macro. Proves "constructor validates, value dispatches" pattern: `$`-baked params in `make_override` give compile-time `#assert` (field existence + signature matching), return value carries type-erased `*void` fn pointer for runtime dispatch. Overrides array is runtime (`:=`), validation is compile-time.
-- `csv_insert_test.jai` — Builds on above with `#code` AST rewriting to eliminate struct type boilerplate. User writes `csv_write_row(*builder, *sample, #code .[ make_override("field", fn) ])` — no struct type anywhere. Macro walks Code AST via `compiler_get_nodes`, validates field names against `type_info(T)`, generates `make_override_internal(StructType, ...)` calls via string `#insert,scope()`. Two-phase compile-time validation: AST walk (field names) + polymorph generation (signatures).
+- `csv_macro_test.jai` — Proves "constructor validates, value dispatches" pattern in a single file.
+- `csv_insert_test.jai` — Proves `#code` AST rewriting in a single file (precursor to csv module).
+- `csv_cross_module/` — Proves backtick identifiers solve cross-module `#insert` scoping. Module defines `#expand` macro, caller defines types + functions — backtick-prefixed names in generated strings resolve in caller's scope.
 
 **Entry points:**
 - `server/main.jai` — Configures router with routes and starts the HTTP server
@@ -90,7 +95,8 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 - **Idiomatic Jai patterns:** `ifx` for conditional expressions, `#specified` on enums with explicit values (enforces all variants have assigned values), named return values for self-documenting multi-return APIs (e.g. `-> (value: string, found: bool)`)
 - **Thread API vs Thread_Group:** Raw `Thread` (`thread_init`, `thread_start`, `thread_is_done`, `thread_deinit`) is for one-shot threads with custom procs. `Thread_Group` is a work-stealing thread pool — all threads run the same callback, work is dispatched via `add_work()` / `get_completed_work()`. Use raw Thread for actor/consumer patterns; Thread_Group for parallel data processing.
 - **"Constructor validates, value dispatches" pattern:** When you need compile-time validation + runtime dispatch, put all validation in a function with `$`-baked params (`$S: Type, $name: string, $fn: $F`). `#assert` fires at compile time during polymorph generation. The return value carries runtime data (e.g. `cast(*void) fn`). The overrides array is `:=` (runtime), not `::` (constant), because function pointers aren't compile-time constants.
-- **`#code` AST rewriting pattern:** `#import "Compiler"` gives access to `compiler_get_nodes(code)` which returns a flat list of all AST nodes. Define a helper inside an `#expand` macro, call it with `#run`, walk/modify the AST or generate a string, and `#insert,scope()` the result. `#code` delays name resolution — identifiers don't need to exist until insertion. This enables "phantom function" patterns where user writes a clean API in `#code` and the macro rewrites it. See `experiments/csv_insert_test.jai`.
+- **`#code` AST rewriting pattern:** `#import "Compiler"` gives access to `compiler_get_nodes(code)` which returns a flat list of all AST nodes. Define a helper inside an `#expand` macro, call it with `#run`, walk/modify the AST or generate a string, and `#insert,scope()` the result. `#code` delays name resolution — identifiers don't need to exist until insertion. This enables "phantom function" patterns where user writes a clean API in `#code` and the macro rewrites it. **Cross-module gotcha:** `#insert` of a generated string inside an `#expand` macro resolves in the module's scope, not the caller's. Use backtick-prefixed identifiers (`` `Name ``) in the generated string for caller-scope names (types, functions). Module-defined names don't need backticks. See `modules/csv/module.jai` (production) and `experiments/csv_cross_module/` (proof-of-concept).
+- **Debugging `#insert`:** The compiler writes all `#insert`-ed strings to `.build/.added_strings_wN.jai` (hidden dot-prefixed file). Inspect this to see exactly what code was generated and inserted, with source locations. Invaluable for debugging `#code` + `#insert` macro patterns.
 
 ## Shared State Architecture
 
@@ -116,7 +122,7 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 - Query params: helpers.jai ✓
 - Time/date handling: datetime module (RFC3339 parsing, date formatting, Unix epoch, start-of-day, relative time, duration bucketing) ✓
 - Float formatting: `formatFloat(value, trailing_width=1, zero_removal=.NO)` ✓
-- CSV serialization: compile-time validated, type-info-based struct→CSV with per-field override support (experiments prove the pattern; module not yet extracted) ✓
+- CSV read/write: `modules/csv/` — `csv_write_row` (#expand macro with `#code` override API), `read_row` (header-mapped), `split_line` (RFC 4180), `@"csv:NAME"` notes. 15 tests. ✓
 
 ## Future Considerations
 
