@@ -108,6 +108,18 @@ split_line :: (line: string) -> CSV_Row() {
     return row;
 }
 
+write_header :: (builder: *String_Builder, $T: Type) {
+    ti := cast(*Type_Info_Struct) type_info(T);
+    first := true;
+    for member: ti.members {
+        col_name, skip := csv_column_name(member);
+        if skip  continue;
+        if !first  append(builder, ",");
+        first = false;
+        append(builder, col_name);
+    }
+}
+
 parse_header :: (line: string) -> CSV_Header() {
     row := split_line(line);
     header: CSV_Header();

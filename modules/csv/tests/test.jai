@@ -83,6 +83,16 @@ test_parse_header :: () {
     print("  PASS: test_parse_header\n");
 }
 
+// -- write_header tests --
+
+test_write_header :: () {
+    builder: String_Builder;
+    write_header(*builder, Test_Record);
+    result := builder_to_string(*builder);
+    assert(result == "name,value,count,Label", "Expected 'name,value,count,Label', got '%'", result);
+    print("  PASS: test_write_header\n");
+}
+
 main :: () {
     print("Running CSV tests...\n\n");
 
@@ -99,6 +109,9 @@ main :: () {
 
     print("\nparse_header:\n");
     test_parse_header();
+
+    print("\nwrite_header:\n");
+    test_write_header();
 
     print("\nAll CSV tests passed.\n");
 }
