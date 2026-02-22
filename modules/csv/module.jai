@@ -38,3 +38,72 @@ csv_column_name :: (member: Type_Info_Struct_Member) -> (name: string, skip: boo
     }
     return member.name, false;
 }
+
+split_line :: (line: string) -> CSV_Row() {
+    row: CSV_Row();
+    i := 0;
+
+    while i <= line.count && row.count < row.max_columns {
+        if i == line.count {
+            // Trailing comma produced an empty final field
+            if row.count > 0 && i > 0 && line.data[i-1] == #char "," {
+                row.fields[row.count] = "";
+                row.count += 1;
+            }
+            break;
+        }
+
+        if line.data[i] == #char "\"" {
+            // Quoted field
+            i += 1;  // skip opening quote
+            start := i;
+            has_escapes := false;
+
+            while i < line.count {
+                if line.data[i] == #char "\"" {
+                    if i + 1 < line.count && line.data[i + 1] == #char "\"" {
+                        has_escapes = true;
+                        i += 2;  // skip escaped quote
+                    } else {
+                        break;  // closing quote
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+
+            if has_escapes {
+                sb: String_Builder;
+                sb.allocator = temp;
+                j := start;
+                while j < i {
+                    if line.data[j] == #char "\"" && j + 1 < i && line.data[j + 1] == #char "\"" {
+                        append(*sb, "\"");
+                        j += 2;
+                    } else {
+                        append(*sb, string.{1, line.data + j});
+                        j += 1;
+                    }
+                }
+                row.fields[row.count] = builder_to_string(*sb,, allocator = temp);
+            } else {
+                row.fields[row.count] = string.{i - start, line.data + start};
+            }
+            row.count += 1;
+
+            if i < line.count  i += 1;  // skip closing quote
+            if i < line.count && line.data[i] == #char ","  i += 1;  // skip comma
+        } else {
+            // Unquoted field
+            start := i;
+            while i < line.count && line.data[i] != #char "," {
+                i += 1;
+            }
+            row.fields[row.count] = string.{i - start, line.data + start};
+            row.count += 1;
+            if i < line.count  i += 1;  // skip comma
+        }
+    }
+
+    return row;
+}

@@ -35,6 +35,42 @@ test_csv_column_name_skip :: () {
     print("  PASS: test_csv_column_name_skip\n");
 }
 
+// -- split_line tests --
+
+test_split_line_simple :: () {
+    row := split_line("a,b,c");
+    assert(row.count == 3, "Expected 3 fields, got %", row.count);
+    assert(row.fields[0] == "a", "Field 0: expected 'a', got '%'", row.fields[0]);
+    assert(row.fields[1] == "b", "Field 1: expected 'b', got '%'", row.fields[1]);
+    assert(row.fields[2] == "c", "Field 2: expected 'c', got '%'", row.fields[2]);
+    print("  PASS: test_split_line_simple\n");
+}
+
+test_split_line_quoted :: () {
+    row := split_line("\"hello, world\",b");
+    assert(row.count == 2, "Expected 2 fields, got %", row.count);
+    assert(row.fields[0] == "hello, world", "Field 0: expected 'hello, world', got '%'", row.fields[0]);
+    assert(row.fields[1] == "b", "Field 1: expected 'b', got '%'", row.fields[1]);
+    print("  PASS: test_split_line_quoted\n");
+}
+
+test_split_line_escaped_quotes :: () {
+    row := split_line("\"say \"\"hi\"\"\",b");
+    assert(row.count == 2, "Expected 2 fields, got %", row.count);
+    assert(row.fields[0] == "say \"hi\"", "Field 0: expected 'say \"hi\"', got '%'", row.fields[0]);
+    assert(row.fields[1] == "b");
+    print("  PASS: test_split_line_escaped_quotes\n");
+}
+
+test_split_line_empty_fields :: () {
+    row := split_line("a,,c");
+    assert(row.count == 3, "Expected 3 fields, got %", row.count);
+    assert(row.fields[0] == "a");
+    assert(row.fields[1] == "", "Field 1 should be empty, got '%'", row.fields[1]);
+    assert(row.fields[2] == "c");
+    print("  PASS: test_split_line_empty_fields\n");
+}
+
 main :: () {
     print("Running CSV tests...\n\n");
 
@@ -42,6 +78,12 @@ main :: () {
     test_csv_column_name_default();
     test_csv_column_name_custom();
     test_csv_column_name_skip();
+
+    print("\nsplit_line:\n");
+    test_split_line_simple();
+    test_split_line_quoted();
+    test_split_line_escaped_quotes();
+    test_split_line_empty_fields();
 
     print("\nAll CSV tests passed.\n");
 }
