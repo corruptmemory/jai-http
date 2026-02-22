@@ -56,30 +56,28 @@ build_sample_programs :: (options: Build_Options, build: string = "debug", build
         add_build_file("client/main.jai", w);
     }
 
-    set_build_options_dc(.{do_output=false});    
+    set_build_options_dc(.{do_output=false});
 }
 
-build_tests :: (options: Build_Options, build_dir: string = "build_tests") {
-    w := compiler_create_workspace("tests");
+build_and_run_test :: (workspace_name: string, executable_name: string, test_file: string, build_dir: string) {
+    w := compiler_create_workspace(workspace_name);
     if !w {
-        print("Server workspace creation failed.\n");
+        print("% workspace creation failed.\n", workspace_name);
         return;
     }
-    server_options := get_build_options(w);
-    args := server_options.compile_time_command_line;
+    opts := get_build_options(w);
     import_path: [..] string;
     array_add(*import_path, "modules");
-    array_add(*import_path, ..server_options.import_path);
-    server_options.import_path = import_path;
-    set_optimization(*server_options, .DEBUG);
-    server_options.arithmetic_overflow_check = .FATAL;
-    server_options.output_executable_name = "tests";
-
-    server_options.output_path = build_dir;
+    array_add(*import_path, ..opts.import_path);
+    opts.import_path = import_path;
+    set_optimization(*opts, .DEBUG);
+    opts.arithmetic_overflow_check = .FATAL;
+    opts.output_executable_name = executable_name;
+    opts.output_path = build_dir;
     make_directory_if_it_does_not_exist(build_dir);
-    set_build_options(server_options, w);
+    set_build_options(opts, w);
     compiler_begin_intercept(w);
-    add_build_file("modules/http_server/tests/test.jai", w);
+    add_build_file(test_file, w);
     while true {
         message := compiler_wait_for_message();
         if message.kind == {
@@ -88,14 +86,17 @@ build_tests :: (options: Build_Options, build_dir: string = "build_tests") {
             if mc.error_code != .NONE {
                 exit(1);
             }
-
             break;
         }
     }
     compiler_end_intercept(w);
     Autorun.run_build_result_of_workspace(w);
-    
-    set_build_options_dc(.{do_output=false});    
+}
+
+build_tests :: (options: Build_Options, build_dir: string = "build_tests") {
+    build_and_run_test("tests", "tests", "modules/http_server/tests/test.jai", build_dir);
+    build_and_run_test("datetime_tests", "datetime_tests", "modules/datetime/tests/test.jai", build_dir);
+    set_build_options_dc(.{do_output=false});
 }
 
 
@@ -110,7 +111,7 @@ build :: () {
           case "debug";
             build_sample_programs(options);
           case "test";
-            build_tests(options);  
+            build_tests(options);
           case;
             compiler_report(tprint("Command-line argument #%, '%', is invalid. Valid options are: 'debug', 'release', 'test'.\n", it_index+1, arg));
         }

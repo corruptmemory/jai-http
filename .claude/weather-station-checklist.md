@@ -21,13 +21,14 @@ Updated across sessions. Check items as they're completed and committed.
 - [ ] Tests for all supported types
 
 ### Time/Date Handling
-- [ ] Verify Jai stdlib `calendar_to_time()` / `time_to_calendar()` coverage
-- [ ] Parse RFC3339 string → Apollo_Time
-- [ ] Format Apollo_Time → RFC3339 string
-- [ ] Format Apollo_Time → `YYYY-MM-DD` (for directory names)
-- [ ] Date arithmetic: start of day, N days ago, N hours ago
-- [ ] Duration bucketing: group timestamps into fixed intervals
-- [ ] Tests for parse/format round-trip and arithmetic
+- [x] Verify Jai stdlib `calendar_to_apollo()` / `to_calendar()` coverage
+- [x] Parse RFC3339 string → Apollo_Time (`parse_rfc3339`, handles T and + separators)
+- [ ] Format Apollo_Time → RFC3339 string (not yet needed, add when required)
+- [x] Format Apollo_Time → `YYYY-MM-DD` (for directory names) (`format_date`)
+- [x] Date arithmetic: start of day, N days ago, N hours ago (`start_of_day`, `days_ago`, `hours_ago`)
+- [x] Duration bucketing: group timestamps into fixed intervals (`bucket_start`)
+- [x] Unix epoch conversions: `to_unix` / `from_unix`
+- [x] Tests for parse/format round-trip and arithmetic (19 tests)
 
 ### CSV Read/Write
 - [ ] CSV writer: format row, handle quoting
@@ -43,8 +44,8 @@ Updated across sessions. Check items as they're completed and committed.
 - [ ] Fragment helper (for htmx partial responses)
 
 ### Float Formatting
-- [ ] Verify `formatFloat` with fixed decimal places (e.g. `%.1` for temperature)
-- [ ] Write formatter if stdlib is insufficient
+- [x] Verify `formatFloat` with fixed decimal places — `formatFloat(value, trailing_width=1, zero_removal=.NO)` works
+- [x] No custom formatter needed
 
 ## Application Layer (weather-station app)
 
@@ -97,3 +98,4 @@ Record what was accomplished each session for continuity.
 | Date | Session | Accomplished |
 |------|---------|-------------|
 | 2026-02-21 | Initial | Gap analysis complete, checklist created |
+| 2026-02-21 | Datetime | `modules/datetime/` — parse_rfc3339, format_date, to_unix/from_unix, start_of_day, hours_ago/days_ago, bucket_start. 19 tests. Extracted `build_and_run_test` helper in first.jai. Float formatting verified. |

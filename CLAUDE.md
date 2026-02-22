@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 3 (routing + helpers) complete. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. 62 tests passing. ~1.6M req/s at 32t/2000c with routing overhead.
+**Current status:** Milestone 3 (routing + helpers) complete, plus datetime module. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. 81 tests passing (62 http_server + 19 datetime). ~1.6M req/s at 32t/2000c with routing overhead.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
@@ -21,7 +21,7 @@ The build system is Jai's compile-time metaprogramming via `first.jai`. All buil
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - debug    # Debug build → build_debug/server, build_debug/client
 ~/jai/jai/bin/jai-linux first.jai - release  # Release build → build_release/server, build_release/client
-~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/tests
+~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/tests, build_tests/datetime_tests
 ```
 **Note:** Single dash `-` separates compiler args from metaprogram args. Double dash `--` is reserved for compiler developer options.
 
@@ -31,7 +31,7 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 ## Architecture
 
-**Build metaprogram** (`first.jai`): Creates three compiler workspaces (server, client, tests). The `modules/` directory is added to the import path for all workspaces. Tests are auto-executed after compilation via `Autorun`.
+**Build metaprogram** (`first.jai`): Creates compiler workspaces (server, client, test suites). The `modules/` directory is added to the import path for all workspaces. Tests are auto-executed after compilation via `Autorun`. The `build_and_run_test` helper creates a test workspace from a workspace name, executable name, and test file path — adding new test suites is a one-liner.
 
 **HTTP Server module** (`modules/http_server/`):
 - `module.jai` — Module definition with compile-time parameters: `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`, `MAX_ROUTES`, `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS`, `MAX_FORM_VALUES`, `MAX_MULTIPART_PARTS`, `LISTEN_BACKLOG`. Imports Basic, Pool, POSIX, Linux, Socket, Thread.
@@ -41,6 +41,10 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 - `router.jai` — Chi-style router: `#add_context http: *HTTP_Context`, route types (Route, Router, Mount_Point), route registration (get/post/put/http_delete/route), middleware chains (use/proceed), sub-router mounting (mount), path param access (param), and dispatch with per-request context setup. Pattern matching supports literal segments, `:name` param capture, and `*name` wildcard (rest-of-path) segments.
 - `helpers.jai` — Response helpers (json/text/html/redirect), url_decode with zero-copy fast path, query_param lookup, form body parsing (Form_Data/parse_form/form_value), and multipart/form-data parsing (Multipart_Data/parse_multipart/multipart_value).
 - `server.jai` — Worker/Server structs, SO_REUSEPORT per-worker sockets, edge-triggered epoll event loop, per-request Pool allocator (reset after each dispatch via `push_context`).
+
+**Datetime module** (`modules/datetime/`):
+- `module.jai` — RFC3339 parsing (handles both `T` and `+` separators for AmbientWeather), date formatting (`YYYY-MM-DD`), Unix epoch conversions (`to_unix`/`from_unix`), `start_of_day`, `hours_ago`/`days_ago` relative time, `bucket_start` for duration-aligned bucketing. Uses anonymous `#import "Basic"` (not named) to bring Apollo_Time operators into scope.
+- `tests/test.jai` — 19 tests covering parse/format/roundtrip, epoch arithmetic, wall-clock tolerance, and bucket alignment.
 
 **Channel module** (`modules/channel/`):
 - Standalone generic typed blocking queue (`Channel(T)`) using mutex/condition variables
@@ -65,6 +69,7 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 - **Per-request pool allocator:** Each Worker owns a `Pool` (from `#import "Pool"` — NOT `Flat_Pool`). Before dispatch, `push_context` swaps `context.allocator` to the pool. After dispatch, `Pool_Module.reset()` bulk-frees all per-request allocations. Handler code uses `alloc()`, `New()`, etc. with automatic per-request cleanup.
 - **Why Pool, not Flat_Pool:** Flat_Pool reserves large contiguous virtual address space via mmap (default 256MB). With 16 workers that's 4GB VIRT — misleading in htop. Pool allocates 64KB heap blocks on demand, recycles on reset(), only shows actual RSS.
 - **Module scoping gotchas:** `#scope_file` restricts to the file, `#scope_module` makes visible within the module but not to importers, default scope exports to importers. When utility functions are needed across module files but shouldn't conflict with standard library names (e.g. `to_lower`), use `#scope_module`.
+- **Named vs anonymous imports and operators:** A named import (`Basic :: #import "Basic"`) namespaces everything under `Basic.`, but operator overloads for types like `Apollo_Time` (inherited from `S128` via `#type,isa`) don't propagate through namespaces. If your module does arithmetic on `Apollo_Time`, use an anonymous import (`#import "Basic"`) to bring operators into scope. The http_server module uses a named import because it doesn't do Apollo_Time arithmetic; the datetime module uses anonymous because it does.
 - **Module parameters aren't exported:** Importers can't reference `MAX_PARAMS` etc. In test code, use `type_of(HTTP_Context.params)` to get the array type instead.
 - Workers use `reset_temporary_storage()` per epoll iteration for memory efficiency
 - Epoll for scalable I/O multiplexing; each worker has its own listen socket via SO_REUSEPORT (shared-nothing, no inter-worker communication)
@@ -93,6 +98,8 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 - Shared state: Channel module + actor pattern ✓
 - Form/multipart parsing: helpers.jai ✓
 - Query params: helpers.jai ✓
+- Time/date handling: datetime module (RFC3339 parsing, date formatting, Unix epoch, start-of-day, relative time, duration bucketing) ✓
+- Float formatting: `formatFloat(value, trailing_width=1, zero_removal=.NO)` ✓
 
 ## Future Considerations
 
