@@ -207,6 +207,10 @@ accept_connections :: (w: *Worker) {
 
         if conn_fd < 0 break;  // EAGAIN — no more pending
 
+        // Disable Nagle's algorithm — send response bytes immediately
+        nodelay: s32 = 1;
+        setsockopt(conn_fd, xx IPPROTO.TCP, TCP_NODELAY, xx *nodelay, size_of(type_of(nodelay)));
+
         c := get_connection(*w.pool);
         if c == null {
             close(conn_fd);
