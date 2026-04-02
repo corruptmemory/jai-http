@@ -186,3 +186,24 @@ kill %1
 | 32 | 2000 | ~1,600,000 | ~4ms |
 
 Router dispatch adds ~36% overhead at 32t/2000c vs raw handler callback (2.49M → 1.6M). Investigated: pool allocator is NOT the cause (same numbers with/without it). The overhead is from push_context, match_pattern segment scanning, and middleware chain setup. Acceptable cost for routing functionality — optimization opportunity for later (e.g. radix tree, compiled dispatch table).
+
+**Milestone 3 + TCP_NODELAY + writev** (i7-12800H laptop, 20 logical cores, sysctl-tuned):
+| wrk Threads | Connections | Req/sec | Avg Latency |
+|-------------|------------|---------|-------------|
+| 1 | 10 | 245,591 | 25us |
+| 4 | 100 | 630,698 | 88us |
+| 8 | 500 | 951,780 | 505us |
+| 16 | 1000 | 929,938 | 1.26ms |
+| 32 | 2000 | 859,438 | 2.42ms |
+
+Numbers plateau and drop above 8t/500c: 16 server workers + 32 wrk threads = 48 threads on 20 cores causes scheduler oversubscription. These numbers are hardware-limited by the laptop. The Threadripper (64 logical cores, no oversubscription) is the meaningful benchmark target.
+
+**Nagle × Delayed ACK — the two-send deadlock (diagnosed and fixed):**
+`write_response` was making two separate `send_all()` calls (headers, then body). Without `TCP_NODELAY` this triggers a well-known deadlock: Nagle buffers the body (waiting for ACK of headers), but the client uses delayed ACKs (waits up to 40ms to piggyback the ACK). Both sides wait on each other — 40ms stall per response, reducing 32t/2000c throughput to ~87K req/s.
+
+`TCP_NODELAY` breaks the deadlock (87K → 850K), but with two separate sends it now emits two TCP segments per response instead of one (doubling packet overhead). Fixed by switching to `writev()`: sends `[headers, body]` atomically in a single syscall → one TCP segment regardless of Nagle state. `write_response` now builds the full header into a temp-allocated string (fast path: `tprint`; slow path: `String_Builder` with `Basic.temp`) and calls `writev()` once.
+
+**Host setup notes (i7-12800H, Artix Linux):**
+- `ulimit -n 65536` required for wrk at 32 threads (set in `/etc/security/limits.conf`)
+- `/etc/sysctl.d/99-benchmark.conf`: somaxconn=65535, netdev_max_backlog=65535, tcp_max_syn_backlog=65535, ip_local_port_range=1024-65535, tcp_slow_start_after_idle=0, tcp_fin_timeout=15
+- CPU governor: `echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor` (Intel P-state active mode, energy_performance_preference already set to performance)

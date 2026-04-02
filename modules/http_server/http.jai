@@ -181,30 +181,40 @@ reset_for_next_request :: (c: *Connection) {
 }
 
 // Serialize and write a response to the fd.
+// Uses writev() to send headers + body in a single syscall so TCP_NODELAY
+// does not split them into two packets.
 write_response :: (fd: s32, response: *Response, keep_alive: bool) {
     conn_str := ifx keep_alive then "keep-alive" else "close";
 
+    header: string;
     if response.header_count == 0 {
-        // Fast path: no custom headers
-        header := Basic.tprint("HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n\r\n",
+        // Fast path: no custom headers — one tprint, no loop
+        header = Basic.tprint("HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n\r\n",
             response.status_code, status_text(response.status_code),
             response.content_type, response.body.count, conn_str);
-        send_all(fd, header.data, header.count);
     } else {
-        header := Basic.tprint("HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n",
+        // Slow path: build all headers into a single temp buffer first
+        builder: Basic.String_Builder;
+        builder.allocator = Basic.temp;
+        Basic.print_to_builder(*builder, "HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n",
             response.status_code, status_text(response.status_code),
             response.content_type, response.body.count, conn_str);
-        send_all(fd, header.data, header.count);
         for i: 0..cast(s64) response.header_count - 1 {
-            hdr := Basic.tprint("%: %\r\n", response.headers[i].name, response.headers[i].value);
-            send_all(fd, hdr.data, hdr.count);
+            Basic.print_to_builder(*builder, "%: %\r\n", response.headers[i].name, response.headers[i].value);
         }
-        end_of_headers :: "\r\n";
-        send_all(fd, end_of_headers.data, end_of_headers.count);
+        Basic.append(*builder, "\r\n");
+        header = Basic.builder_to_string(*builder,, allocator = Basic.temp);
     }
 
     if response.body.count > 0 {
-        send_all(fd, response.body.data, response.body.count);
+        iov: [2] iovec;
+        iov[0].iov_base = cast(*void) header.data;
+        iov[0].iov_len  = xx header.count;
+        iov[1].iov_base = cast(*void) response.body.data;
+        iov[1].iov_len  = xx response.body.count;
+        writev(fd, iov.data, 2);
+    } else {
+        send_all(fd, header.data, header.count);
     }
 }
 
