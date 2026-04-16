@@ -147,8 +147,8 @@ File read/write operations.
 ### File_Utilities/
 Higher-level file helpers (directory listing, recursive operations).
 
-### File_Async/
-Asynchronous file I/O.
+### File_Async/ (REMOVED in 0.2.026)
+Was asynchronous file I/O. Removed to reduce maintenance footprint. Copy from an older beta if needed.
 
 ### File_Watcher/
 OS-level file change notification (inotify on Linux).
