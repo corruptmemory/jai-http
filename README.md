@@ -9,7 +9,8 @@ A high-performance HTTP/1.1 server library for [Jai](https://jai.community/), bu
 - **`#add_context` integration** -- Per-request `HTTP_Context` is injected into Jai's implicit context. Handlers access path params via `param("id")` with no explicit context argument.
 - **Per-request pool allocator** -- Each worker owns a `Pool` that resets after every request. Handler code uses `alloc()`, `New()`, dynamic arrays, etc. with automatic cleanup.
 - **Zero-copy parsing** -- HTTP request parser, URL decoder, form parser, and multipart parser all produce string views into the connection read buffer where possible.
-- **No external dependencies** -- Uses only Jai standard library modules.
+- **JSON serialization & parsing** -- Typed struct ⇄ JSON plus a generic `JSON_Value` tree, vendored from [rluba/jaison](https://github.com/rluba/jaison) (MIT).
+- **Batteries included, no install step** -- Builds with only the Jai compiler. No package manager and nothing to install at runtime; third-party modules (e.g. JSON) are vendored in-tree, not fetched. Like any Jai program, the resulting binary dynamically links a few system libraries such as libc (visible via `ldd`) -- we don't target fully-static musl linking, and that's fine.
 
 ## Performance
 
@@ -121,6 +122,32 @@ file := multipart_value(*data, "avatar");
 if file  print("filename: %\n", file.filename);
 ```
 
+## JSON
+
+Typed serialization and parsing via the vendored `json` module ([rluba/jaison](https://github.com/rluba/jaison)):
+
+```jai
+#import "json";
+
+Reading :: struct {
+    station:  string;
+    temp_f:   float;
+    humidity: int;
+}
+
+// Serialize a struct to a compact JSON string
+r := Reading.{station = "outdoor", temp_f = 72.5, humidity = 48};
+body := json_write_string(r, indent_char = "");
+// -> {"station": "outdoor","temp_f": 72.5,"humidity": 48}
+
+// Parse a JSON string back into a struct
+ok, parsed := json_parse_string(body, Reading);
+```
+
+Field names are customized with notes: `@JsonName(other_name)` to rename, `@JsonIgnore` to skip.
+For payloads whose shape isn't known at compile time, omit the type argument to get a generic
+`JSON_Value` tree instead: `ok, value := json_parse_string(body)`.
+
 ## Building
 
 Requires the Jai compiler (`~/jai/jai/bin/jai-linux`). Tested with beta 0.2.026.
@@ -177,6 +204,10 @@ modules/http_server/
   router.jai             -- Router, dispatch, middleware chains, #add_context
   helpers.jai            -- Response helpers, URL decode, query/form/multipart parsing
   server.jai             -- Worker threads, SO_REUSEPORT, event loop
+modules/json/            -- Vendored JSON (rluba/jaison, MIT): typed + generic interfaces
+modules/datetime/        -- RFC3339 parsing, formatting, Unix epoch, bucketing
+modules/channel/         -- Generic blocking queue Channel(T) for the actor pattern
+modules/csv/             -- Compile-time-validated CSV read/write (RFC 4180)
 ```
 
 ## License

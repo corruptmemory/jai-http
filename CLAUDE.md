@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. 119 tests passing (70 http_server + 19 datetime + 15 channel + 15 CSV). ~1.6M req/s at 32t/2000c with routing overhead.
+**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. Plus a vendored JSON module (rluba/jaison, MIT): typed struct ⇄ JSON and a generic `JSON_Value` tree. 119 unit tests passing (70 http_server + 19 datetime + 15 channel + 15 CSV), plus the vendored JSON suite (leak + round-trip harness). ~1.6M req/s at 32t/2000c with routing overhead. Builds and all tests pass on Jai beta 0.2.029.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
@@ -21,7 +21,7 @@ The build system is Jai's compile-time metaprogramming via `first.jai`. All buil
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - debug    # Debug build → build_debug/server, build_debug/client
 ~/jai/jai/bin/jai-linux first.jai - release  # Release build → build_release/server, build_release/client
-~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/tests, build_tests/datetime_tests, build_tests/channel_tests
+~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/{tests,datetime_tests,channel_tests,csv_tests,json_tests}
 ```
 **Note:** Single dash `-` separates compiler args from metaprogram args. Double dash `--` is reserved for compiler developer options.
 
@@ -64,6 +64,14 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 - `module.jai` — Compile-time validated CSV read/write. `@"csv:NAME"` notes for column naming, `@"csv:-"` to skip fields. `csv_write_row` is an `#expand` macro: accepts `#code .[ make_override("field", fn) ]`, walks AST at compile time via `compiler_get_nodes`, validates field names, generates `make_override_internal` calls with backtick-prefixed caller-scope identifiers. Two-phase validation: AST walk (field existence) + polymorph `#assert` (signature matching). Runtime: type-erased `Writer_Fn` dispatch. `read_row` maps CSV fields to struct via header column names. `split_line` handles RFC 4180 (quoted fields, escaped double-quotes).
 - `tests/test.jai` — 15 tests covering note parsing, split_line edge cases, write/read paths, overrides.
 
+**JSON module** (`modules/json/`):
+- **Vendored third-party** module from [rluba/jaison](https://github.com/rluba/jaison) (MIT, commit `2009cdb`). Provenance + the short list of local changes are in the header of `module.jai`. Module sources are verbatim; only `tests/test.jai` was adapted (load path + assertions + a pass-summary line) to join our suite.
+- Two interfaces: **typed** (reflection-based struct ⇄ JSON, the common case) and **generic** (`JSON_Value` tagged-union tree for unknown shapes). They compose — a struct field typed as `JSON_Value`/`*JSON_Value` is parsed generically.
+- API: `json_parse_string(str, T)` / `json_parse_string(str)` (generic) / `json_parse_file(...)`, `json_write_string(value, ...)` / `json_write_file(...)`, `json_escape_string`. Notes `@JsonName(x)` / `@JsonIgnore` (with pluggable `rename`/`ignore` procs). Configurable NaN/Inf handling via `Special_Float_Handling`.
+- Dependency: bundled `unicode_utils/` (rluba's jai-unicode, MIT) for `\uXXXX` decode — vendored alongside, resolved via `#import,dir "./unicode_utils"`.
+- **Perf note for the server hot path:** `parse_object` rebuilds a member lookup `Table` per object instance parsed (upstream flags this `@Speed`). Serialization is unaffected; only high-volume *parsing* would want this cached per type. Non-blocker today.
+- `tests/test.jai` — jaison's MEMORY_DEBUGGER leak harness: malformed-input rejection, typed/generic round-trips, and ~300 parse iterations checked for leaks. Reports `0 bytes leaked` at every checkpoint.
+
 **Experiments** (`experiments/`):
 - `csv_macro_test.jai` — Proves "constructor validates, value dispatches" pattern in a single file.
 - `csv_insert_test.jai` — Proves `#code` AST rewriting in a single file (precursor to csv module).
@@ -77,13 +85,13 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 
 **MANDATORY:** Before writing or modifying ANY Jai code — including in subagents, plan tasks, and background agents — you MUST first invoke the `jai-language` skill using the Skill tool. This loads the comprehensive language reference (syntax, semantics, import rules, operator overloading, named vs anonymous imports, and common pitfalls). This is NOT optional. Do not rely on prior knowledge of Jai; always load the skill first. Additionally, read `.claude/jai-stdlib-reference.md` for a cheat-sheet of all standard library modules and their key APIs.
 
-**Jai compiler version:** Codebase targets beta 0.2.026. When the compiler is updated, check `~/jai/jai/CHANGELOG.txt` (top of file) for breaking changes — especially renamed APIs, deprecated syntax, and removed modules.
+**Jai compiler version:** Builds and all tests pass on beta 0.2.029 (verified 2026-06-18). When the compiler is updated, check `~/jai/jai/CHANGELOG.txt` (top of file) for breaking changes — especially renamed APIs, deprecated syntax, and removed modules.
 
 The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not exist, ask the user where the Jai distribution is located on this machine. Standard library modules are at `<jai>/modules/` — consult these when using or understanding Jai standard library APIs (Socket, Thread, POSIX, Linux, Atomics, etc.). The `<jai>/how_to/` directory contains detailed annotated examples of every language feature.
 
 ## Key Patterns
 
-- No external dependencies — uses only Jai standard library modules (Basic, Pool, Socket, Thread, POSIX, Linux, Atomics, Machine_X64)
+- Batteries included, no install step — builds with only the Jai compiler; nothing to install at runtime. First-party code uses only Jai standard library modules (Basic, Pool, Socket, Thread, POSIX, Linux, Atomics, Machine_X64); third-party code (currently JSON, from rluba/jaison) is **vendored in-tree** under `modules/`, never fetched by a package manager. The resulting binary dynamically links system `.so`s (libc, etc. — visible via `ldd`); fully-static musl linking is explicitly not a goal.
 - **Per-request pool allocator:** Each Worker owns a `Pool` (from `#import "Pool"` — NOT `Flat_Pool`). Before dispatch, `push_context` swaps `context.allocator` to the pool. After dispatch, `Pool_Module.reset()` bulk-frees all per-request allocations. Handler code uses `alloc()`, `New()`, etc. with automatic per-request cleanup.
 - **Why Pool, not Flat_Pool:** Flat_Pool reserves large contiguous virtual address space via mmap (default 256MB). With 16 workers that's 4GB VIRT — misleading in htop. Pool allocates 64KB heap blocks on demand, recycles on reset(), only shows actual RSS.
 - **Module scoping gotchas:** `#scope_file` restricts to the file, `#scope_module` makes visible within the module but not to importers, default scope exports to importers. When utility functions are needed across module files but shouldn't conflict with standard library names (e.g. `to_lower`), use `#scope_module`.
@@ -111,8 +119,7 @@ The 16 SO_REUSEPORT workers are shared-nothing — they don't communicate with e
 Before the weather station app can be rebuilt in Jai, these library-level features are needed:
 
 1. **Static file serving handler** — Thin wrapper: map wildcard path to embedded bytes (via `#run read_entire_file()`), set Content-Type from file extension, write body. Wildcard routes (`*filepath`) are already implemented.
-2. **JSON serialization** — At minimum, serialize structs to JSON strings for API endpoints. Jai's compile-time introspection (`type_info`) makes reflection-based serialization feasible.
-3. **CSV read overrides** — `read_row` has no override mechanism (write path has `#code` overrides). Needed for custom parse functions per field (e.g., percentage strings, custom date formats). Should be symmetric with write overrides.
+2. **CSV read overrides** — `read_row` has no override mechanism (write path has `#code` overrides). Needed for custom parse functions per field (e.g., percentage strings, custom date formats). Should be symmetric with write overrides.
 
 **NOT gaps** (already covered):
 - Routing: chi-style router with params, wildcards, middleware, mounting ✓
@@ -124,6 +131,7 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 - Time/date handling: datetime module (RFC3339 parsing, date formatting, Unix epoch, start-of-day, relative time, duration bucketing) ✓
 - Float formatting: `formatFloat(value, trailing_width=1, zero_removal=.NO)` ✓
 - CSV read/write: `modules/csv/` — `csv_write_row` (#expand macro with `#code` override API), `read_row` (header-mapped), `split_line` (RFC 4180), `@"csv:NAME"` notes. 15 tests. ✓
+- JSON serialization & parsing: `modules/json/` — vendored rluba/jaison (MIT). Typed struct ⇄ JSON + generic `JSON_Value` tree, `@JsonName`/`@JsonIgnore` notes, NaN/Inf handling. Closes the former "JSON serialization" gap and adds parsing too. ✓
 
 ## Future Considerations
 
