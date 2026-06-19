@@ -204,6 +204,8 @@ kill %1
 
 Router dispatch adds ~36% overhead at 32t/2000c vs raw handler callback (2.49M → 1.6M). Investigated: pool allocator is NOT the cause (same numbers with/without it). The overhead is from push_context, match_pattern segment scanning, and middleware chain setup. Acceptable cost for routing functionality — optimization opportunity for later (e.g. radix tree, compiled dispatch table).
 
+> **SUPERSEDED — that 36% was a cross-milestone artifact, not isolated routing cost.** It compared Milestone 2's raw callback (2.49M) against Milestone 3's router (1.6M) — two builds differing in more than routing. A proper apples-to-apples A/B on the post-refactor core (raw vs routed through the *same* machinery) shows routing-one-route overhead is ≈ 0. See "Routing-overhead A/B" below.
+
 **Milestone 3 + TCP_NODELAY + writev** (i7-12800H laptop, 20 logical cores, sysctl-tuned):
 | wrk Threads | Connections | Req/sec | Avg Latency |
 |-------------|------------|---------|-------------|
@@ -224,3 +226,15 @@ Numbers plateau and drop above 8t/500c: 16 server workers + 32 wrk threads = 48 
 - `ulimit -n 65536` required for wrk at 32 threads (set in `/etc/security/limits.conf`)
 - `/etc/sysctl.d/99-benchmark.conf`: somaxconn=65535, netdev_max_backlog=65535, tcp_max_syn_backlog=65535, ip_local_port_range=1024-65535, tcp_slow_start_after_idle=0, tcp_fin_timeout=15
 - CPU governor: `echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor` (Intel P-state active mode, energy_performance_preference already set to performance)
+
+**Routing-overhead A/B** (2026-06-19, 64 logical cores, post handler/context refactor; `hello_world` routed vs `hello_world_raw` bare handler — identical `"Hello, World!"` response through the *same* core machinery):
+
+| wrk | raw (no routing) | routed (chi router) | delta |
+|-----|------------------|---------------------|-------|
+| t1 / c10  (3-rep avg) | 115,040 | 115,696 | +0.6% (noise) |
+| t4 / c100 (3-rep avg) | 351,106 | 351,251 | +0.04% (noise) |
+| t8 / c500  (1 run)    | 669,576 | 676,263 | — |
+| t16 / c1000 (1 run)   | 764,377 | 938,276 | — (variance) |
+| t32 / c2000 (1 run)   | 891,857 | 976,468 | — (variance) |
+
+**Finding:** for a *single* route, routing adds **no measurable overhead** — the low-noise points (3 reps each) overlap, so routed-vs-raw is ≈ 0. The router's fixed per-request cost (one `match_pattern` on `/`, method check, `HTTP_Context` build, inner `push_context`) is lost in the noise. The high-concurrency single-run points are variance-dominated (routed nominally ≥ raw is noise, not a real speedup — would need averaging). The real routing cost is **O(route count)**: `dispatch` linearly scans routes calling `match_pattern` per route, so it grows with the number of routes and a late match pays for every earlier miss — *that* is the radix-tree / compiled-dispatch target, not fixed overhead, and it only shows up as routes multiply. Absolute numbers here are NOT comparable to the milestone entries above (different machine/build/date); only the raw-vs-routed delta measured together is meaningful. Methodology + design: `docs/plans/2026-06-19-handler-context-refactor-design.md`.

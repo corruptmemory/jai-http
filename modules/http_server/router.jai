@@ -188,6 +188,26 @@ dispatch :: (router: *Router, req: *Request, resp: *Response) {
     }
 }
 
+// -- Routing as an OPTIONAL Handler layered on the core --
+//
+// server.jai knows nothing about routing; it just invokes a Handler. This adapter bridges the
+// generic Handler contract to dispatch(). It rides the generic context.handler_data slot with a
+// single internal cast, because Router is the library's OWN type and a module cannot be
+// parameterized by its own type (you'd need Handler_Data = http_server.Router while importing
+// http_server — circular). That cast is a TEMPORARY bridge: the committed next step lifts the
+// router into its own module importing the core with Handler_Data = Router, making this cast-free
+// (see docs/plans/2026-06-19-handler-context-refactor-design.md). Gated to the default (void)
+// parameterization — a typed Handler_Data means you are serving a single app handler, not routing.
+#if Handler_Data == void {
+    route_handler :: (req: *Request, resp: *Response) {
+        dispatch(cast(*Router) context.handler_data, req, resp);
+    }
+
+    serve :: (server: *Server, router: *Router) {
+        serve(server, route_handler, xx router);
+    }
+}
+
 // -- Pattern matching (public for testing) --
 
 // Segment-by-segment pattern matching.
