@@ -191,22 +191,52 @@ dispatch :: (router: *Router, req: *Request, resp: *Response) {
 // -- Routing as an OPTIONAL Handler layered on the core --
 //
 // The http_server core knows nothing about routing; it just invokes a bare Handler. This adapter
-// bridges that generic contract to dispatch(). It rides the core's context.handler_data slot with
-// a single internal cast: this module imports http_server with the DEFAULT program parameter
-// (Handler_Data = void), so context.handler_data is *void here. Eliminating this one cast — by
-// importing the core with Handler_Data = Router so the slot is already typed *Router — is the
-// committed next step (docs/plans/2026-06-19-handler-context-refactor-design.md). The cast is
-// confined to this adapter; it never appears in user handler code.
+// bridges that generic contract to dispatch(), cast-free: context.handler_data is statically typed
+// *Router because the consuming MAIN PROGRAM imports the core with Handler_Data = Router.
+//
+// That wiring is the consumer's job, explicitly (program parameters can only be supplied from the
+// main program — a library cannot do it, and shouldn't: pulling in this optional dependency means
+// you opt into the wiring). If main omits it, the #assert below fails LOUD and tells you exactly
+// what to add — no silent fallback, no magic.
 route_handler :: (req: *Request, resp: *Response) {
-    dispatch(cast(*Router) context.handler_data, req, resp);
+    // #run forces compile-time evaluation so the result is a constant #if can branch on.
+    ROUTER_COMPATIBLE :: #run handler_data_is_router(type_of(context.handler_data));
+    #if ROUTER_COMPATIBLE {
+        // Cast-free: context.handler_data is *Router, OR a *T whose T embeds Router via `#as using`
+        // (so the *T -> *Router conversion happens implicitly at the dispatch call below).
+        dispatch(context.handler_data, req, resp);
+    } else {
+        // Not a silent fallback — a hard compile error. compiler_report owns the entire message
+        // text (no compiler-generated prefix), so the consumer gets a clean, actionable diagnostic.
+        #run Compiler.compiler_report(#string MSG
+http_router is a cast-free routing layer: the core's per-request handler-state slot (Handler_Data)
+must be Router, OR a struct that embeds Router via `#as using` (so *Handler_Data converts to *Router).
+Only the MAIN PROGRAM can set Handler_Data — program parameters may be supplied solely from main,
+never from a library module (which is why this module can't wire itself).
+
+Fix: in your main program, import the core with a Router-compatible Handler_Data, e.g.
+
+    // simplest — the router itself is the handler state:
+    #import "http_server"()(Handler_Data = http_router.Router);
+
+    // or your own app-state that IS-A Router (handlers then read full app state, still cast-free):
+    //     App :: struct { #as using router: http_router.Router;  /* ...app fields... */ }
+    #import "http_server"()(Handler_Data = App);
+
+    http_router :: #import "http_router";
+MSG
+        );
+    }
 }
 
-// serve(*Server, *Router): install the router as the server's handler. Resolves to the core's
-// serve(*Server, Handler, *Handler_Data) — route_handler is the Handler, the router is its bound
-// state (xx auto-casts *Router -> *void). Consumers should namespace this import
-// (e.g. `http_router :: #import "http_router"`) so this never collides with the core's serve.
-serve :: (server: *Server, router: *Router) {
-    serve(server, route_handler, xx router);
+// serve(*Server, *T/Router): install the router as the server's handler. T is Router, or your own
+// app-state struct that embeds Router via `#as using` — i.e. exactly the type the main program set
+// as Handler_Data. We pass *T STRAIGHT THROUGH as the core's bound state (no downcast to *Router),
+// so the core stores the full *T and handlers later read context.handler_data as *T. Resolves to the
+// core's serve(*Server, Handler, *Handler_Data). Namespace this import (e.g. http_router :: #import
+// "http_router") so it never collides with the core's serve.
+serve :: (server: *Server, router: *$T/Router) {
+    serve(server, route_handler, router);
 }
 
 // -- Pattern matching (public for testing) --
@@ -294,6 +324,28 @@ match_pattern :: (pattern: string, path: string, params: *[MAX_PARAMS] Param, pa
 // -- Private helpers --
 
 #scope_file
+
+// Compile-time: is *Handler_Data assignable to *Router? (handler_data_ptr_type is type_of(context.handler_data),
+// i.e. the *Handler_Data pointer type.) True when Handler_Data is Router, or a struct that embeds Router via
+// `#as using` — which is precisely the relation that makes *Handler_Data implicitly convert to *Router, so the
+// cast-free dispatch(context.handler_data, ...) call typechecks. A plain `using` (no #as) only promotes field
+// access and does NOT make the pointer convertible, so we test the AS flag specifically. Recurses for multi-level.
+handler_data_is_router :: (handler_data_ptr_type: Type) -> bool {
+    info := cast(*Type_Info) handler_data_ptr_type;
+    if info.type != .POINTER  return false;
+    return is_router_base((cast(*Type_Info_Pointer) info).pointer_to);
+}
+
+is_router_base :: (t: *Type_Info) -> bool {
+    if t == type_info(Router)  return true;
+    if t.type != .STRUCT       return false;
+    s := cast(*Type_Info_Struct) t;
+    for s.members {
+        if !(it.flags & .AS)  continue;          // only #as members grant the implicit *T -> *base conversion
+        if is_router_base(it.type)  return true;
+    }
+    return false;
+}
 
 // Dispatch into a sub-router, running parent middleware first, then sub-router middleware.
 dispatch_with_middleware :: (parent: *Router, sub: *Router, req: *Request, resp: *Response) {

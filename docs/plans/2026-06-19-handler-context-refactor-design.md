@@ -89,14 +89,58 @@ never collide). All six suites pass; both examples build; `GET /`→200, `GET /m
 verified live. The cross-module `serve` overload resolved with **no** collision (named import
 made it moot anyway).
 
-**Cast-free finish — STILL PENDING.** `route_handler` still holds the single
-`cast(*Router) context.handler_data`, because the module imports the core with the default
-`Handler_Data = void`. The remaining step is to switch `http_router/module.jai` to
-`#import "http_server"()(Handler_Data = Router)` and drop the cast. Watch the program-parameter
-rules (how_to/380): `Handler_Data` is program-wide, supplied once, and that import must precede
-every other import of `http_server` — so the dual-import example/test sites must be reconciled
-(set the program param first, or route all core access through `http_router`). That ordering
-fragility is exactly why structural-first was sequenced ahead of it.
+**Cast-free finish — DONE (2026-06-19).** `route_handler` is now cast-free.
+
+**Key discovery that reshaped the plan:** the design's original mechanism — `http_router` doing
+`#import "http_server"()(Handler_Data = Router)` — is **illegal**. The compiler rejects it:
+*"This #import provides program parameters, but is not located in the main program. Program
+parameters can only be supplied from the main program."* A library module **cannot** supply program
+parameters at all; only the main program file can. (User's framing, and the right one: the consumer
+who pulls in the optional dependency does the explicit wiring — not the library. Library-supplied
+program params would be magic, and magic is discouraged.)
+
+So the cast-free contract is:
+- `http_router/module.jai` does a **bare** `#import "http_server"` — it *inherits* the program-wide
+  `Handler_Data`.
+- The consuming **main program** sets it: `#import "http_server"()(Handler_Data = http_router.Router)`.
+  Examples do this with a named `http_router :: #import "http_router"`; test mains import both
+  anonymously and reference `Router` directly (order-independent — `Router` resolves from the
+  anonymous `http_router` import). `Handler_Data = http_router.Router` forward-references the
+  later import fine.
+- `route_handler` is `#if type_of(context.handler_data) == *Router { dispatch(...) }` (cast-free) with
+  an `else` arm of `#run Compiler.compiler_report(<friendly message>)`. This is **not** a silent
+  fallback: a consumer that forgets to wire gets a clean, actionable compile error (no
+  `#assert`/"assertion failed" boilerplate — `compiler_report` owns the whole message). The bare
+  `*Router` won't parse on the RHS of `==` in expression position, so it goes through a named
+  constant (`EXPECTED_HANDLER_DATA :: *Router`).
+
+Verified: all 6 suites pass, both examples build, `GET /`→200 / `GET /missing`→404 live, and the
+unwired-consumer error message confirmed.
+
+**Generalization — `Handler_Data` need not be exactly `Router` (2026-06-19).** The earlier worry that
+the program-wide slot is "spent on `Router`" is **lifted**. `route_handler` now accepts `Handler_Data`
+that is `Router` **or any struct that embeds `Router` via `#as using`** (structural single-inheritance —
+the `$T/Router` relation). Mechanism:
+- `route_handler` guards with `#if #run handler_data_is_router(type_of(context.handler_data))`, a
+  compile-time `type_info` predicate (the how_to/160 `assert_in_body` style): true iff `Handler_Data`
+  is `Router`, or a struct with an `#as` member (member flag `AS`, *not* plain `USING`) of type
+  `Router`, recursively — i.e. iff `*Handler_Data` is assignable to `*Router`. (`#if` needs a constant,
+  so the call is wrapped in `#run`.) The true branch dispatches via the implicit `*Handler_Data → *Router`
+  conversion; the else branch is the `compiler_report` error (message updated to teach the `#as using`
+  option).
+- `serve` became `serve :: (server: *Server, router: *$T/Router)` — polymorphic with the structural
+  restriction — so the FULL `*T` (e.g. `*App`) passes straight through to the core's bound-state slot
+  with no downcast, keeping `context.handler_data` typed `*App` for handlers.
+
+So an app reclaims the single `Handler_Data` slot for its own state *and* keeps routing:
+```jai
+App :: struct { #as using router: http_router.Router;  greeting: string; }
+#import "http_server"()(Handler_Data = App);
+// handler: app := context.handler_data;  // *App, cast-free; router still dispatches cast-free
+```
+Verified live via `examples/app_state.jai` (`/`→200 with app-state body, `/missing`→404), all 6 suites
+green, and the precise-rejection cases (plain `using` without `#as`, and `void`) both fail loudly at
+compile time. Mechanism reference: `how_to/160_type_restrictions.jai` (`$T/R` + `#as using`).
 
 ## Benchmark methodology (the A/B)
 

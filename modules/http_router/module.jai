@@ -18,13 +18,14 @@
 
 #scope_module
 
-Basic :: #import "Basic";
+Basic    :: #import "Basic";
+Compiler :: #import "Compiler";   // compile-time only: friendly error in route_handler when the core isn't wired
 
-// The core. Imported with the DEFAULT program parameter (Handler_Data = void), so
-// context.handler_data is *void here and route_handler casts it back to *Router. Eliminating
-// that single cast — by importing the core with Handler_Data = Router — is the committed next
-// step (see docs/plans/2026-06-19-handler-context-refactor-design.md). Not re-exported: a
-// consumer imports `http_server` directly alongside this module (dual import).
+// The core. Bare import — it INHERITS the program-wide Handler_Data. This module's dispatch
+// adapter (router.jai) is cast-free, which requires context.handler_data to be typed *Router; i.e.
+// the consuming MAIN PROGRAM must import the core with `Handler_Data = Router`. (Program parameters
+// can only be supplied from the main program, never from a library module — so this import cannot
+// set it here.) A main that omits it gets a clear *void-vs-*Router type error, not silent breakage.
 #import "http_server";
 
 #load "router.jai";

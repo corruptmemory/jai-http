@@ -510,5 +510,9 @@ main :: () {
 }
 
 #import "Basic";
-#import "http_server";   // Request, Response, string_equals
-#import "http_router";   // Router, get/post, dispatch, param, proceed, use, mount, match_pattern, HTTP_Context, Middleware
+// Main program sets the program-wide Handler_Data = Router so the dispatch adapter is cast-free.
+// `Router` resolves via the anonymous http_router import below (order-independent). Both modules
+// imported anonymously so routing symbols stay unqualified; the two `serve`s form an overload set
+// but are never called here (tests drive dispatch() directly), so no collision.
+#import "http_server"()(Handler_Data = Router);   // Request, Response, string_equals
+#import "http_router";                            // Router, get/post, dispatch, param, proceed, use, mount, match_pattern, HTTP_Context, Middleware

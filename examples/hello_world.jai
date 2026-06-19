@@ -1,4 +1,7 @@
-#import "http_server";                  // core: Request, Response, Server, init_server, ... (ambient HTTP vocabulary)
+// The main program sets the program-wide Handler_Data = http_router.Router (only main may supply
+// program parameters). That types context.handler_data as *Router so http_router's dispatch adapter
+// is cast-free. The bare core symbols (Request, Response, Server, init_server, ...) stay ambient.
+#import "http_server"()(Handler_Data = http_router.Router);
 http_router :: #import "http_router";   // optional routing layer, explicitly namespaced
 
 hello_handler :: (request: *Request, response: *Response) {
