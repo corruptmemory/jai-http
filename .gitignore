@@ -6,3 +6,6 @@ tmp/
 build_debug/
 build_release/
 build_tests/
+
+# Per-machine Claude Code settings — local only, never tracked
+.claude/settings.local.json
