@@ -8,7 +8,7 @@
 build-target grammar in `first.jai`.
 
 **Architecture:** `first.jai` parses `compile_time_command_line` tokens by shape (`-release`,
-`-run`, `run-tests`, `--`, bare-word targets), resolves targets dynamically to
+`-run`, `run-tests`, `++` passthrough, bare-word targets), resolves targets dynamically to
 `examples/<name>.jai`, and builds into `build_debug/` or `build_release/` (tests into
 `build_tests/`). Debug is the implied default; `-release` is the only mode modifier.
 
@@ -69,17 +69,23 @@ Expected: `examples/hello_world.jai` exists; `server/` and `client/` gone.
 //   -release      build optimized (default is debug; there is NO -debug token)
 //   -run          run the single build target after building
 //   run-tests     build + run all unit-test suites (exclusive: no other targets)
-//   --            end of our args; everything after is passed to the run target,
-//                 and the presence of `--` implies -run
+//   ++            end of our args; everything after is passed to the run target,
+//                 and the presence of `++` implies -run
 //   <name>        a build target → examples/<name>.jai
 //
 //   first.jai -                            build ALL examples/*.jai (debug, no run)
 //   first.jai - hello_world                build one example (debug, no run)
 //   first.jai - hello_world -release       → build_release/hello_world
 //   first.jai - hello_world -run           build + run (debug)
-//   first.jai - hello_world -- --port 9090 build + run, passthrough (`--` implies -run)
+//   first.jai - hello_world ++ --port 9090 build + run, passthrough (`++` implies -run)
 //   first.jai - run-tests                  build + run all suites (debug)
 //   first.jai - run-tests -release         same, optimized
+//
+// Why `++` and not `--` as the passthrough separator: the Jai compiler reserves a
+// standalone `--` for its OWN developer options — everything after the last `--` is
+// consumed by the compiler and never reaches compile_time_command_line. `++` is an
+// ordinary token that passes straight through, as do `--`-PREFIXED args after it
+// (e.g. `--port`); only a *standalone* `--` is special, so don't forward one.
 // ─────────────────────────────────────────────────────────────────────────────
 
 build :: () {
@@ -92,14 +98,14 @@ build :: () {
 
     args := get_build_options().compile_time_command_line;
 
-    // Split at the FIRST `--`: tokens after it are passthrough to the run target, and
-    // the presence of `--` implies -run. The `--` token itself is consumed.
+    // Split at the FIRST `++`: tokens after it are passthrough to the run target, and
+    // the presence of `++` implies -run. The `++` token itself is consumed.
     front := args;
     passthrough: [] string;
-    saw_double_dash := false;
+    saw_separator := false;
     for args {
-        if it == "--" {
-            saw_double_dash = true;
+        if it == "++" {
+            saw_separator = true;
             front       = array_view(args, 0, it_index);
             passthrough = array_view(args, it_index + 1, args.count - it_index - 1);
             break;
@@ -125,15 +131,15 @@ build :: () {
         }
     }
 
-    run := run_flag || saw_double_dash;   // `--` implies -run
+    run := run_flag || saw_separator;   // `++` implies -run
 
     if run_tests_flag {
         if targets.count > 0 {
             compiler_report(tprint("`run-tests` is exclusive; it cannot be combined with build targets (got %).\n", targets));
             return;
         }
-        if saw_double_dash {
-            compiler_report("`run-tests` takes no `--` passthrough (`--` is only for running a single example).\n");
+        if saw_separator {
+            compiler_report("`run-tests` takes no `++` passthrough (`++` is only for running a single example).\n");
             return;
         }
         // -run alongside run-tests is a no-op (tests always run); allowed silently.
@@ -143,11 +149,11 @@ build :: () {
 
     if run {
         if targets.count == 0 {
-            compiler_report("`-run` (or `--`) needs exactly one build target, but none was given.\n");
+            compiler_report("`-run` (or `++`) needs exactly one build target, but none was given.\n");
             return;
         }
         if targets.count > 1 {
-            compiler_report(tprint("`-run` (or `--`) needs exactly one build target, but % were given: %.\n", targets.count, targets));
+            compiler_report(tprint("`-run` (or `++`) needs exactly one build target, but % were given: %.\n", targets.count, targets));
             return;
         }
         build_example(targets[0], optimized, run = true, passthrough);
@@ -306,7 +312,7 @@ Expected: exit 0; all five suites build and run; pass summaries print
 ~/jai/jai/bin/jai-linux first.jai - a b -run                # "2 were given"
 ~/jai/jai/bin/jai-linux first.jai - nope                    # "No example named 'nope'"
 ~/jai/jai/bin/jai-linux first.jai - -bogus                  # "Unknown modifier '-bogus'"
-~/jai/jai/bin/jai-linux first.jai - run-tests -- x          # "run-tests takes no `--` passthrough"
+~/jai/jai/bin/jai-linux first.jai - run-tests ++ x          # "run-tests takes no `++` passthrough"
 ```
 
 Expected: each prints its message and exits non-zero (`echo $status` ≠ 0 in fish).

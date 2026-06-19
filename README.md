@@ -150,23 +150,35 @@ For payloads whose shape isn't known at compile time, omit the type argument to 
 
 ## Building
 
-Requires the Jai compiler (`~/jai/jai/bin/jai-linux`). Tested with beta 0.2.026.
+Requires the Jai compiler (`~/jai/jai/bin/jai-linux`). Tested with beta 0.2.029.
+
+Build targets are bare words that resolve to `examples/<name>.jai`. Debug is the default;
+`-release` flips to optimized. `-run` runs the single target after building, and `++` forwards
+everything after it to that target (implying `-run`). The passthrough separator is `++` rather
+than `--` because a standalone `--` is reserved by the Jai compiler for its own developer options.
 
 ```bash
-# Debug build
-~/jai/jai/bin/jai-linux first.jai - debug
+# Build ALL examples (debug) → build_debug/
+~/jai/jai/bin/jai-linux first.jai -
 
-# Release build
-~/jai/jai/bin/jai-linux first.jai - release
+# Build one example (debug) → build_debug/hello_world
+~/jai/jai/bin/jai-linux first.jai - hello_world
 
-# Build and run tests
-~/jai/jai/bin/jai-linux first.jai - test
+# Optimized build → build_release/hello_world
+~/jai/jai/bin/jai-linux first.jai - hello_world -release
+
+# Build + run an example; forward args after `++`
+~/jai/jai/bin/jai-linux first.jai - hello_world -run
+~/jai/jai/bin/jai-linux first.jai - hello_world ++ --port 9090
+
+# Build and run ALL test suites
+~/jai/jai/bin/jai-linux first.jai - run-tests
 ```
 
-Run the server:
+Run a built example:
 
 ```bash
-./build_debug/server    # listens on 0.0.0.0:9090
+./build_debug/hello_world    # listens on 0.0.0.0:9090
 ```
 
 ## Module Parameters
@@ -195,7 +207,7 @@ Override at import time:
 ## Architecture
 
 ```
-server/main.jai          -- Example server entry point
+examples/hello_world.jai -- Example server entry point (build targets: examples/*.jai)
 modules/http_server/
   module.jai             -- Module definition, parameters, imports
   http.jai               -- Request/Response types, zero-copy parser, serializer

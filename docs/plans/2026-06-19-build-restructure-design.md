@@ -40,21 +40,26 @@ interleave freely.
 | `-release`       | build mode = OPTIMIZED (the **only** mode modifier)                     |
 | `-run`           | autorun the single build target                                        |
 | `run-tests`      | the exclusive test verb                                                |
-| `--`             | end of first.jai args; everything after is passthrough to the run target (**implies `-run`**) |
+| `++`             | end of first.jai args; everything after is passthrough to the run target (**implies `-run`**) |
 | any other bare word | a build target → `examples/<word>.jai`                              |
 
 - **Debug is the default and implied** — there is no `-debug` token. Build mode is a single
   boolean (`optimized := false`, flipped by `-release`). The old "both `-debug` and
   `-release`" contradiction is **structurally impossible** — nothing to resolve, nothing to
   get wrong. (No-silent-failures: the bad combination is unrepresentable, not merely rejected.)
-- Any **unrecognized `-flag`** before `--` is a hard error listing valid modifiers.
+- Any **unrecognized `-flag`** before `++` is a hard error listing valid modifiers.
+- **Passthrough separator is `++`, not `--`.** A standalone `--` is reserved by the Jai
+  compiler for its own developer options — everything after the last `--` is consumed by the
+  compiler and never reaches `compile_time_command_line`. `++` passes straight through to the
+  metaprogram (as do `--`-*prefixed* tokens after it, e.g. `--port`); only a *standalone* `--`
+  is special, so a literal `--` cannot be forwarded to the run target (a nonissue in practice).
 
 ## Section 3: Dispatch & validation
 
 ```
-split tokens at the FIRST `--`  → (front, passthrough)
+split tokens at the FIRST `++`  → (front, passthrough)
 classify front into: optimized (bool), run_flag (bool), run_tests_flag (bool), targets[]
-run := run_flag OR (passthrough present)        // `--` implies -run
+run := run_flag OR (saw `++`)                   // `++` implies -run
 
 if run_tests_flag:
     error if targets present          ("run-tests is exclusive; cannot combine with targets …")
@@ -62,7 +67,7 @@ if run_tests_flag:
     ignore -run                         (no-op)
     → build + run all test suites in <mode> into build_tests/
 else if run:
-    error unless exactly one target     (0 → "nothing to run"; ≥2 → "-run/`--` needs a single target")
+    error unless exactly one target     (0 → "nothing to run"; ≥2 → "-run/`++` needs a single target")
     → build that target into build_<mode>/, then run it with passthrough args
 else:
     if targets empty → build ALL examples/*.jai into build_<mode>/ (run none)   // the no-arg default
@@ -70,8 +75,8 @@ else:
 ```
 
 Error conditions (all hard, via `compiler_report`, no silent acceptance):
-- `run-tests` combined with any build target, or with `--`/passthrough.
-- `-run` (or `--`) with zero targets, or with ≥2 targets.
+- `run-tests` combined with any build target, or with `++`/passthrough.
+- `-run` (or `++`) with zero targets, or with ≥2 targets.
 - A named target whose `examples/<name>.jai` does not exist (error lists discovered examples).
 - An unrecognized `-flag`.
 
@@ -124,7 +129,7 @@ jai-linux first.jai -                                 # build ALL examples (debu
 jai-linux first.jai - hello_world                     # build one example (debug, no run)
 jai-linux first.jai - hello_world -release            # → build_release/hello_world
 jai-linux first.jai - hello_world -run                # build + run (debug)
-jai-linux first.jai - hello_world -- --port 9090      # build + run, passthrough (`--` implies -run)
+jai-linux first.jai - hello_world ++ --port 9090      # build + run, passthrough (`++` implies -run)
 jai-linux first.jai - hello_world -run -release       # build + run, optimized
 jai-linux first.jai - hello_world foo bar             # build three, run none
 jai-linux first.jai - run-tests                       # build + run all suites (debug)

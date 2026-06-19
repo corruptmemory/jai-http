@@ -19,13 +19,21 @@ Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Fea
 The build system is Jai's compile-time metaprogramming via `first.jai`. All builds are invoked through the Jai compiler:
 
 ```bash
-~/jai/jai/bin/jai-linux first.jai - debug    # Debug build → build_debug/server, build_debug/client
-~/jai/jai/bin/jai-linux first.jai - release  # Release build → build_release/server, build_release/client
-~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/{tests,datetime_tests,channel_tests,csv_tests,json_tests}
+# Build targets are bare words → examples/<name>.jai. Modifiers start with `-`.
+~/jai/jai/bin/jai-linux first.jai -                              # Build ALL examples/*.jai → build_debug/ (no run)
+~/jai/jai/bin/jai-linux first.jai - hello_world                 # Build one example → build_debug/hello_world
+~/jai/jai/bin/jai-linux first.jai - hello_world -release        # Optimized → build_release/hello_world
+~/jai/jai/bin/jai-linux first.jai - hello_world -run            # Build + run (debug)
+~/jai/jai/bin/jai-linux first.jai - hello_world ++ --port 9090  # Build + run, forwarding args after `++` (`++` implies -run)
+~/jai/jai/bin/jai-linux first.jai - run-tests                   # Build + run ALL suites → build_tests/{tests,datetime_tests,channel_tests,csv_tests,json_tests}
+~/jai/jai/bin/jai-linux first.jai - run-tests -release          # Same, optimized
 ```
-**Note:** Single dash `-` separates compiler args from metaprogram args. Double dash `--` is reserved for compiler developer options.
 
-**Compiler flags:** `-release` is deprecated as of 0.2.026. Use `-o` or `-optimized` for release builds, `-od` or `-optimized_debug` for optimized debug. Our build metaprogram handles this via its own `release`/`debug` args, so this only matters if invoking the compiler directly.
+**Grammar (classified by token shape, not position):** `-release` = optimized (debug is the implied default — there is **no** `-debug`); `-run` = run the single target after building; `run-tests` = the exclusive test verb (build + run all suites; cannot be combined with build targets or `++`); `++` = everything after is passed through to the run target, and its presence implies `-run`; any other bare word is a build target resolved dynamically to `examples/<name>.jai`. `-run`/`++` require exactly one target. **Adding an example is just dropping a file into `examples/`** — no `first.jai` edit.
+
+**Note:** Single dash `-` separates compiler args from metaprogram args. A **standalone** double dash `--` is reserved by the compiler for its own developer options (everything after the last `--` never reaches `compile_time_command_line`) — which is exactly why the passthrough separator is `++`, not `--`. (`--`-*prefixed* tokens like `--port` after `++` pass through fine; only a lone `--` is special.)
+
+**Compiler flags:** The metaprogram chooses optimization itself from its own `-release` modifier (which is a *metaprogram* arg after the `-` separator, distinct from the compiler's deprecated `-release`/`-optimized` flags). You do not pass compiler optimization flags directly.
 
 Standalone experiments (not part of the build system):
 ```bash
@@ -33,7 +41,7 @@ Standalone experiments (not part of the build system):
 ~/jai/jai/bin/jai-linux experiments/csv_insert_test.jai   # #code AST rewriting experiment
 ```
 
-Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
+Run an example: `./build_debug/hello_world` (listens on 0.0.0.0:9090)
 
 ## Architecture
 
@@ -78,8 +86,9 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 - `csv_cross_module/` — Proves backtick identifiers solve cross-module `#insert` scoping. Module defines `#expand` macro, caller defines types + functions — backtick-prefixed names in generated strings resolve in caller's scope.
 
 **Entry points:**
-- `server/main.jai` — Configures router with routes and starts the HTTP server
-- `client/main.jai` — Client stub
+- `examples/hello_world.jai` — Example program: configures a router and starts the HTTP server on `0.0.0.0:9090`. Build targets are discovered dynamically from `examples/*.jai`; add more examples by dropping files here.
+
+**No native HTTP client.** A from-scratch client (TLS, HTTP/2, HTTP/3, redirects, cookies, cert chains) is a correctness tarpit that libcurl already owns, so the client will be a thin libcurl wrapper (future, separate module) — not native Jai. The old `client/` stub has been removed.
 
 ## Jai Toolchain
 
@@ -143,8 +152,8 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 **IMPORTANT:** After each milestone / "got it working" loop, re-run the standard wrk benchmark suite against a release build to track progress. If numbers regress or stall, pause and investigate before moving on.
 
 ```bash
-~/jai/jai/bin/jai-linux first.jai - release
-./build_release/server &
+~/jai/jai/bin/jai-linux first.jai - hello_world -release
+./build_release/hello_world &
 wrk -t1 -c10 -d10s http://localhost:9090/
 wrk -t4 -c100 -d10s http://localhost:9090/
 wrk -t8 -c500 -d10s http://localhost:9090/
