@@ -75,6 +75,29 @@ Extract the router into its **own module** (e.g. `modules/http_router/`) that do
 stays 100% routing-agnostic, the GetRect↔Simp split realized in full. The in-module cast
 above is a temporary bridge only. (Tracked in auto-memory `router-own-module-extraction`.)
 
+### Progress (2026-06-19, branch `routing-module`)
+
+**Structural extraction — DONE.** `router.jai` now lives in `modules/http_router/`
+(`module.jai` + `router.jai` + `tests/test.jai`). The module owns the routing limits
+(`MAX_ROUTES`/`MAX_PARAMS`/`MAX_MIDDLEWARE`/`MAX_MOUNTS`) as its own group-1 params,
+`#import "http_server"` (default `Handler_Data = void`) + `#import "Basic"`, and `#load`s the
+router. The core (`http_server`) no longer `#load`s `router.jai` and holds zero `Router`
+references. Routing tests split into the new `http_router` suite (20 tests; core keeps 50);
+`first.jai` registers `router_tests`. The routed example dual-imports: anonymous
+`#import "http_server"` + `http_router :: #import "http_router"` (named, so the two `serve`s
+never collide). All six suites pass; both examples build; `GET /`→200, `GET /missing`→404
+verified live. The cross-module `serve` overload resolved with **no** collision (named import
+made it moot anyway).
+
+**Cast-free finish — STILL PENDING.** `route_handler` still holds the single
+`cast(*Router) context.handler_data`, because the module imports the core with the default
+`Handler_Data = void`. The remaining step is to switch `http_router/module.jai` to
+`#import "http_server"()(Handler_Data = Router)` and drop the cast. Watch the program-parameter
+rules (how_to/380): `Handler_Data` is program-wide, supplied once, and that import must precede
+every other import of `http_server` — so the dual-import example/test sites must be reconciled
+(set the program param first, or route all core access through `http_router`). That ordering
+fragility is exactly why structural-first was sequenced ahead of it.
+
 ## Benchmark methodology (the A/B)
 
 Release build, both examples, identical response (`"Hello, World!"`). Same `wrk` grid the

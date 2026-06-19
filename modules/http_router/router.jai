@@ -190,22 +190,23 @@ dispatch :: (router: *Router, req: *Request, resp: *Response) {
 
 // -- Routing as an OPTIONAL Handler layered on the core --
 //
-// server.jai knows nothing about routing; it just invokes a Handler. This adapter bridges the
-// generic Handler contract to dispatch(). It rides the generic context.handler_data slot with a
-// single internal cast, because Router is the library's OWN type and a module cannot be
-// parameterized by its own type (you'd need Handler_Data = http_server.Router while importing
-// http_server — circular). That cast is a TEMPORARY bridge: the committed next step lifts the
-// router into its own module importing the core with Handler_Data = Router, making this cast-free
-// (see docs/plans/2026-06-19-handler-context-refactor-design.md). Gated to the default (void)
-// parameterization — a typed Handler_Data means you are serving a single app handler, not routing.
-#if Handler_Data == void {
-    route_handler :: (req: *Request, resp: *Response) {
-        dispatch(cast(*Router) context.handler_data, req, resp);
-    }
+// The http_server core knows nothing about routing; it just invokes a bare Handler. This adapter
+// bridges that generic contract to dispatch(). It rides the core's context.handler_data slot with
+// a single internal cast: this module imports http_server with the DEFAULT program parameter
+// (Handler_Data = void), so context.handler_data is *void here. Eliminating this one cast — by
+// importing the core with Handler_Data = Router so the slot is already typed *Router — is the
+// committed next step (docs/plans/2026-06-19-handler-context-refactor-design.md). The cast is
+// confined to this adapter; it never appears in user handler code.
+route_handler :: (req: *Request, resp: *Response) {
+    dispatch(cast(*Router) context.handler_data, req, resp);
+}
 
-    serve :: (server: *Server, router: *Router) {
-        serve(server, route_handler, xx router);
-    }
+// serve(*Server, *Router): install the router as the server's handler. Resolves to the core's
+// serve(*Server, Handler, *Handler_Data) — route_handler is the Handler, the router is its bound
+// state (xx auto-casts *Router -> *void). Consumers should namespace this import
+// (e.g. `http_router :: #import "http_router"`) so this never collides with the core's serve.
+serve :: (server: *Server, router: *Router) {
+    serve(server, route_handler, xx router);
 }
 
 // -- Pattern matching (public for testing) --

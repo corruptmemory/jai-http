@@ -1,0 +1,514 @@
+
+// http_router test suite — pattern matching, dispatch, middleware, mounting, context.
+//
+// Imports the core anonymously (Request/Response/string_equals) and the routing layer it tests.
+// Both resolve to the same default-parameterized http_server instance (dedup), so Request/Response
+// are identical types across the boundary. These tests call dispatch() directly, never serve(),
+// so the core's serve and http_router's serve never need disambiguation here.
+
+// -- Router: pattern matching tests --
+
+test_match_exact_path :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/users", "/users", *params, *pc) == true, "Exact path should match");
+    assert(pc == 0, "No params for exact match");
+
+    assert(match_pattern("/users", "/users/") == false, "/users should not match /users/");
+    assert(match_pattern("/", "/") == true, "Root path should match");
+    assert(match_pattern("/users", "/posts") == false, "/users should not match /posts");
+
+    print("  PASS: test_match_exact_path\n");
+}
+
+test_match_param_capture :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/users/:id", "/users/42", *params, *pc) == true, "Param pattern should match");
+    assert(pc == 1, "Should capture 1 param, got %", pc);
+    assert(string_equals(params[0].name, "id"), "Param name should be 'id', got '%'", params[0].name);
+    assert(string_equals(params[0].value, "42"), "Param value should be '42', got '%'", params[0].value);
+
+    print("  PASS: test_match_param_capture\n");
+}
+
+test_match_multi_param :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/users/:id/posts/:pid", "/users/42/posts/99", *params, *pc) == true);
+    assert(pc == 2, "Should capture 2 params, got %", pc);
+    assert(string_equals(params[0].name, "id"));
+    assert(string_equals(params[0].value, "42"));
+    assert(string_equals(params[1].name, "pid"));
+    assert(string_equals(params[1].value, "99"));
+
+    print("  PASS: test_match_multi_param\n");
+}
+
+test_match_no_match :: () {
+    // Too few segments
+    assert(match_pattern("/users/:id", "/users") == false, "Too few segments should not match");
+    // Too many segments
+    assert(match_pattern("/users/:id", "/users/42/extra") == false, "Too many segments should not match");
+    // Empty param segment
+    assert(match_pattern("/users/:id", "/users/") == false, "Empty param segment should not match");
+
+    print("  PASS: test_match_no_match\n");
+}
+
+// -- Router: wildcard pattern matching tests --
+
+test_match_wildcard_basic :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/static/*filepath", "/static/style.css", *params, *pc) == true, "Wildcard should match single segment");
+    assert(pc == 1, "Should capture 1 param, got %", pc);
+    assert(string_equals(params[0].name, "filepath"), "Param name should be 'filepath', got '%'", params[0].name);
+    assert(string_equals(params[0].value, "style.css"), "Param value should be 'style.css', got '%'", params[0].value);
+
+    print("  PASS: test_match_wildcard_basic\n");
+}
+
+test_match_wildcard_deep_path :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/static/*filepath", "/static/css/main/style.css", *params, *pc) == true, "Wildcard should match deep path");
+    assert(pc == 1);
+    assert(string_equals(params[0].name, "filepath"));
+    assert(string_equals(params[0].value, "css/main/style.css"), "Should capture full remaining path, got '%'", params[0].value);
+
+    print("  PASS: test_match_wildcard_deep_path\n");
+}
+
+test_match_wildcard_with_prefix_params :: () {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    assert(match_pattern("/repos/:owner/*rest", "/repos/jim/blob/main/README.md", *params, *pc) == true);
+    assert(pc == 2, "Should capture 2 params, got %", pc);
+    assert(string_equals(params[0].name, "owner"));
+    assert(string_equals(params[0].value, "jim"));
+    assert(string_equals(params[1].name, "rest"));
+    assert(string_equals(params[1].value, "blob/main/README.md"), "Wildcard should capture rest, got '%'", params[1].value);
+
+    print("  PASS: test_match_wildcard_with_prefix_params\n");
+}
+
+test_match_wildcard_no_match :: () {
+    // Wildcard needs at least one character after the prefix
+    assert(match_pattern("/static/*filepath", "/static/") == false, "Trailing slash only should not match wildcard");
+    assert(match_pattern("/static/*filepath", "/static") == false, "No trailing content should not match wildcard");
+    // Wrong prefix
+    assert(match_pattern("/static/*filepath", "/assets/style.css") == false, "Wrong prefix should not match");
+
+    print("  PASS: test_match_wildcard_no_match\n");
+}
+
+// -- Router: wildcard dispatch tests --
+
+wildcard_captured_path: string;
+
+wildcard_handler :: (req: *Request, resp: *Response) {
+    fp, found := param("filepath");
+    assert(found, "Should find wildcard param 'filepath'");
+    wildcard_captured_path = fp;
+    resp.status_code = 200;
+}
+
+test_dispatch_wildcard :: () {
+    router: Router;
+    get(*router, "/static/*filepath", wildcard_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/static/js/app.min.js";
+    resp: Response;
+
+    wildcard_captured_path = "";
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 200, "Should match wildcard route");
+    assert(string_equals(wildcard_captured_path, "js/app.min.js"), "Should capture 'js/app.min.js', got '%'", wildcard_captured_path);
+
+    print("  PASS: test_dispatch_wildcard\n");
+}
+
+// -- Router: dispatch tests --
+
+test_handler_called: bool;
+test_handler_path:   string;
+
+simple_test_handler :: (req: *Request, resp: *Response) {
+    test_handler_called = true;
+    test_handler_path = req.path;
+    resp.status_code = 200;
+    resp.body = "OK";
+}
+
+test_dispatch_basic :: () {
+    router: Router;
+    get(*router, "/hello", simple_test_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/hello";
+    resp: Response;
+
+    test_handler_called = false;
+    dispatch(*router, *req, *resp);
+    assert(test_handler_called, "Handler should have been called");
+    assert(resp.status_code == 200, "Status should be 200");
+
+    print("  PASS: test_dispatch_basic\n");
+}
+
+test_dispatch_404 :: () {
+    router: Router;
+    get(*router, "/hello", simple_test_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/missing";
+    resp: Response;
+
+    test_handler_called = false;
+    dispatch(*router, *req, *resp);
+    assert(!test_handler_called, "Handler should not have been called");
+    assert(resp.status_code == 404, "Status should be 404, got %", resp.status_code);
+
+    print("  PASS: test_dispatch_404\n");
+}
+
+test_dispatch_405 :: () {
+    router: Router;
+    get(*router, "/hello", simple_test_handler);
+
+    req: Request;
+    req.method = "POST";
+    req.path = "/hello";
+    resp: Response;
+
+    test_handler_called = false;
+    dispatch(*router, *req, *resp);
+    assert(!test_handler_called, "Handler should not have been called for wrong method");
+    assert(resp.status_code == 405, "Status should be 405, got %", resp.status_code);
+
+    print("  PASS: test_dispatch_405\n");
+}
+
+test_dispatch_method_filtering :: () {
+    router: Router;
+    post(*router, "/submit", simple_test_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/submit";
+    resp: Response;
+
+    test_handler_called = false;
+    dispatch(*router, *req, *resp);
+    assert(!test_handler_called, "GET should not match POST route");
+    assert(resp.status_code == 405, "Should be 405 for wrong method");
+
+    // Now test with correct method
+    req.method = "POST";
+    resp = .{};
+    test_handler_called = false;
+    dispatch(*router, *req, *resp);
+    assert(test_handler_called, "POST should match POST route");
+    assert(resp.status_code == 200);
+
+    print("  PASS: test_dispatch_method_filtering\n");
+}
+
+// -- Router: param access via context --
+
+param_test_captured_id: string;
+
+param_capture_handler :: (req: *Request, resp: *Response) {
+    id, found := param("id");
+    assert(found, "Should find param 'id'");
+    param_test_captured_id = id;
+    resp.status_code = 200;
+}
+
+test_dispatch_param_access :: () {
+    router: Router;
+    get(*router, "/users/:id", param_capture_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/users/42";
+    resp: Response;
+
+    param_test_captured_id = "";
+    dispatch(*router, *req, *resp);
+    assert(string_equals(param_test_captured_id, "42"), "Should capture id=42, got '%'", param_test_captured_id);
+    assert(resp.status_code == 200);
+
+    print("  PASS: test_dispatch_param_access\n");
+}
+
+// -- Router: middleware tests --
+
+mw_test_order: [8] s32;
+mw_test_count: s32;
+
+record_order :: (val: s32) {
+    if mw_test_count < 8 {
+        mw_test_order[mw_test_count] = val;
+        mw_test_count += 1;
+    }
+}
+
+middleware_a :: (ctx: *HTTP_Context) {
+    record_order(1);
+    proceed(ctx);
+    record_order(4);
+}
+
+middleware_b :: (ctx: *HTTP_Context) {
+    record_order(2);
+    proceed(ctx);
+    record_order(3);
+}
+
+mw_test_handler :: (req: *Request, resp: *Response) {
+    record_order(10);
+    resp.status_code = 200;
+}
+
+test_middleware_chain :: () {
+    router: Router;
+    use(*router, middleware_a);
+    use(*router, middleware_b);
+    get(*router, "/test", mw_test_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/test";
+    resp: Response;
+
+    mw_test_count = 0;
+    dispatch(*router, *req, *resp);
+
+    assert(resp.status_code == 200, "Handler should have run");
+    assert(mw_test_count == 5, "Should have 5 order records, got %", mw_test_count);
+    assert(mw_test_order[0] == 1,  "First should be middleware_a enter (1)");
+    assert(mw_test_order[1] == 2,  "Second should be middleware_b enter (2)");
+    assert(mw_test_order[2] == 10, "Third should be handler (10)");
+    assert(mw_test_order[3] == 3,  "Fourth should be middleware_b exit (3)");
+    assert(mw_test_order[4] == 4,  "Fifth should be middleware_a exit (4)");
+
+    print("  PASS: test_middleware_chain\n");
+}
+
+// -- Router: middleware short-circuit --
+
+blocking_middleware :: (ctx: *HTTP_Context) {
+    // Short-circuit: set 403 and don't call proceed
+    ctx.resp.status_code = 403;
+    ctx.resp.body = "Forbidden";
+}
+
+test_middleware_short_circuit :: () {
+    router: Router;
+    use(*router, blocking_middleware);
+    get(*router, "/secret", simple_test_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/secret";
+    resp: Response;
+
+    test_handler_called = false;
+    dispatch(*router, *req, *resp);
+    assert(!test_handler_called, "Handler should NOT have been called when middleware short-circuits");
+    assert(resp.status_code == 403, "Should get 403 from blocking middleware");
+
+    print("  PASS: test_middleware_short_circuit\n");
+}
+
+// -- Router: sub-router mounting --
+
+sub_handler_called: bool;
+sub_handler_path:   string;
+
+sub_test_handler :: (req: *Request, resp: *Response) {
+    sub_handler_called = true;
+    sub_handler_path = req.path;
+    resp.status_code = 200;
+    resp.body = "sub OK";
+}
+
+test_mount_basic :: () {
+    api_router: Router;
+    get(*api_router, "/users", sub_test_handler);
+
+    root: Router;
+    mount(*root, "/api", *api_router);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/api/users";
+    resp: Response;
+
+    sub_handler_called = false;
+    dispatch(*root, *req, *resp);
+    assert(sub_handler_called, "Sub-router handler should have been called");
+    assert(resp.status_code == 200);
+
+    print("  PASS: test_mount_basic\n");
+}
+
+test_mount_404 :: () {
+    api_router: Router;
+    get(*api_router, "/users", sub_test_handler);
+
+    root: Router;
+    mount(*root, "/api", *api_router);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/api/missing";
+    resp: Response;
+
+    sub_handler_called = false;
+    dispatch(*root, *req, *resp);
+    assert(!sub_handler_called, "Sub-router handler should not be called for missing route");
+    assert(resp.status_code == 404, "Should be 404 for missing sub-route");
+
+    print("  PASS: test_mount_404\n");
+}
+
+// -- Router: mounted sub-router with parent middleware --
+
+mount_mw_order: [8] s32;
+mount_mw_count: s32;
+
+mount_record_order :: (val: s32) {
+    if mount_mw_count < 8 {
+        mount_mw_order[mount_mw_count] = val;
+        mount_mw_count += 1;
+    }
+}
+
+parent_mw :: (ctx: *HTTP_Context) {
+    mount_record_order(1);
+    proceed(ctx);
+}
+
+sub_mw :: (ctx: *HTTP_Context) {
+    mount_record_order(2);
+    proceed(ctx);
+}
+
+mount_handler :: (req: *Request, resp: *Response) {
+    mount_record_order(3);
+    resp.status_code = 200;
+}
+
+test_mount_middleware_order :: () {
+    sub_router: Router;
+    use(*sub_router, sub_mw);
+    get(*sub_router, "/items", mount_handler);
+
+    root: Router;
+    use(*root, parent_mw);
+    mount(*root, "/api", *sub_router);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/api/items";
+    resp: Response;
+
+    mount_mw_count = 0;
+    dispatch(*root, *req, *resp);
+
+    assert(resp.status_code == 200);
+    assert(mount_mw_count == 3, "Should have 3 order records, got %", mount_mw_count);
+    assert(mount_mw_order[0] == 1, "Parent middleware should run first");
+    assert(mount_mw_order[1] == 2, "Sub middleware should run second");
+    assert(mount_mw_order[2] == 3, "Handler should run third");
+
+    print("  PASS: test_mount_middleware_order\n");
+}
+
+// -- Router: context.http is set during handler --
+
+context_http_was_set: bool;
+
+context_check_handler :: (req: *Request, resp: *Response) {
+    context_http_was_set = context.http != null;
+    resp.status_code = 200;
+}
+
+test_context_http_set :: () {
+    router: Router;
+    get(*router, "/check", context_check_handler);
+
+    req: Request;
+    req.method = "GET";
+    req.path = "/check";
+    resp: Response;
+
+    context_http_was_set = false;
+    dispatch(*router, *req, *resp);
+    assert(context_http_was_set, "context.http should be set during handler execution");
+
+    print("  PASS: test_context_http_set\n");
+}
+
+// -- Helper: match_pattern overload without params for convenience in tests --
+
+match_pattern :: (pattern: string, path: string) -> bool {
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+    return match_pattern(pattern, path, *params, *pc);
+}
+
+main :: () {
+    print("Running http_router tests...\n\n");
+
+    print("Router - pattern matching:\n");
+    test_match_exact_path();
+    test_match_param_capture();
+    test_match_multi_param();
+    test_match_no_match();
+
+    print("\nRouter - wildcard matching:\n");
+    test_match_wildcard_basic();
+    test_match_wildcard_deep_path();
+    test_match_wildcard_with_prefix_params();
+    test_match_wildcard_no_match();
+
+    print("\nRouter - dispatch:\n");
+    test_dispatch_wildcard();
+    test_dispatch_basic();
+    test_dispatch_404();
+    test_dispatch_405();
+    test_dispatch_method_filtering();
+    test_dispatch_param_access();
+
+    print("\nRouter - middleware:\n");
+    test_middleware_chain();
+    test_middleware_short_circuit();
+
+    print("\nRouter - mounting:\n");
+    test_mount_basic();
+    test_mount_404();
+    test_mount_middleware_order();
+
+    print("\nRouter - context:\n");
+    test_context_http_set();
+
+    print("\nAll http_router tests passed.\n");
+}
+
+#import "Basic";
+#import "http_server";   // Request, Response, string_equals
+#import "http_router";   // Router, get/post, dispatch, param, proceed, use, mount, match_pattern, HTTP_Context, Middleware

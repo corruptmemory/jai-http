@@ -213,6 +213,7 @@ build_and_run_test :: (workspace_name: string, executable_name: string, test_fil
 
 run_tests :: (optimized: bool) {
     build_and_run_test("tests",          "tests",          "modules/http_server/tests/test.jai", "build_tests", optimized);
+    build_and_run_test("router_tests",   "router_tests",   "modules/http_router/tests/test.jai", "build_tests", optimized);
     build_and_run_test("datetime_tests", "datetime_tests", "modules/datetime/tests/test.jai",     "build_tests", optimized);
     build_and_run_test("channel_tests",  "channel_tests",  "modules/channel/tests/test.jai",      "build_tests", optimized);
     build_and_run_test("csv_tests",      "csv_tests",      "modules/csv/tests/test.jai",          "build_tests", optimized);
