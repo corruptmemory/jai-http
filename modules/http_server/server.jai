@@ -288,10 +288,12 @@ handle_client :: (w: *Worker, c: *Connection, events: u32) {
                     new_ctx.handler_data = w.handler_data;
                     push_context new_ctx {
                         if w.handler  w.handler(*c.req, *response);
+                        // Send the response while the per-request Pool is the context allocator,
+                        // so write_response's header formatting (sprint/String_Builder) allocates
+                        // from the Pool too — not temporary storage.
+                        write_response(c.fd, *response, c.req.keep_alive);
                     }
-                    Pool_Module.reset(*w.request_pool);
-
-                    write_response(c.fd, *response, c.req.keep_alive);
+                    Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
 
                     if !c.req.keep_alive {
                         close_connection(w, c);
