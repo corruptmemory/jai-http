@@ -10,6 +10,13 @@
     MAX_FORM_VALUES     : s32 = 64,
     MAX_MULTIPART_PARTS : s32 = 16,
 	LISTEN_BACKLOG      : s32 = 1024
+)(
+    // Program-wide (set-once) type of the per-request bound state handed to handlers via
+    // `context.handler_data`. Default `void` => `*void` (fully generic). A consumer can
+    // inject a concrete type for cast-free, type-safe handler state. Must live in this
+    // second (program) group: there is one Context type per program, so the type of the
+    // `#add_context handler_data` field cannot vary per-import.
+    Handler_Data : Type = void
 );
 
 #scope_module

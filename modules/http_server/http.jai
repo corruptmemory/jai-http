@@ -181,21 +181,26 @@ reset_for_next_request :: (c: *Connection) {
 }
 
 // Serialize and write a response to the fd.
-// Uses writev() to send headers + body in a single syscall so TCP_NODELAY
-// does not split them into two packets.
+// Uses writev() to send headers + body in a single syscall so TCP_NODELAY does not split them
+// into two packets. The header is formatted from context.allocator — which the worker sets to the
+// per-request Pool (reset after this call, blocks recycled). It must NOT use temporary storage:
+// write_response originally used `tprint`, which is hardwired to temp storage (it ignores
+// context.allocator); under batch load the default 16 KB temp overflowed into repeated heap page
+// allocations (~45% of CPU at high concurrency). `sprint` / `String_Builder` allocate from
+// context.allocator, so routing through the per-request Pool keeps response building churn-free.
 write_response :: (fd: s32, response: *Response, keep_alive: bool) {
     conn_str := ifx keep_alive then "keep-alive" else "close";
 
     header: string;
     if response.header_count == 0 {
-        // Fast path: no custom headers — one tprint, no loop
-        header = Basic.tprint("HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n\r\n",
+        // Fast path: no custom headers.
+        header = Basic.sprint("HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n\r\n",
             response.status_code, status_text(response.status_code),
             response.content_type, response.body.count, conn_str);
     } else {
-        // Slow path: build all headers into a single temp buffer first
+        // Slow path: custom headers.
         builder: Basic.String_Builder;
-        builder.allocator = Basic.temp;
+        builder.allocator = context.allocator;
         Basic.print_to_builder(*builder, "HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n",
             response.status_code, status_text(response.status_code),
             response.content_type, response.body.count, conn_str);
@@ -203,7 +208,7 @@ write_response :: (fd: s32, response: *Response, keep_alive: bool) {
             Basic.print_to_builder(*builder, "%: %\r\n", response.headers[i].name, response.headers[i].value);
         }
         Basic.append(*builder, "\r\n");
-        header = Basic.builder_to_string(*builder,, allocator = Basic.temp);
+        header = Basic.builder_to_string(*builder,, allocator = context.allocator);
     }
 
     if response.body.count > 0 {

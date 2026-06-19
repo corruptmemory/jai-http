@@ -1,4 +1,14 @@
 
+// `Handler` (the core server's only contract) is defined in http.jai as #type (request, response).
+// The router (router.jai) is just one Handler built on top; Route_Handler is structurally identical
+// — a route handler IS a handler. Bound state is reached via the context, not a parameter (below).
+//
+// The handler's bound state ("receiver"), delivered ambiently through the context rather than
+// as a parameter (Jai has no closures). Its type is the `Handler_Data` program parameter:
+// `*void` by default (generic), or a concrete `*T` when the consumer injects one — then it is
+// type-safe with no cast in handler code. The core never inspects it; only the handler does.
+#add_context handler_data: *Handler_Data;
+
 Worker :: struct {
     engine:       Event_Engine;
     pool:         Connection_Pool;
@@ -6,7 +16,8 @@ Worker :: struct {
     listen_conn:  *Connection;     // Sentinel connection for the listen socket
     running:      bool;
     id:           s32;
-    router:       *Router;
+    handler:      Handler;
+    handler_data: *Handler_Data;
     request_pool: Pool_Module.Pool;  // Per-request allocator, reset after each dispatch
     thread:       Thread;
 }
@@ -15,7 +26,8 @@ Server :: struct {
     workers:       [] Worker;
     num_workers:   s32;
     running:       bool;
-    router:        *Router;
+    handler:       Handler;
+    handler_data:  *Handler_Data;
     data_to_free:  *void;
 }
 
@@ -48,8 +60,12 @@ init_server :: (server: *Server, num_workers: s32 = 16, pool_size: s64 = 1024) -
     return true;
 }
 
-serve :: (server: *Server, router: *Router) {
-    server.router = router;
+// Wire a handler into the server. `data` is the handler's bound state; it reaches every
+// invocation via context.handler_data. Routing is NOT special here — the router installs
+// itself through this same path (see the serve(*Server, *Router) overload in router.jai).
+serve :: (server: *Server, handler: Handler, data: *Handler_Data = null) {
+    server.handler      = handler;
+    server.handler_data = data;
 }
 
 destroy_server :: (server: *Server) {
@@ -82,9 +98,10 @@ server_listen :: (server: *Server, address: string, port: u16) -> bool {
 server_run :: (server: *Server) {
     server.running = true;
 
-    // Copy router to all workers
+    // Copy the handler + its bound data to every worker (shared-nothing: each owns a copy).
     for i: 0..cast(s64) server.num_workers - 1 {
-        server.workers[i].router = server.router;
+        server.workers[i].handler      = server.handler;
+        server.workers[i].handler_data = server.handler_data;
     }
 
     // Start worker threads (workers 1..N-1)
@@ -263,15 +280,20 @@ handle_client :: (w: *Worker, c: *Connection, events: u32) {
                 if result == .COMPLETE {
                     response: Response;
 
-                    // Dispatch through router with per-request pool allocator
+                    // Invoke the handler under the per-request pool allocator, with the
+                    // handler's bound state poked into the context. The core is routing-
+                    // agnostic — for a routed server, w.handler is router.jai's adapter.
                     new_ctx := context;
-                    new_ctx.allocator = .{Pool_Module.pool_allocator_proc, *w.request_pool};
+                    new_ctx.allocator    = .{Pool_Module.pool_allocator_proc, *w.request_pool};
+                    new_ctx.handler_data = w.handler_data;
                     push_context new_ctx {
-                        dispatch(w.router, *c.req, *response);
+                        if w.handler  w.handler(*c.req, *response);
+                        // Send the response while the per-request Pool is the context allocator,
+                        // so write_response's header formatting (sprint/String_Builder) allocates
+                        // from the Pool too — not temporary storage.
+                        write_response(c.fd, *response, c.req.keep_alive);
                     }
-                    Pool_Module.reset(*w.request_pool);
-
-                    write_response(c.fd, *response, c.req.keep_alive);
+                    Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
 
                     if !c.req.keep_alive {
                         close_connection(w, c);
