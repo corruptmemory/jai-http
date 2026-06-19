@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. Plus a vendored JSON module (rluba/jaison, MIT): typed struct ⇄ JSON and a generic `JSON_Value` tree. 119 unit tests passing (70 http_server + 19 datetime + 15 channel + 15 CSV), plus the vendored JSON suite (leak + round-trip harness). ~1.6M req/s at 32t/2000c with routing overhead. Builds and all tests pass on Jai beta 0.2.029.
+**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. Plus a vendored JSON module (rluba/jaison, MIT): typed struct ⇄ JSON and a generic `JSON_Value` tree. 119 unit tests passing (70 http_server + 19 datetime + 15 channel + 15 CSV), plus the vendored JSON suite (leak + round-trip harness). ~1.6M req/s at 32t/2000c with routing overhead. Builds and all tests pass on Jai beta 0.2.029. The project has refocused to a **library + examples** layout: build targets are `examples/<name>.jai` driven by `first.jai`'s shape-based grammar (`-release`/`-run`/`run-tests`/`++`), and the native HTTP client was dropped in favor of a future libcurl wrapper.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
@@ -19,13 +19,21 @@ Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Fea
 The build system is Jai's compile-time metaprogramming via `first.jai`. All builds are invoked through the Jai compiler:
 
 ```bash
-~/jai/jai/bin/jai-linux first.jai - debug    # Debug build → build_debug/server, build_debug/client
-~/jai/jai/bin/jai-linux first.jai - release  # Release build → build_release/server, build_release/client
-~/jai/jai/bin/jai-linux first.jai - test     # Build and auto-run tests → build_tests/{tests,datetime_tests,channel_tests,csv_tests,json_tests}
+# Build targets are bare words → examples/<name>.jai. Modifiers start with `-`.
+~/jai/jai/bin/jai-linux first.jai -                              # Build ALL examples/*.jai → build_debug/ (no run)
+~/jai/jai/bin/jai-linux first.jai - hello_world                 # Build one example → build_debug/hello_world
+~/jai/jai/bin/jai-linux first.jai - hello_world -release        # Optimized → build_release/hello_world
+~/jai/jai/bin/jai-linux first.jai - hello_world -run            # Build + run (debug)
+~/jai/jai/bin/jai-linux first.jai - hello_world ++ --port 9090  # Build + run, forwarding args after `++` (`++` implies -run)
+~/jai/jai/bin/jai-linux first.jai - run-tests                   # Build + run ALL suites → build_tests/{tests,datetime_tests,channel_tests,csv_tests,json_tests}
+~/jai/jai/bin/jai-linux first.jai - run-tests -release          # Same, optimized
 ```
-**Note:** Single dash `-` separates compiler args from metaprogram args. Double dash `--` is reserved for compiler developer options.
 
-**Compiler flags:** `-release` is deprecated as of 0.2.026. Use `-o` or `-optimized` for release builds, `-od` or `-optimized_debug` for optimized debug. Our build metaprogram handles this via its own `release`/`debug` args, so this only matters if invoking the compiler directly.
+**Grammar (classified by token shape, not position):** `-release` = optimized (debug is the implied default — there is **no** `-debug`); `-run` = run the single target after building; `run-tests` = the exclusive test verb (build + run all suites; cannot be combined with build targets or `++`); `++` = everything after is passed through to the run target, and its presence implies `-run`; any other bare word is a build target resolved dynamically to `examples/<name>.jai`. `-run`/`++` require exactly one target. **Adding an example is just dropping a file into `examples/`** — no `first.jai` edit.
+
+**Note:** Single dash `-` separates compiler args from metaprogram args. A **standalone** double dash `--` is reserved by the compiler for its own developer options (everything after the last `--` never reaches `compile_time_command_line`) — which is exactly why the passthrough separator is `++`, not `--`. (`--`-*prefixed* tokens like `--port` after `++` pass through fine; only a lone `--` is special.)
+
+**Compiler flags:** The metaprogram chooses optimization itself from its own `-release` modifier (which is a *metaprogram* arg after the `-` separator, distinct from the compiler's deprecated `-release`/`-optimized` flags). You do not pass compiler optimization flags directly.
 
 Standalone experiments (not part of the build system):
 ```bash
@@ -33,11 +41,11 @@ Standalone experiments (not part of the build system):
 ~/jai/jai/bin/jai-linux experiments/csv_insert_test.jai   # #code AST rewriting experiment
 ```
 
-Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
+Run an example: `./build_debug/hello_world` (listens on 0.0.0.0:9090)
 
 ## Architecture
 
-**Build metaprogram** (`first.jai`): Creates compiler workspaces (server, client, test suites). The `modules/` directory is added to the import path for all workspaces. Tests are auto-executed after compilation via `Autorun`. The `build_and_run_test` helper creates a test workspace from a workspace name, executable name, and test file path — adding new test suites is a one-liner.
+**Build metaprogram** (`first.jai`): Creates one compiler workspace per build target — an example (`examples/<name>.jai`, discovered dynamically) or a test suite. The `modules/` directory is prepended to the import path for all workspaces. The `build_example` helper compiles an example into `build_debug/`/`build_release/` and optionally runs it (forwarding `++` passthrough args); `build_and_run_test` compiles a test suite and auto-runs it via `Autorun`. Adding a new example is just dropping a file into `examples/`; adding a test suite is a one-line `build_and_run_test` call. See "Build Commands" for the full target grammar.
 
 **HTTP Server module** (`modules/http_server/`):
 - `module.jai` — Module definition with compile-time parameters: `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`, `MAX_ROUTES`, `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS`, `MAX_FORM_VALUES`, `MAX_MULTIPART_PARTS`, `LISTEN_BACKLOG`. Imports Basic, Pool, POSIX, Linux, Socket, Thread.
@@ -78,8 +86,9 @@ Run the server: `./build_debug/server` (listens on 0.0.0.0:8080)
 - `csv_cross_module/` — Proves backtick identifiers solve cross-module `#insert` scoping. Module defines `#expand` macro, caller defines types + functions — backtick-prefixed names in generated strings resolve in caller's scope.
 
 **Entry points:**
-- `server/main.jai` — Configures router with routes and starts the HTTP server
-- `client/main.jai` — Client stub
+- `examples/hello_world.jai` — Example program: configures a router and starts the HTTP server on `0.0.0.0:9090`. Build targets are discovered dynamically from `examples/*.jai`; add more examples by dropping files here.
+
+**No native HTTP client.** A from-scratch client (TLS, HTTP/2, HTTP/3, redirects, cookies, cert chains) is a correctness tarpit that libcurl already owns, so the client will be a thin libcurl wrapper (future, separate module) — not native Jai. The old `client/` stub has been removed.
 
 ## Jai Toolchain
 
@@ -143,8 +152,8 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 **IMPORTANT:** After each milestone / "got it working" loop, re-run the standard wrk benchmark suite against a release build to track progress. If numbers regress or stall, pause and investigate before moving on.
 
 ```bash
-~/jai/jai/bin/jai-linux first.jai - release
-./build_release/server &
+~/jai/jai/bin/jai-linux first.jai - hello_world -release
+./build_release/hello_world &
 wrk -t1 -c10 -d10s http://localhost:9090/
 wrk -t4 -c100 -d10s http://localhost:9090/
 wrk -t8 -c500 -d10s http://localhost:9090/
