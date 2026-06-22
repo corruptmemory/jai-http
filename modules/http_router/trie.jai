@@ -94,11 +94,7 @@ build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) 
     }
 
     if ok {
-        ep: Trie_Endpoint;
-        ep.method     = method;
-        ep.handler    = handler;
-        ep.param_keys = keys;
-        Basic.array_add(*t.nodes[cur].endpoints, ep);
+        Basic.array_add(*t.nodes[cur].endpoints, .{ method = method, handler = handler, param_keys = keys });
     }
 
     return t, ok;
@@ -149,8 +145,7 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
             n := vcount;
             if n > cast(s32) ep.param_keys.count  n = cast(s32) ep.param_keys.count;
             for i: 0..n-1 {
-                out_params.*[i].name  = ep.param_keys[i];
-                out_params.*[i].value = values[i];
+                out_params.*[i] = .{ name = ep.param_keys[i], value = values[i] };
             }
             out_count.* = n;
             return ep.handler, .MATCHED;
@@ -184,12 +179,8 @@ trie_dump_node :: (sb: *Basic.String_Builder, t: Trie, node_idx: s32, depth: s32
 }
 
 trie_add_node :: (t: *Trie, kind: Seg_Kind, segment: string) -> s32 {
-    node: Trie_Node;
-    node.kind           = kind;
-    node.segment        = segment;
-    node.param_child    = -1;
-    node.wildcard_child = -1;
-    Basic.array_add(*t.nodes, node);
+    // param_child / wildcard_child default to -1 in the Trie_Node definition.
+    Basic.array_add(*t.nodes, .{ kind = kind, segment = segment });
     return cast(s32) (t.nodes.count - 1);
 }
 
