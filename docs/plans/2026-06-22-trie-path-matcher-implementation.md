@@ -51,11 +51,12 @@
   - `build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) -> (tree: Trie, ok: bool)`
   - private: `trie_add_node :: (t: *Trie, kind: Seg_Kind, segment: string) -> s32`, `substr :: (s: string, start: s64, len: s64) -> string`
 
-- [ ] **Step 1: Add `#load` and module param.** Edit `modules/http_router/module.jai`: add `MAX_PATH_SEGMENTS : s32 = 32,` to the `#module_parameters (...)` list (and remove `MAX_ROUTES : s32 = 128,`), and add `#load "trie.jai";` immediately before `#load "router.jai";`.
+- [ ] **Step 1: Add `#load` and module param.** Edit `modules/http_router/module.jai`: add `MAX_PATH_SEGMENTS : s32 = 32,` to the `#module_parameters (...)` list, and add `#load "trie.jai";` immediately before `#load "router.jai";`. (Keep `MAX_ROUTES` for now — `router.jai` still uses it via `Router.routes` until Task B2 removes the linear route array. Removing it here would break the build.)
 
 Resulting `#module_parameters` block:
 ```jai
 #module_parameters (
+    MAX_ROUTES         : s32 = 128,
     MAX_PARAMS         : s32 = 8,
     MAX_MIDDLEWARE     : s32 = 16,
     MAX_MOUNTS         : s32 = 16,
@@ -839,6 +840,8 @@ Router :: struct {
 }
 ```
 (Delete the old `Route :: struct {...}`. Keep `Mount_Point` — shown here because it sat between them.)
+
+Also edit `modules/http_router/module.jai`: remove `MAX_ROUTES : s32 = 128,` from the `#module_parameters (...)` list — it is now unused (Task A1 deliberately kept it because the old `Router.routes` array still referenced it). The remaining params are `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS`, `MAX_PATH_SEGMENTS`.
 
 - [ ] **Step 3: Rewrite `route`** (currently `router.jai:67-74`):
 ```jai
