@@ -516,6 +516,54 @@ test_tree_dump :: () {
     print("  PASS: test_tree_dump\n");
 }
 
+// -- Trie: merge --
+
+test_merge_disjoint :: () {
+    acc: Trie;
+    p1, _ := build_partial_tree("GET", "/users", simple_test_handler);
+    p2, _ := build_partial_tree("GET", "/posts", simple_test_handler);
+    assert(merge(*acc, p1), "merge p1");
+    assert(merge(*acc, p2), "merge p2");
+    s := tree_to_string(acc);
+    expected := "STATIC \"\"\n  STATIC \"users\" GET\n  STATIC \"posts\" GET\n";
+    assert(string_equals(s, expected), "disjoint merge:\n%", s);
+    print("  PASS: test_merge_disjoint\n");
+}
+
+test_merge_shared_prefix :: () {
+    acc: Trie;
+    p1, _ := build_partial_tree("GET", "/users/:id",          simple_test_handler);
+    p2, _ := build_partial_tree("GET", "/users/:userId/posts", simple_test_handler);
+    assert(merge(*acc, p1));
+    assert(merge(*acc, p2));
+    // Shared "users" + shared single param edge; p2 continues to "posts".
+    s := tree_to_string(acc);
+    expected := "STATIC \"\"\n  STATIC \"users\"\n    :id GET\n      STATIC \"posts\" GET\n";
+    assert(string_equals(s, expected), "shared-prefix merge:\n%", s);
+    print("  PASS: test_merge_shared_prefix\n");
+}
+
+test_merge_method_union :: () {
+    acc: Trie;
+    p1, _ := build_partial_tree("GET",  "/x", simple_test_handler);
+    p2, _ := build_partial_tree("POST", "/x", simple_test_handler);
+    assert(merge(*acc, p1));
+    assert(merge(*acc, p2));
+    s := tree_to_string(acc);
+    expected := "STATIC \"\"\n  STATIC \"x\" GET POST\n";
+    assert(string_equals(s, expected), "method-union merge:\n%", s);
+    print("  PASS: test_merge_method_union\n");
+}
+
+test_merge_conflict :: () {
+    acc: Trie;
+    p1, _ := build_partial_tree("GET", "/dup", simple_test_handler);
+    p2, _ := build_partial_tree("GET", "/dup", simple_test_handler);
+    assert(merge(*acc, p1), "first registration ok");
+    assert(!merge(*acc, p2), "duplicate GET /dup must conflict");
+    print("  PASS: test_merge_conflict\n");
+}
+
 // -- Helper: match_pattern overload without params for convenience in tests --
 
 match_pattern :: (pattern: string, path: string) -> bool {
@@ -567,6 +615,12 @@ main :: () {
 
     print("\nTrie - tree_to_string:\n");
     test_tree_dump();
+
+    print("\nTrie - merge:\n");
+    test_merge_disjoint();
+    test_merge_shared_prefix();
+    test_merge_method_union();
+    test_merge_conflict();
 
     print("\nAll http_router tests passed.\n");
 }

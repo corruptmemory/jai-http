@@ -104,6 +104,14 @@ build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) 
     return t, ok;
 }
 
+// Structurally union `from` into `into`. Returns false on a duplicate (same path + same method),
+// after logging — never a silent overwrite. For a single-route partial tree this is "insert".
+merge :: (into: *Trie, from: Trie) -> bool {
+    trie_ensure_root(into);
+    if from.nodes.count == 0  return true;
+    return trie_merge_node(into, 0, from, 0);
+}
+
 // Depth-indented dump of a tree. Generalizes to a forest by calling it per root.
 tree_to_string :: (t: Trie) -> string {
     sb: Basic.String_Builder;
@@ -150,4 +158,99 @@ substr :: (s: string, start: s64, len: s64) -> string {
     out.data  = s.data + start;
     out.count = len;
     return out;
+}
+
+trie_ensure_root :: (t: *Trie) {
+    if t.nodes.count == 0  trie_add_node(t, .STATIC, "");
+}
+
+find_static_child :: (t: *Trie, node_idx: s32, seg: string) -> s32 {
+    node := *t.nodes[node_idx];
+    for node.static_children {
+        if string_equals(t.nodes[it].segment, seg)  return it;
+    }
+    return -1;
+}
+
+find_endpoint_method :: (t: *Trie, node_idx: s32, method: string) -> bool {
+    node := *t.nodes[node_idx];
+    for * node.endpoints  if string_equals(it.method, method)  return true;
+    return false;
+}
+
+// Deep-copy from's subtree rooted at from_idx into `into`; returns the new index in `into`.
+// INDEX DISCIPLINE: re-resolve into.nodes[new_idx] after each recursive copy (which grows into.nodes).
+trie_copy_subtree :: (into: *Trie, from: Trie, from_idx: s32) -> s32 {
+    new_idx := trie_add_node(into, from.nodes[from_idx].kind, from.nodes[from_idx].segment);
+
+    feps := from.nodes[from_idx].endpoints;          // header copy (reads from-backing)
+    for feps  Basic.array_add(*into.nodes[new_idx].endpoints, it);
+
+    fkids := from.nodes[from_idx].static_children;   // header copy
+    for fkids {
+        child := trie_copy_subtree(into, from, it);
+        Basic.array_add(*into.nodes[new_idx].static_children, child);
+    }
+    if from.nodes[from_idx].param_child != -1 {
+        c := trie_copy_subtree(into, from, from.nodes[from_idx].param_child);
+        into.nodes[new_idx].param_child = c;
+    }
+    if from.nodes[from_idx].wildcard_child != -1 {
+        c := trie_copy_subtree(into, from, from.nodes[from_idx].wildcard_child);
+        into.nodes[new_idx].wildcard_child = c;
+    }
+    return new_idx;
+}
+
+trie_merge_node :: (into: *Trie, into_idx: s32, from: Trie, from_idx: s32) -> bool {
+    ok := true;
+
+    // 1. endpoints union (conflict on same method)
+    feps := from.nodes[from_idx].endpoints;          // header copy
+    for feps {
+        if find_endpoint_method(into, into_idx, it.method) {
+            Basic.log_error("http_router: duplicate route — method '%' already registered at this path", it.method);
+            ok = false;
+        } else {
+            Basic.array_add(*into.nodes[into_idx].endpoints, it);
+        }
+    }
+
+    // 2. static children
+    fkids := from.nodes[from_idx].static_children;   // header copy
+    for fkids {
+        cf       := it;
+        cseg     := from.nodes[cf].segment;
+        existing := find_static_child(into, into_idx, cseg);
+        if existing != -1 {
+            if !trie_merge_node(into, existing, from, cf)  ok = false;
+        } else {
+            ni := trie_copy_subtree(into, from, cf);
+            Basic.array_add(*into.nodes[into_idx].static_children, ni);
+        }
+    }
+
+    // 3. param child (single)
+    if from.nodes[from_idx].param_child != -1 {
+        fp := from.nodes[from_idx].param_child;
+        if into.nodes[into_idx].param_child != -1 {
+            if !trie_merge_node(into, into.nodes[into_idx].param_child, from, fp)  ok = false;
+        } else {
+            ni := trie_copy_subtree(into, from, fp);
+            into.nodes[into_idx].param_child = ni;
+        }
+    }
+
+    // 4. wildcard child (single)
+    if from.nodes[from_idx].wildcard_child != -1 {
+        fw := from.nodes[from_idx].wildcard_child;
+        if into.nodes[into_idx].wildcard_child != -1 {
+            if !trie_merge_node(into, into.nodes[into_idx].wildcard_child, from, fw)  ok = false;
+        } else {
+            ni := trie_copy_subtree(into, from, fw);
+            into.nodes[into_idx].wildcard_child = ni;
+        }
+    }
+
+    return ok;
 }
