@@ -463,6 +463,48 @@ test_context_http_set :: () {
     print("  PASS: test_context_http_set\n");
 }
 
+// -- Trie: build_partial_tree --
+
+test_build_simple_param :: () {
+    t, ok := build_partial_tree("GET", "/users/:id", simple_test_handler);
+    assert(ok, "build should succeed");
+    assert(t.nodes.count == 3, "expected 3 nodes, got %", t.nodes.count);
+    assert(t.nodes[0].kind == .STATIC && t.nodes[0].segment.count == 0, "node0 = root STATIC \"\"");
+    assert(t.nodes[1].kind == .STATIC && string_equals(t.nodes[1].segment, "users"), "node1 = STATIC users");
+    assert(t.nodes[2].kind == .PARAM  && string_equals(t.nodes[2].segment, "id"),    "node2 = PARAM id");
+    assert(t.nodes[0].static_children.count == 1 && t.nodes[0].static_children[0] == 1, "root -> node1");
+    assert(t.nodes[1].param_child == 2, "node1 param_child -> node2");
+    assert(t.nodes[2].endpoints.count == 1, "leaf has 1 endpoint");
+    assert(string_equals(t.nodes[2].endpoints[0].method, "GET"), "endpoint method GET");
+    assert(t.nodes[2].endpoints[0].param_keys.count == 1, "1 param key");
+    assert(string_equals(t.nodes[2].endpoints[0].param_keys[0], "id"), "param key = id");
+    print("  PASS: test_build_simple_param\n");
+}
+
+test_build_root :: () {
+    t, ok := build_partial_tree("GET", "/", simple_test_handler);
+    assert(ok, "build / should succeed");
+    assert(t.nodes.count == 1, "root-only tree, got % nodes", t.nodes.count);
+    assert(t.nodes[0].endpoints.count == 1, "root is the leaf for /");
+    print("  PASS: test_build_root\n");
+}
+
+test_build_wildcard :: () {
+    t, ok := build_partial_tree("GET", "/static/*filepath", simple_test_handler);
+    assert(ok, "build wildcard should succeed");
+    assert(t.nodes.count == 3, "root, static, wildcard");
+    assert(t.nodes[2].kind == .WILDCARD && string_equals(t.nodes[2].segment, "filepath"), "node2 wildcard filepath");
+    assert(t.nodes[1].wildcard_child == 2, "static -> wildcard");
+    assert(string_equals(t.nodes[2].endpoints[0].param_keys[0], "filepath"), "key filepath");
+    print("  PASS: test_build_wildcard\n");
+}
+
+test_build_wildcard_not_last :: () {
+    _, ok := build_partial_tree("GET", "/a/*rest/b", simple_test_handler);
+    assert(!ok, "wildcard not last must fail");
+    print("  PASS: test_build_wildcard_not_last\n");
+}
+
 // -- Helper: match_pattern overload without params for convenience in tests --
 
 match_pattern :: (pattern: string, path: string) -> bool {
@@ -505,6 +547,12 @@ main :: () {
 
     print("\nRouter - context:\n");
     test_context_http_set();
+
+    print("\nTrie - build_partial_tree:\n");
+    test_build_simple_param();
+    test_build_root();
+    test_build_wildcard();
+    test_build_wildcard_not_last();
 
     print("\nAll http_router tests passed.\n");
 }

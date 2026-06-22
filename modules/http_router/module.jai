@@ -10,10 +10,11 @@
 // Routing limits are this module's own parameters (they describe the router, not the core).
 
 #module_parameters (
-    MAX_ROUTES     : s32 = 128,
-    MAX_PARAMS     : s32 = 8,
-    MAX_MIDDLEWARE : s32 = 16,
-    MAX_MOUNTS     : s32 = 16
+    MAX_ROUTES        : s32 = 128,
+    MAX_PARAMS        : s32 = 8,
+    MAX_MIDDLEWARE    : s32 = 16,
+    MAX_MOUNTS        : s32 = 16,
+    MAX_PATH_SEGMENTS : s32 = 32
 );
 
 #scope_module
@@ -28,4 +29,5 @@ Compiler :: #import "Compiler";   // compile-time only: friendly error in route_
 // set it here.) A main that omits it gets a clear *void-vs-*Router type error, not silent breakage.
 #import "http_server";
 
+#load "trie.jai";
 #load "router.jai";
