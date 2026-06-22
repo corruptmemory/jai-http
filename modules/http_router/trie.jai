@@ -104,9 +104,36 @@ build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) 
     return t, ok;
 }
 
+// Depth-indented dump of a tree. Generalizes to a forest by calling it per root.
+tree_to_string :: (t: Trie) -> string {
+    sb: Basic.String_Builder;
+    Basic.init_string_builder(*sb);
+    if t.nodes.count > 0  trie_dump_node(*sb, t, 0, 0);
+    return Basic.builder_to_string(*sb);
+}
+
 // -- Private helpers --
 
 #scope_module
+
+trie_dump_node :: (sb: *Basic.String_Builder, t: Trie, node_idx: s32, depth: s32) {
+    node := t.nodes[node_idx];
+    for 0..depth-1  Basic.append(sb, "  ");
+    if node.kind == {
+      case .STATIC;   Basic.append(sb, "STATIC \""); Basic.append(sb, node.segment); Basic.append(sb, "\"");
+      case .PARAM;    Basic.append(sb, ":");         Basic.append(sb, node.segment);
+      case .WILDCARD; Basic.append(sb, "*");         Basic.append(sb, node.segment);
+    }
+    for node.endpoints {
+        Basic.append(sb, " ");
+        if it.method.count == 0  Basic.append(sb, "ANY");
+        else                     Basic.append(sb, it.method);
+    }
+    Basic.append(sb, "\n");
+    for node.static_children    trie_dump_node(sb, t, it, depth + 1);
+    if node.param_child    != -1  trie_dump_node(sb, t, node.param_child,    depth + 1);
+    if node.wildcard_child != -1  trie_dump_node(sb, t, node.wildcard_child, depth + 1);
+}
 
 trie_add_node :: (t: *Trie, kind: Seg_Kind, segment: string) -> s32 {
     node: Trie_Node;

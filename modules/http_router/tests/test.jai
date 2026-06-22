@@ -505,6 +505,17 @@ test_build_wildcard_not_last :: () {
     print("  PASS: test_build_wildcard_not_last\n");
 }
 
+// -- Trie: tree_to_string --
+
+test_tree_dump :: () {
+    t, ok := build_partial_tree("GET", "/users/:id", simple_test_handler);
+    assert(ok);
+    s := tree_to_string(t);
+    expected := "STATIC \"\"\n  STATIC \"users\"\n    :id GET\n";
+    assert(string_equals(s, expected), "dump mismatch:\n%", s);
+    print("  PASS: test_tree_dump\n");
+}
+
 // -- Helper: match_pattern overload without params for convenience in tests --
 
 match_pattern :: (pattern: string, path: string) -> bool {
@@ -553,6 +564,9 @@ main :: () {
     test_build_root();
     test_build_wildcard();
     test_build_wildcard_not_last();
+
+    print("\nTrie - tree_to_string:\n");
+    test_tree_dump();
 
     print("\nAll http_router tests passed.\n");
 }
