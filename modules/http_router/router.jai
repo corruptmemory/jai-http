@@ -77,9 +77,7 @@ use :: (router: *Router, mw: Middleware) {
 
 mount :: (router: *Router, prefix: string, sub: *Router) {
     if router.mount_count >= MAX_MOUNTS return;
-    m := *router.mounts[router.mount_count];
-    m.prefix = prefix;
-    m.router = sub;
+    router.mounts[router.mount_count] = .{ prefix = prefix, router = sub };
     router.mount_count += 1;
 }
 
@@ -247,13 +245,11 @@ match_pattern :: (pattern: string, path: string, params: *[MAX_PARAMS] Param, pa
             if ai >= path.count return false;
 
             if param_count.* < MAX_PARAMS {
-                p := *params.*[param_count.*];
-                // Name is everything after the '*'
-                p.name.data = pattern.data + pat_seg_start + 1;
-                p.name.count = pat_seg_len - 1;
-                // Value is everything remaining in the path
-                p.value.data = path.data + ai;
-                p.value.count = path.count - ai;
+                // Name is everything after the '*'; value is the rest of the path.
+                params.*[param_count.*] = .{
+                    name  = substr(pattern, pat_seg_start + 1, pat_seg_len - 1),
+                    value = substr(path, ai, path.count - ai),
+                };
                 param_count.* += 1;
             }
             return true;  // Wildcard consumes the rest — always a match
@@ -274,13 +270,11 @@ match_pattern :: (pattern: string, path: string, params: *[MAX_PARAMS] Param, pa
             if path_seg_len == 0 return false;
 
             if param_count.* < MAX_PARAMS {
-                p := *params.*[param_count.*];
-                // Name is everything after the ':'
-                p.name.data = pattern.data + pat_seg_start + 1;
-                p.name.count = pat_seg_len - 1;
-                // Value is the path segment
-                p.value.data = path.data + path_seg_start;
-                p.value.count = path_seg_len;
+                // Name is everything after the ':'; value is the path segment.
+                params.*[param_count.*] = .{
+                    name  = substr(pattern, pat_seg_start + 1, pat_seg_len - 1),
+                    value = substr(path, path_seg_start, path_seg_len),
+                };
                 param_count.* += 1;
             }
         } else {

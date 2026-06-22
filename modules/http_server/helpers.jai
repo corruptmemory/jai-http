@@ -151,20 +151,19 @@ parse_form :: (req: *Request) -> Form_Data {
             eq += 1;
         }
 
-        fv := *form.values[form.count];
-
         key: string;
         key.data = body.data + pos;
         key.count = eq - pos;
-        fv.name = url_decode(key);
 
+        value: string;
         if eq < amp {
             val: string;
             val.data = body.data + eq + 1;
             val.count = amp - eq - 1;
-            fv.value = url_decode(val);
+            value = url_decode(val);
         }
 
+        form.values[form.count] = .{ name = url_decode(key), value = value };
         form.count += 1;
         pos = amp + 1;
     }

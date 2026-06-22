@@ -46,14 +46,15 @@ parse_rfc3339 :: (s: string) -> (time: Apollo_Time, ok: bool) {
     if min   > 59                return .{}, false;
     if sec   > 59                return .{}, false;
 
-    ct: Calendar_Time;
-    ct.year                        = cast(s32) year;
-    ct.month_starting_at_0         = cast(s8) (month - 1);
-    ct.day_of_month_starting_at_0  = cast(s8) (day - 1);
-    ct.hour                        = cast(s8) hour;
-    ct.minute                      = cast(s8) min;
-    ct.second                      = cast(s8) sec;
-    ct.time_zone                   = .UTC;
+    ct := Calendar_Time.{
+        year                       = cast(s32) year,
+        month_starting_at_0        = cast(s8) (month - 1),
+        day_of_month_starting_at_0 = cast(s8) (day - 1),
+        hour                       = cast(s8) hour,
+        minute                     = cast(s8) min,
+        second                     = cast(s8) sec,
+        time_zone                  = .UTC,
+    };
 
     return calendar_to_apollo(ct), true;
 }
