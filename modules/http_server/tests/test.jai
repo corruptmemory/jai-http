@@ -545,8 +545,7 @@ test_url_decode_uppercase_hex :: () {
 // -- Query param tests --
 
 test_query_param_basic :: () {
-    req: Request;
-    req.query_string = "name=alice&age=30";
+    req := Request.{ query_string = "name=alice&age=30" };
     val, found := query_param(*req, "name");
     assert(found, "Should find 'name'");
     assert(string_equals(val, "alice"), "name should be alice, got '%'", val);
@@ -558,16 +557,14 @@ test_query_param_basic :: () {
 }
 
 test_query_param_missing :: () {
-    req: Request;
-    req.query_string = "name=alice";
+    req := Request.{ query_string = "name=alice" };
     _, found := query_param(*req, "missing");
     assert(!found, "Should not find 'missing'");
     print("  PASS: test_query_param_missing\n");
 }
 
 test_query_param_encoded :: () {
-    req: Request;
-    req.query_string = "q=hello+world&path=%2Fhome";
+    req := Request.{ query_string = "q=hello+world&path=%2Fhome" };
     val, found := query_param(*req, "q");
     assert(found);
     assert(string_equals(val, "hello world"), "Should decode +, got '%'", val);
@@ -579,8 +576,7 @@ test_query_param_encoded :: () {
 }
 
 test_query_param_empty_value :: () {
-    req: Request;
-    req.query_string = "flag&name=bob";
+    req := Request.{ query_string = "flag&name=bob" };
     val, found := query_param(*req, "flag");
     assert(found, "Should find 'flag' even without value");
     assert(val.count == 0, "Flag value should be empty");

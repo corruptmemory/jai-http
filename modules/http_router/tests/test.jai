@@ -124,9 +124,7 @@ test_dispatch_wildcard :: () {
     router: Router;
     get(*router, "/static/*filepath", wildcard_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/static/js/app.min.js";
+    req := Request.{ method = "GET", path = "/static/js/app.min.js" };
     resp: Response;
 
     wildcard_captured_path = "";
@@ -153,9 +151,7 @@ test_dispatch_basic :: () {
     router: Router;
     get(*router, "/hello", simple_test_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/hello";
+    req := Request.{ method = "GET", path = "/hello" };
     resp: Response;
 
     test_handler_called = false;
@@ -170,9 +166,7 @@ test_dispatch_404 :: () {
     router: Router;
     get(*router, "/hello", simple_test_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/missing";
+    req := Request.{ method = "GET", path = "/missing" };
     resp: Response;
 
     test_handler_called = false;
@@ -187,9 +181,7 @@ test_dispatch_405 :: () {
     router: Router;
     get(*router, "/hello", simple_test_handler);
 
-    req: Request;
-    req.method = "POST";
-    req.path = "/hello";
+    req := Request.{ method = "POST", path = "/hello" };
     resp: Response;
 
     test_handler_called = false;
@@ -204,9 +196,7 @@ test_dispatch_method_filtering :: () {
     router: Router;
     post(*router, "/submit", simple_test_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/submit";
+    req := Request.{ method = "GET", path = "/submit" };
     resp: Response;
 
     test_handler_called = false;
@@ -240,9 +230,7 @@ test_dispatch_param_access :: () {
     router: Router;
     get(*router, "/users/:id", param_capture_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/users/42";
+    req := Request.{ method = "GET", path = "/users/42" };
     resp: Response;
 
     param_test_captured_id = "";
@@ -288,9 +276,7 @@ test_middleware_chain :: () {
     use(*router, middleware_b);
     get(*router, "/test", mw_test_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/test";
+    req := Request.{ method = "GET", path = "/test" };
     resp: Response;
 
     mw_test_count = 0;
@@ -320,9 +306,7 @@ test_middleware_short_circuit :: () {
     use(*router, blocking_middleware);
     get(*router, "/secret", simple_test_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/secret";
+    req := Request.{ method = "GET", path = "/secret" };
     resp: Response;
 
     test_handler_called = false;
@@ -352,9 +336,7 @@ test_mount_basic :: () {
     root: Router;
     mount(*root, "/api", *api_router);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/api/users";
+    req := Request.{ method = "GET", path = "/api/users" };
     resp: Response;
 
     sub_handler_called = false;
@@ -372,9 +354,7 @@ test_mount_404 :: () {
     root: Router;
     mount(*root, "/api", *api_router);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/api/missing";
+    req := Request.{ method = "GET", path = "/api/missing" };
     resp: Response;
 
     sub_handler_called = false;
@@ -421,9 +401,7 @@ test_mount_middleware_order :: () {
     use(*root, parent_mw);
     mount(*root, "/api", *sub_router);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/api/items";
+    req := Request.{ method = "GET", path = "/api/items" };
     resp: Response;
 
     mount_mw_count = 0;
@@ -451,9 +429,7 @@ test_context_http_set :: () {
     router: Router;
     get(*router, "/check", context_check_handler);
 
-    req: Request;
-    req.method = "GET";
-    req.path = "/check";
+    req := Request.{ method = "GET", path = "/check" };
     resp: Response;
 
     context_http_was_set = false;

@@ -94,9 +94,7 @@ test_producer_consumer :: () {
     init(*ch, 16);
     defer destroy(*ch);
 
-    ctx: Producer_Ctx;
-    ctx.ch = *ch;
-    ctx.count = COUNT;
+    ctx := Producer_Ctx.{ ch = *ch, count = COUNT };
 
     t: Thread;
     thread_init(*t, producer_proc);
@@ -185,8 +183,7 @@ test_blocking_receive :: () {
     init(*ch, 4);
     defer destroy(*ch);
 
-    ctx: Blocking_Recv_Ctx;
-    ctx.ch = *ch;
+    ctx := Blocking_Recv_Ctx.{ ch = *ch };
 
     t: Thread;
     thread_init(*t, blocking_recv_proc);
@@ -223,8 +220,7 @@ test_blocking_send :: () {
     defer destroy(*ch);
     send(*ch, 11);  // fill buffer
 
-    ctx: Blocking_Send_Ctx;
-    ctx.ch = *ch;
+    ctx := Blocking_Send_Ctx.{ ch = *ch };
 
     t: Thread;
     thread_init(*t, blocking_send_proc);
@@ -266,8 +262,7 @@ test_close_unblocks_receiver :: () {
     init(*ch, 4);
     defer destroy(*ch);
 
-    ctx: Close_Recv_Ctx;
-    ctx.ch = *ch;
+    ctx := Close_Recv_Ctx.{ ch = *ch };
 
     t: Thread;
     thread_init(*t, close_recv_proc);
@@ -303,8 +298,7 @@ test_close_unblocks_sender :: () {
     defer destroy(*ch);
     send(*ch, 11);  // fill buffer
 
-    ctx: Close_Send_Ctx;
-    ctx.ch = *ch;
+    ctx := Close_Send_Ctx.{ ch = *ch };
 
     t: Thread;
     thread_init(*t, close_send_proc);
