@@ -10,7 +10,6 @@
 // Routing limits are this module's own parameters (they describe the router, not the core).
 
 #module_parameters (
-    MAX_ROUTES        : s32 = 128,
     MAX_PARAMS        : s32 = 8,
     MAX_MIDDLEWARE    : s32 = 16,
     MAX_MOUNTS        : s32 = 16,

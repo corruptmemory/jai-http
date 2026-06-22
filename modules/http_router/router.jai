@@ -26,21 +26,14 @@ Middleware     :: #type (ctx: *HTTP_Context);
 
 // -- Route and Router types --
 
-Route :: struct {
-    method:  string;         // "GET", "POST", etc. Empty = any method.
-    pattern: string;         // e.g. "/users/:id"
-    handler: Route_Handler;
-}
-
 Mount_Point :: struct {
     prefix: string;
     router: *Router;
 }
 
 Router :: struct {
-    routes:      [MAX_ROUTES] Route;
-    route_count: s32;
-    middleware:   [MAX_MIDDLEWARE] Middleware;
+    tree:        Trie;
+    middleware:  [MAX_MIDDLEWARE] Middleware;
     mw_count:    s32;
     mounts:      [MAX_MOUNTS] Mount_Point;
     mount_count: s32;
@@ -65,12 +58,11 @@ http_delete :: (router: *Router, pattern: string, handler: Route_Handler) {
 }
 
 route :: (router: *Router, method: string, pattern: string, handler: Route_Handler) {
-    if router.route_count >= MAX_ROUTES return;
-    r := *router.routes[router.route_count];
-    r.method = method;
-    r.pattern = pattern;
-    r.handler = handler;
-    router.route_count += 1;
+    partial, ok := build_partial_tree(method, pattern, handler);
+    if !ok  return;   // build_partial_tree already logged the malformed pattern
+    if !merge(*router.tree, partial) {
+        Basic.log_error("http_router: route registration conflict for % %", method, pattern);
+    }
 }
 
 // -- Middleware --
@@ -123,69 +115,52 @@ param :: (name: string) -> (value: string, found: bool) {
 // -- Dispatch (called by server event loop) --
 
 dispatch :: (router: *Router, req: *Request, resp: *Response) {
-    // Check mounts first — if path starts with a mount prefix, delegate to sub-router
+    // Mounts first — if the path starts with a mount prefix, delegate to the sub-router.
     for i: 0..cast(s64) router.mount_count - 1 {
         mp := *router.mounts[i];
         if starts_with(req.path, mp.prefix) {
-            // Strip the prefix for the sub-router
             original_path := req.path;
             remaining := req.path;
-            remaining.data += mp.prefix.count;
+            remaining.data  += mp.prefix.count;
             remaining.count -= mp.prefix.count;
-            // Ensure sub-path starts with "/" or is empty (becomes "/")
-            if remaining.count == 0 {
-                req.path = "/";
-            } else {
-                req.path = remaining;
-            }
+            if remaining.count == 0  req.path = "/";
+            else                     req.path = remaining;
             dispatch_with_middleware(router, mp.router, req, resp);
             req.path = original_path;
             return;
         }
     }
 
-    // Linear scan routes — match method + pattern
-    matched_path := false;
     http_ctx: HTTP_Context;
+    handler, status := tree_match(*router.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
 
-    for i: 0..cast(s64) router.route_count - 1 {
-        r := *router.routes[i];
-        http_ctx.param_count = 0;
+    if status == .MATCHED {
+        http_ctx.req     = req;
+        http_ctx.resp    = resp;
+        http_ctx.handler = handler;
 
-        if match_pattern(r.pattern, req.path, *http_ctx.params, *http_ctx.param_count) {
-            matched_path = true;
-            // Check method (empty method = any)
-            if r.method.count == 0 || string_equals(r.method, req.method) {
-                http_ctx.req = req;
-                http_ctx.resp = resp;
-                http_ctx.handler = r.handler;
+        mw_slice: [] Middleware;
+        mw_slice.data  = router.middleware.data;
+        mw_slice.count = cast(s64) router.mw_count;
+        http_ctx.middleware = mw_slice;
+        http_ctx.mw_index   = 0;
 
-                // Build middleware slice from this router
-                mw_slice: [] Middleware;
-                mw_slice.data = router.middleware.data;
-                mw_slice.count = cast(s64) router.mw_count;
-                http_ctx.middleware = mw_slice;
-                http_ctx.mw_index = 0;
-
-                ctx := *context;
-                ctx.http = *http_ctx;
-                push_context ctx.* {
-                    proceed(*http_ctx);
-                }
-                return;
-            }
+        ctx := *context;
+        ctx.http = *http_ctx;
+        push_context ctx.* {
+            proceed(*http_ctx);
         }
+        return;
     }
 
-    // No match
-    if matched_path {
-        // Path matched but method didn't → 405
+    if status == .METHOD_NOT_ALLOWED {
         resp.status_code = 405;
         resp.body = "Method Not Allowed";
-    } else {
-        resp.status_code = 404;
-        resp.body = "Not Found";
+        return;
     }
+
+    resp.status_code = 404;
+    resp.body = "Not Found";
 }
 
 // -- Routing as an OPTIONAL Handler layered on the core --
@@ -349,53 +324,40 @@ is_router_base :: (t: *Type_Info) -> bool {
 
 // Dispatch into a sub-router, running parent middleware first, then sub-router middleware.
 dispatch_with_middleware :: (parent: *Router, sub: *Router, req: *Request, resp: *Response) {
-    // Find matching route in sub-router
-    matched_path := false;
     http_ctx: HTTP_Context;
+    handler, status := tree_match(*sub.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
 
-    for i: 0..cast(s64) sub.route_count - 1 {
-        r := *sub.routes[i];
-        http_ctx.param_count = 0;
+    if status == .MATCHED {
+        http_ctx.req     = req;
+        http_ctx.resp    = resp;
+        http_ctx.handler = handler;
 
-        if match_pattern(r.pattern, req.path, *http_ctx.params, *http_ctx.param_count) {
-            matched_path = true;
-            if r.method.count == 0 || string_equals(r.method, req.method) {
-                http_ctx.req = req;
-                http_ctx.resp = resp;
-                http_ctx.handler = r.handler;
-
-                // Merge middleware: parent middleware first, then sub-router middleware.
-                // Use temporary storage for the merged array.
-                total_mw := cast(s64) parent.mw_count + cast(s64) sub.mw_count;
-                if total_mw > 0 {
-                    merged := Basic.NewArray(total_mw, Middleware, initialized = false,, allocator = Basic.temp);
-                    for j: 0..cast(s64) parent.mw_count - 1 {
-                        merged[j] = parent.middleware[j];
-                    }
-                    for j: 0..cast(s64) sub.mw_count - 1 {
-                        merged[cast(s64) parent.mw_count + j] = sub.middleware[j];
-                    }
-                    http_ctx.middleware = merged;
-                }
-                http_ctx.mw_index = 0;
-
-                ctx := *context;
-                ctx.http = *http_ctx;
-                push_context ctx.* {
-                    proceed(*http_ctx);
-                }
-                return;
-            }
+        // Merge middleware: parent first, then sub-router. Temp storage for the merged slice.
+        total_mw := cast(s64) parent.mw_count + cast(s64) sub.mw_count;
+        if total_mw > 0 {
+            merged := Basic.NewArray(total_mw, Middleware, initialized = false,, allocator = Basic.temp);
+            for j: 0..cast(s64) parent.mw_count - 1  merged[j] = parent.middleware[j];
+            for j: 0..cast(s64) sub.mw_count - 1     merged[cast(s64) parent.mw_count + j] = sub.middleware[j];
+            http_ctx.middleware = merged;
         }
+        http_ctx.mw_index = 0;
+
+        ctx := *context;
+        ctx.http = *http_ctx;
+        push_context ctx.* {
+            proceed(*http_ctx);
+        }
+        return;
     }
 
-    if matched_path {
+    if status == .METHOD_NOT_ALLOWED {
         resp.status_code = 405;
         resp.body = "Method Not Allowed";
-    } else {
-        resp.status_code = 404;
-        resp.body = "Not Found";
+        return;
     }
+
+    resp.status_code = 404;
+    resp.body = "Not Found";
 }
 
 starts_with :: inline (s: string, prefix: string) -> bool {
