@@ -564,6 +564,77 @@ test_merge_conflict :: () {
     print("  PASS: test_merge_conflict\n");
 }
 
+// -- Trie: tree_match --
+
+build_acc :: (patterns: [] string) -> Trie {
+    acc: Trie;
+    for patterns {
+        p, ok := build_partial_tree("GET", it, simple_test_handler);
+        assert(ok, "build % ok", it);
+        assert(merge(*acc, p), "merge % ok", it);
+    }
+    return acc;
+}
+
+test_tm_static_vs_param_backtrack :: () {
+    acc := build_acc(.["/users/new", "/users/:id"]);
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    // Static wins for the literal.
+    h, st := tree_match(*acc, "GET", "/users/new", *params, *pc);
+    assert(st == .MATCHED, "static /users/new matched");
+    assert(pc == 0, "static path captures nothing");
+
+    // Param matches a different value.
+    h, st = tree_match(*acc, "GET", "/users/42", *params, *pc);
+    assert(st == .MATCHED, "param /users/42 matched");
+    assert(pc == 1 && string_equals(params[0].name, "id") && string_equals(params[0].value, "42"), "id=42");
+
+    print("  PASS: test_tm_static_vs_param_backtrack\n");
+}
+
+test_tm_deeper_backtrack :: () {
+    // /users/new is a leaf; /users/:id/edit needs the param branch even though "new" is static.
+    acc := build_acc(.["/users/new", "/users/:id/edit"]);
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+    h, st := tree_match(*acc, "GET", "/users/new/edit", *params, *pc);
+    assert(st == .MATCHED, "must backtrack from static 'new' to param branch");
+    assert(pc == 1 && string_equals(params[0].value, "new"), "captured id=new, got '%'", params[0].value);
+    print("  PASS: test_tm_deeper_backtrack\n");
+}
+
+test_tm_wildcard :: () {
+    acc := build_acc(.["/static/*filepath"]);
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+    h, st := tree_match(*acc, "GET", "/static/css/app.css", *params, *pc);
+    assert(st == .MATCHED, "wildcard matched");
+    assert(pc == 1 && string_equals(params[0].name, "filepath"), "key filepath");
+    assert(string_equals(params[0].value, "css/app.css"), "rest captured, got '%'", params[0].value);
+
+    h, st = tree_match(*acc, "GET", "/static/", *params, *pc);
+    assert(st == .NOT_FOUND, "empty wildcard remainder must not match");
+    print("  PASS: test_tm_wildcard\n");
+}
+
+test_tm_404_405 :: () {
+    acc: Trie;
+    p, _ := build_partial_tree("GET", "/only", simple_test_handler);
+    merge(*acc, p);
+    params: type_of(HTTP_Context.params);
+    pc: s32;
+
+    h, st := tree_match(*acc, "GET", "/missing", *params, *pc);
+    assert(st == .NOT_FOUND, "missing path -> NOT_FOUND");
+
+    h, st = tree_match(*acc, "POST", "/only", *params, *pc);
+    assert(st == .METHOD_NOT_ALLOWED, "wrong method on existing path -> METHOD_NOT_ALLOWED");
+
+    print("  PASS: test_tm_404_405\n");
+}
+
 // -- Helper: match_pattern overload without params for convenience in tests --
 
 match_pattern :: (pattern: string, path: string) -> bool {
@@ -621,6 +692,12 @@ main :: () {
     test_merge_shared_prefix();
     test_merge_method_union();
     test_merge_conflict();
+
+    print("\nTrie - tree_match:\n");
+    test_tm_static_vs_param_backtrack();
+    test_tm_deeper_backtrack();
+    test_tm_wildcard();
+    test_tm_404_405();
 
     print("\nAll http_router tests passed.\n");
 }

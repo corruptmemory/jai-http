@@ -120,6 +120,46 @@ tree_to_string :: (t: Trie) -> string {
     return Basic.builder_to_string(*sb);
 }
 
+// Match method+path against the tree. Fills out_params/out_count (capture names from the matched
+// leaf zipped with positionally-captured values). Read-only over the tree; uses only stack locals.
+tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS] Param, out_count: *s32) -> (handler: Route_Handler, status: Match_Status) {
+    out_count.* = 0;
+    null_handler: Route_Handler;
+    if t.nodes.count == 0  return null_handler, .NOT_FOUND;
+
+    sp := path;
+    if sp.count > 0 && sp[0] == #char "/" { sp.data += 1; sp.count -= 1; }
+
+    segs_buf: [MAX_PATH_SEGMENTS] string;
+    seg_count, ok := split_path_segments(sp, *segs_buf);
+    if !ok  return null_handler, .NOT_FOUND;
+
+    segs: [] string;
+    segs.data  = segs_buf.data;
+    segs.count = seg_count;
+
+    values: [MAX_PARAMS] string;
+    vcount: s32 = 0;
+    saw_leaf := false;
+
+    leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *saw_leaf);
+    if leaf != -1 {
+        ep := find_endpoint(*t.nodes[leaf], method);
+        if ep != null {
+            n := vcount;
+            if n > cast(s32) ep.param_keys.count  n = cast(s32) ep.param_keys.count;
+            for i: 0..n-1 {
+                out_params.*[i].name  = ep.param_keys[i];
+                out_params.*[i].value = values[i];
+            }
+            out_count.* = n;
+            return ep.handler, .MATCHED;
+        }
+    }
+    if saw_leaf  return null_handler, .METHOD_NOT_ALLOWED;
+    return null_handler, .NOT_FOUND;
+}
+
 // -- Private helpers --
 
 #scope_module
@@ -200,6 +240,88 @@ trie_copy_subtree :: (into: *Trie, from: Trie, from_idx: s32) -> s32 {
         into.nodes[new_idx].wildcard_child = c;
     }
     return new_idx;
+}
+
+// Split the leading-slash-stripped path on '/'. Empty pieces (trailing/double slash) are kept as
+// empty segments, matching build_partial_tree. ok=false if there are more than MAX_PATH_SEGMENTS.
+split_path_segments :: (sp: string, segs: *[MAX_PATH_SEGMENTS] string) -> (count: s32, ok: bool) {
+    count: s32 = 0;
+    if sp.count == 0  return 0, true;
+    i := 0;
+    n := sp.count;
+    while i <= n {
+        j := i;
+        while j < n && sp[j] != #char "/"  j += 1;
+        if count >= MAX_PATH_SEGMENTS  return count, false;
+        segs.*[count] = substr(sp, i, j - i);
+        count += 1;
+        if j >= n  break;
+        i = j + 1;
+    }
+    return count, true;
+}
+
+node_has_method :: (node: *Trie_Node, method: string) -> bool {
+    for * node.endpoints  if it.method.count == 0 || string_equals(it.method, method)  return true;
+    return false;
+}
+
+find_endpoint :: (node: *Trie_Node, method: string) -> *Trie_Endpoint {
+    for * node.endpoints  if string_equals(it.method, method)  return it;   // exact method
+    for * node.endpoints  if it.method.count == 0              return it;   // then "any"
+    return null;
+}
+
+// Precedence static -> param -> wildcard, with backtracking. Returns the matched leaf index, or -1.
+// `sp` is the stripped path (for wildcard raw-remainder capture); `segs[k..]` are the unconsumed segments.
+trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32, method: string,
+                   values: *[MAX_PARAMS] string, vcount: *s32, saw_leaf: *bool) -> s32 {
+    node := *t.nodes[node_idx];
+
+    if k == segs.count {
+        if node.endpoints.count > 0 {
+            saw_leaf.* = true;
+            if node_has_method(node, method)  return node_idx;
+        }
+        return -1;
+    }
+
+    seg := segs[k];
+
+    // 1. STATIC
+    sidx := find_static_child(t, node_idx, seg);
+    if sidx != -1 {
+        r := trie_match_rec(t, sidx, sp, segs, k + 1, method, values, vcount, saw_leaf);
+        if r != -1  return r;
+    }
+
+    // 2. PARAM (non-empty segment only)
+    if node.param_child != -1 && seg.count > 0 && vcount.* < MAX_PARAMS {
+        values.*[vcount.*] = seg;
+        vcount.* += 1;
+        r := trie_match_rec(t, node.param_child, sp, segs, k + 1, method, values, vcount, saw_leaf);
+        if r != -1  return r;
+        vcount.* -= 1;   // backtrack
+    }
+
+    // 3. WILDCARD (captures the raw remainder from segs[k] to end of sp; must be non-empty; terminal)
+    if node.wildcard_child != -1 && vcount.* < MAX_PARAMS {
+        rest: string = ---;
+        rest.data  = seg.data;
+        rest.count = (sp.data + sp.count) - seg.data;
+        if rest.count > 0 {
+            values.*[vcount.*] = rest;
+            vcount.* += 1;
+            wnode := *t.nodes[node.wildcard_child];
+            if wnode.endpoints.count > 0 {
+                saw_leaf.* = true;
+                if node_has_method(wnode, method)  return node.wildcard_child;
+            }
+            vcount.* -= 1;   // backtrack
+        }
+    }
+
+    return -1;
 }
 
 trie_merge_node :: (into: *Trie, into_idx: s32, from: Trie, from_idx: s32) -> bool {
