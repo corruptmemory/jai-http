@@ -1,7 +1,7 @@
 # Trie-Based Path Matcher (segment trie, merge-built)
 
 **Date:** 2026-06-22
-**Status:** Approved (design)
+**Status:** Implemented (2026-06-22) — phases A+B landed; `match_pattern` retired; all suites green. Phase C (macros) is future work.
 **Module:** `modules/http_router/`
 **Supersedes routing internals of:** `modules/http_router/router.jai` (the `routes:[MAX_ROUTES]Route`
 linear array + `match_pattern` linear scan)

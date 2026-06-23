@@ -6,109 +6,6 @@
 // are identical types across the boundary. These tests call dispatch() directly, never serve(),
 // so the core's serve and http_router's serve never need disambiguation here.
 
-// -- Router: pattern matching tests --
-
-test_match_exact_path :: () {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-
-    assert(match_pattern("/users", "/users", *params, *pc) == true, "Exact path should match");
-    assert(pc == 0, "No params for exact match");
-
-    assert(match_pattern("/users", "/users/") == false, "/users should not match /users/");
-    assert(match_pattern("/", "/") == true, "Root path should match");
-    assert(match_pattern("/users", "/posts") == false, "/users should not match /posts");
-
-    print("  PASS: test_match_exact_path\n");
-}
-
-test_match_param_capture :: () {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-
-    assert(match_pattern("/users/:id", "/users/42", *params, *pc) == true, "Param pattern should match");
-    assert(pc == 1, "Should capture 1 param, got %", pc);
-    assert(string_equals(params[0].name, "id"), "Param name should be 'id', got '%'", params[0].name);
-    assert(string_equals(params[0].value, "42"), "Param value should be '42', got '%'", params[0].value);
-
-    print("  PASS: test_match_param_capture\n");
-}
-
-test_match_multi_param :: () {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-
-    assert(match_pattern("/users/:id/posts/:pid", "/users/42/posts/99", *params, *pc) == true);
-    assert(pc == 2, "Should capture 2 params, got %", pc);
-    assert(string_equals(params[0].name, "id"));
-    assert(string_equals(params[0].value, "42"));
-    assert(string_equals(params[1].name, "pid"));
-    assert(string_equals(params[1].value, "99"));
-
-    print("  PASS: test_match_multi_param\n");
-}
-
-test_match_no_match :: () {
-    // Too few segments
-    assert(match_pattern("/users/:id", "/users") == false, "Too few segments should not match");
-    // Too many segments
-    assert(match_pattern("/users/:id", "/users/42/extra") == false, "Too many segments should not match");
-    // Empty param segment
-    assert(match_pattern("/users/:id", "/users/") == false, "Empty param segment should not match");
-
-    print("  PASS: test_match_no_match\n");
-}
-
-// -- Router: wildcard pattern matching tests --
-
-test_match_wildcard_basic :: () {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-
-    assert(match_pattern("/static/*filepath", "/static/style.css", *params, *pc) == true, "Wildcard should match single segment");
-    assert(pc == 1, "Should capture 1 param, got %", pc);
-    assert(string_equals(params[0].name, "filepath"), "Param name should be 'filepath', got '%'", params[0].name);
-    assert(string_equals(params[0].value, "style.css"), "Param value should be 'style.css', got '%'", params[0].value);
-
-    print("  PASS: test_match_wildcard_basic\n");
-}
-
-test_match_wildcard_deep_path :: () {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-
-    assert(match_pattern("/static/*filepath", "/static/css/main/style.css", *params, *pc) == true, "Wildcard should match deep path");
-    assert(pc == 1);
-    assert(string_equals(params[0].name, "filepath"));
-    assert(string_equals(params[0].value, "css/main/style.css"), "Should capture full remaining path, got '%'", params[0].value);
-
-    print("  PASS: test_match_wildcard_deep_path\n");
-}
-
-test_match_wildcard_with_prefix_params :: () {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-
-    assert(match_pattern("/repos/:owner/*rest", "/repos/jim/blob/main/README.md", *params, *pc) == true);
-    assert(pc == 2, "Should capture 2 params, got %", pc);
-    assert(string_equals(params[0].name, "owner"));
-    assert(string_equals(params[0].value, "jim"));
-    assert(string_equals(params[1].name, "rest"));
-    assert(string_equals(params[1].value, "blob/main/README.md"), "Wildcard should capture rest, got '%'", params[1].value);
-
-    print("  PASS: test_match_wildcard_with_prefix_params\n");
-}
-
-test_match_wildcard_no_match :: () {
-    // Wildcard needs at least one character after the prefix
-    assert(match_pattern("/static/*filepath", "/static/") == false, "Trailing slash only should not match wildcard");
-    assert(match_pattern("/static/*filepath", "/static") == false, "No trailing content should not match wildcard");
-    // Wrong prefix
-    assert(match_pattern("/static/*filepath", "/assets/style.css") == false, "Wrong prefix should not match");
-
-    print("  PASS: test_match_wildcard_no_match\n");
-}
-
 // -- Router: wildcard dispatch tests --
 
 wildcard_captured_path: string;
@@ -611,30 +508,10 @@ test_tm_404_405 :: () {
     print("  PASS: test_tm_404_405\n");
 }
 
-// -- Helper: match_pattern overload without params for convenience in tests --
-
-match_pattern :: (pattern: string, path: string) -> bool {
-    params: type_of(HTTP_Context.params);
-    pc: s32;
-    return match_pattern(pattern, path, *params, *pc);
-}
-
 main :: () {
     print("Running http_router tests...\n\n");
 
-    print("Router - pattern matching:\n");
-    test_match_exact_path();
-    test_match_param_capture();
-    test_match_multi_param();
-    test_match_no_match();
-
-    print("\nRouter - wildcard matching:\n");
-    test_match_wildcard_basic();
-    test_match_wildcard_deep_path();
-    test_match_wildcard_with_prefix_params();
-    test_match_wildcard_no_match();
-
-    print("\nRouter - dispatch:\n");
+    print("Router - dispatch:\n");
     test_dispatch_wildcard();
     test_dispatch_basic();
     test_dispatch_404();
@@ -684,4 +561,4 @@ main :: () {
 // imported anonymously so routing symbols stay unqualified; the two `serve`s form an overload set
 // but are never called here (tests drive dispatch() directly), so no collision.
 #import "http_server"()(Handler_Data = Router);   // Request, Response, string_equals
-#import "http_router";                            // Router, get/post, dispatch, param, proceed, use, mount, match_pattern, HTTP_Context, Middleware
+#import "http_router";                            // Router, get/post, dispatch, param, proceed, use, mount, HTTP_Context, Middleware

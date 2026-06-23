@@ -1,5 +1,7 @@
 # Trie-Based Path Matcher Implementation Plan
 
+> **STATUS: COMPLETE (2026-06-22).** Phases A (trie types, `build_partial_tree`, `tree_to_string`, `merge`) and B (`tree_match` + dispatch integration) landed and were reviewed task-by-task plus a clean whole-branch review. Optional Task B4 (retire `match_pattern`) was also done. All six suites green; `hello_world` smoke-tested 200/404 live. Phase C (the `get`/`post`/… macros) is future work, intentionally out of this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace `http_router`'s O(route-count) linear dispatch with a segment trie matched in O(path-segments), built by merging per-route partial trees into one accumulated tree.
