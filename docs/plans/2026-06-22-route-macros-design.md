@@ -1,7 +1,7 @@
 # Route-Registration Macros (compile-time pattern validation)
 
 **Date:** 2026-06-22
-**Status:** Approved (design)
+**Status:** Implemented (2026-06-22) — `get`/`post`/`put`/`http_delete`/`head` are compile-time macros; malformed pattern = build error (verified); all suites green.
 **Module:** `modules/http_router/`
 **Builds on:** the segment-trie matcher (`docs/plans/2026-06-22-trie-path-matcher-{design,implementation}.md`)
 
