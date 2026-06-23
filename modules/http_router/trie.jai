@@ -1,0 +1,403 @@
+
+// Segment trie for HTTP path routing. Index-based: a Trie is a flat array of nodes; children are
+// referenced by s32 index (-1 = none). Built once at registration (default allocator) and READ-ONLY
+// during dispatch. See docs/plans/2026-06-22-trie-path-matcher-design.md.
+//
+// INDEX DISCIPLINE: appending to `Trie.nodes` may reallocate it. Never hold a *Trie_Node across an
+// append (trie_add_node / trie_copy_subtree / trie_merge_node) — re-resolve t.nodes[idx] afterward.
+// The matcher (trie_match_rec) is read-only and may hold node pointers freely.
+
+Seg_Kind :: enum u8 {
+    STATIC   :: 0;
+    PARAM    :: 1;
+    WILDCARD :: 2;
+}
+
+// One parsed pattern segment. name = literal text (STATIC) or capture name (PARAM/WILDCARD),
+// a string view into the pattern literal.
+Pattern_Segment :: struct {
+    kind: Seg_Kind;
+    name: string;
+}
+
+// One HTTP method's leaf data. param_keys are ordered capture names (views into the pattern literal),
+// zipped with positionally-captured values at match time. "" method = any method.
+Trie_Endpoint :: struct {
+    method:     string;
+    handler:    Route_Handler;
+    param_keys: [] string;
+}
+
+Trie_Node :: struct {
+    kind:            Seg_Kind;
+    segment:         string;        // STATIC: literal text. PARAM/WILDCARD: name (debug only; the matcher ignores it).
+    static_children: [..] s32;      // indices into the owning Trie.nodes
+    param_child:     s32 = -1;      // single PARAM child, or -1
+    wildcard_child:  s32 = -1;      // single WILDCARD child, or -1
+    endpoints:       [..] Trie_Endpoint;   // non-empty => this node is a leaf
+}
+
+Trie :: struct {
+    nodes: [..] Trie_Node;   // nodes[0] is the root: STATIC, empty segment
+}
+
+Match_Status :: enum u8 {
+    MATCHED            :: 0;
+    METHOD_NOT_ALLOWED :: 1;
+    NOT_FOUND          :: 2;
+}
+
+// Parse a route pattern into its segments. Returns the segments as a SLICE (a #run of this bakes;
+// a [..] field would not). ok=false + a human err on a malformed pattern (today: a '*' wildcard
+// that isn't the final segment). No logging here — callers decide compiler_report vs log_error.
+parse_pattern :: (pattern: string) -> (segs: [] Pattern_Segment, ok: bool, err: string) {
+    result: [..] Pattern_Segment;
+
+    rem := pattern;
+    if rem.count > 0 && rem[0] == #char "/" { rem.data += 1; rem.count -= 1; }
+
+    saw_wildcard := false;
+    if rem.count > 0 {
+        i := 0;
+        n := rem.count;
+        while i <= n {
+            j := i;
+            while j < n && rem[j] != #char "/"  j += 1;
+            seg := substr(rem, i, j - i);
+
+            if saw_wildcard  return result, false, "'*' wildcard must be the last segment";
+
+            if seg.count > 0 && seg[0] == #char ":" {
+                Basic.array_add(*result, .{ .PARAM, substr(seg, 1, seg.count - 1) });
+            } else if seg.count > 0 && seg[0] == #char "*" {
+                Basic.array_add(*result, .{ .WILDCARD, substr(seg, 1, seg.count - 1) });
+                saw_wildcard = true;
+            } else {
+                Basic.array_add(*result, .{ .STATIC, seg });
+            }
+
+            if j >= n  break;
+            i = j + 1;
+        }
+    }
+
+    return result, true, "";
+}
+
+// Parse a pattern and build its partial chain trie. ok=false (after logging) on a malformed pattern.
+build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) -> (tree: Trie, ok: bool) {
+    segs, ok, err := parse_pattern(pattern);
+    if !ok {
+        Basic.log_error("http_router: % in pattern '%'", err, pattern);
+        return .{}, false;
+    }
+    return chain_from_segments(method, segs, handler), true;
+}
+
+// Structurally union `from` into `into`. Returns false on a duplicate (same path + same method),
+// after logging — never a silent overwrite. For a single-route partial tree this is "insert".
+merge :: (into: *Trie, from: Trie) -> bool {
+    trie_ensure_root(into);
+    if from.nodes.count == 0  return true;
+    return trie_merge_node(into, 0, from, 0);
+}
+
+// Depth-indented dump of a tree. Generalizes to a forest by calling it per root.
+tree_to_string :: (t: Trie) -> string {
+    sb: Basic.String_Builder;
+    Basic.init_string_builder(*sb);
+    if t.nodes.count > 0  trie_dump_node(*sb, t, 0, 0);
+    return Basic.builder_to_string(*sb);
+}
+
+// Match method+path against the tree. Fills out_params/out_count (capture names from the matched
+// leaf zipped with positionally-captured values). Read-only over the tree; uses only stack locals.
+tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS] Param, out_count: *s32) -> (handler: Route_Handler, status: Match_Status) {
+    out_count.* = 0;
+    null_handler: Route_Handler;
+    if t.nodes.count == 0  return null_handler, .NOT_FOUND;
+
+    sp := path;
+    if sp.count > 0 && sp[0] == #char "/" { sp.data += 1; sp.count -= 1; }
+
+    segs_buf: [MAX_PATH_SEGMENTS] string;
+    seg_count, ok := split_path_segments(sp, *segs_buf);
+    if !ok  return null_handler, .NOT_FOUND;
+
+    segs: [] string;
+    segs.data  = segs_buf.data;
+    segs.count = seg_count;
+
+    values: [MAX_PARAMS] string;
+    vcount: s32 = 0;
+    saw_leaf := false;
+
+    leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *saw_leaf);
+    if leaf != -1 {
+        ep := find_endpoint(*t.nodes[leaf], method);
+        if ep != null {
+            n := vcount;
+            if n > cast(s32) ep.param_keys.count  n = cast(s32) ep.param_keys.count;
+            for i: 0..n-1 {
+                out_params.*[i] = .{ name = ep.param_keys[i], value = values[i] };
+            }
+            out_count.* = n;
+            return ep.handler, .MATCHED;
+        }
+    }
+    if saw_leaf  return null_handler, .METHOD_NOT_ALLOWED;
+    return null_handler, .NOT_FOUND;
+}
+
+// -- Private helpers --
+
+#scope_module
+
+// Build the linear-chain partial trie for one route from its parsed segments + method + handler.
+// (The tree-building half of the old build_partial_tree.) INDEX DISCIPLINE: re-resolve t.nodes[cur]
+// after each trie_add_node (which may reallocate t.nodes).
+chain_from_segments :: (method: string, segs: [] Pattern_Segment, handler: Route_Handler) -> Trie {
+    t: Trie;
+    trie_add_node(*t, .STATIC, "");   // root at index 0
+    cur: s32 = 0;
+    keys: [..] string;
+
+    for segs {
+        if it.kind == {
+          case .STATIC;
+            child := trie_add_node(*t, .STATIC, it.name);
+            Basic.array_add(*t.nodes[cur].static_children, child);
+            cur = child;
+          case .PARAM;
+            child := trie_add_node(*t, .PARAM, it.name);
+            t.nodes[cur].param_child = child;
+            Basic.array_add(*keys, it.name);
+            cur = child;
+          case .WILDCARD;
+            child := trie_add_node(*t, .WILDCARD, it.name);
+            t.nodes[cur].wildcard_child = child;
+            Basic.array_add(*keys, it.name);
+            cur = child;
+        }
+    }
+
+    Basic.array_add(*t.nodes[cur].endpoints, .{ method = method, handler = handler, param_keys = keys });
+    return t;
+}
+
+// Compile-time (#run-only) wrapper: parse + validate, and on a malformed pattern emit a build
+// error via compiler_report. Returns just the slice (one return value, so a #run can assign it).
+parse_or_report :: (pattern: string) -> [] Pattern_Segment {
+    segs, ok, err := parse_pattern(pattern);
+    if !ok  Compiler.compiler_report(Basic.tprint("http_router: % in pattern '%'", err, pattern));
+    return segs;
+}
+
+trie_dump_node :: (sb: *Basic.String_Builder, t: Trie, node_idx: s32, depth: s32) {
+    node := t.nodes[node_idx];
+    for 0..depth-1  Basic.append(sb, "  ");
+    if node.kind == {
+      case .STATIC;   Basic.append(sb, "STATIC \""); Basic.append(sb, node.segment); Basic.append(sb, "\"");
+      case .PARAM;    Basic.append(sb, ":");         Basic.append(sb, node.segment);
+      case .WILDCARD; Basic.append(sb, "*");         Basic.append(sb, node.segment);
+    }
+    for node.endpoints {
+        Basic.append(sb, " ");
+        if it.method.count == 0  Basic.append(sb, "ANY");
+        else                     Basic.append(sb, it.method);
+    }
+    Basic.append(sb, "\n");
+    for node.static_children    trie_dump_node(sb, t, it, depth + 1);
+    if node.param_child    != -1  trie_dump_node(sb, t, node.param_child,    depth + 1);
+    if node.wildcard_child != -1  trie_dump_node(sb, t, node.wildcard_child, depth + 1);
+}
+
+trie_add_node :: (t: *Trie, kind: Seg_Kind, segment: string) -> s32 {
+    // param_child / wildcard_child default to -1 in the Trie_Node definition.
+    Basic.array_add(*t.nodes, .{ kind = kind, segment = segment });
+    return cast(s32) (t.nodes.count - 1);
+}
+
+substr :: (s: string, start: s64, len: s64) -> string {
+    out: string = ---;
+    out.data  = s.data + start;
+    out.count = len;
+    return out;
+}
+
+trie_ensure_root :: (t: *Trie) {
+    if t.nodes.count == 0  trie_add_node(t, .STATIC, "");
+}
+
+find_static_child :: (t: *Trie, node_idx: s32, seg: string) -> s32 {
+    node := *t.nodes[node_idx];
+    for node.static_children {
+        if string_equals(t.nodes[it].segment, seg)  return it;
+    }
+    return -1;
+}
+
+find_endpoint_method :: (t: *Trie, node_idx: s32, method: string) -> bool {
+    node := *t.nodes[node_idx];
+    for * node.endpoints  if string_equals(it.method, method)  return true;
+    return false;
+}
+
+// Deep-copy from's subtree rooted at from_idx into `into`; returns the new index in `into`.
+// INDEX DISCIPLINE: re-resolve into.nodes[new_idx] after each recursive copy (which grows into.nodes).
+trie_copy_subtree :: (into: *Trie, from: Trie, from_idx: s32) -> s32 {
+    new_idx := trie_add_node(into, from.nodes[from_idx].kind, from.nodes[from_idx].segment);
+
+    feps := from.nodes[from_idx].endpoints;          // header copy (reads from-backing)
+    for feps  Basic.array_add(*into.nodes[new_idx].endpoints, it);
+
+    fkids := from.nodes[from_idx].static_children;   // header copy
+    for fkids {
+        child := trie_copy_subtree(into, from, it);
+        Basic.array_add(*into.nodes[new_idx].static_children, child);
+    }
+    if from.nodes[from_idx].param_child != -1 {
+        c := trie_copy_subtree(into, from, from.nodes[from_idx].param_child);
+        into.nodes[new_idx].param_child = c;
+    }
+    if from.nodes[from_idx].wildcard_child != -1 {
+        c := trie_copy_subtree(into, from, from.nodes[from_idx].wildcard_child);
+        into.nodes[new_idx].wildcard_child = c;
+    }
+    return new_idx;
+}
+
+// Split the leading-slash-stripped path on '/'. Empty pieces (trailing/double slash) are kept as
+// empty segments, matching build_partial_tree. ok=false if there are more than MAX_PATH_SEGMENTS.
+split_path_segments :: (sp: string, segs: *[MAX_PATH_SEGMENTS] string) -> (count: s32, ok: bool) {
+    count: s32 = 0;
+    if sp.count == 0  return 0, true;
+    i := 0;
+    n := sp.count;
+    while i <= n {
+        j := i;
+        while j < n && sp[j] != #char "/"  j += 1;
+        if count >= MAX_PATH_SEGMENTS  return count, false;
+        segs.*[count] = substr(sp, i, j - i);
+        count += 1;
+        if j >= n  break;
+        i = j + 1;
+    }
+    return count, true;
+}
+
+node_has_method :: (node: *Trie_Node, method: string) -> bool {
+    for * node.endpoints  if it.method.count == 0 || string_equals(it.method, method)  return true;
+    return false;
+}
+
+find_endpoint :: (node: *Trie_Node, method: string) -> *Trie_Endpoint {
+    for * node.endpoints  if string_equals(it.method, method)  return it;   // exact method
+    for * node.endpoints  if it.method.count == 0              return it;   // then "any"
+    return null;
+}
+
+// Precedence static -> param -> wildcard, with backtracking. Returns the matched leaf index, or -1.
+// `sp` is the stripped path (for wildcard raw-remainder capture); `segs[k..]` are the unconsumed segments.
+trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32, method: string,
+                   values: *[MAX_PARAMS] string, vcount: *s32, saw_leaf: *bool) -> s32 {
+    node := *t.nodes[node_idx];
+
+    if k == segs.count {
+        if node.endpoints.count > 0 {
+            saw_leaf.* = true;
+            if node_has_method(node, method)  return node_idx;
+        }
+        return -1;
+    }
+
+    seg := segs[k];
+
+    // 1. STATIC
+    sidx := find_static_child(t, node_idx, seg);
+    if sidx != -1 {
+        r := trie_match_rec(t, sidx, sp, segs, k + 1, method, values, vcount, saw_leaf);
+        if r != -1  return r;
+    }
+
+    // 2. PARAM (non-empty segment only)
+    if node.param_child != -1 && seg.count > 0 && vcount.* < MAX_PARAMS {
+        values.*[vcount.*] = seg;
+        vcount.* += 1;
+        r := trie_match_rec(t, node.param_child, sp, segs, k + 1, method, values, vcount, saw_leaf);
+        if r != -1  return r;
+        vcount.* -= 1;   // backtrack
+    }
+
+    // 3. WILDCARD (captures the raw remainder from segs[k] to end of sp; must be non-empty; terminal)
+    if node.wildcard_child != -1 && vcount.* < MAX_PARAMS {
+        rest: string = ---;
+        rest.data  = seg.data;
+        rest.count = (sp.data + sp.count) - seg.data;
+        if rest.count > 0 {
+            values.*[vcount.*] = rest;
+            vcount.* += 1;
+            wnode := *t.nodes[node.wildcard_child];
+            if wnode.endpoints.count > 0 {
+                saw_leaf.* = true;
+                if node_has_method(wnode, method)  return node.wildcard_child;
+            }
+            vcount.* -= 1;   // backtrack
+        }
+    }
+
+    return -1;
+}
+
+trie_merge_node :: (into: *Trie, into_idx: s32, from: Trie, from_idx: s32) -> bool {
+    ok := true;
+
+    // 1. endpoints union (conflict on same method)
+    feps := from.nodes[from_idx].endpoints;          // header copy
+    for feps {
+        if find_endpoint_method(into, into_idx, it.method) {
+            Basic.log_error("http_router: duplicate route — method '%' already registered at this path", it.method);
+            ok = false;
+        } else {
+            Basic.array_add(*into.nodes[into_idx].endpoints, it);
+        }
+    }
+
+    // 2. static children
+    fkids := from.nodes[from_idx].static_children;   // header copy
+    for fkids {
+        cf       := it;
+        cseg     := from.nodes[cf].segment;
+        existing := find_static_child(into, into_idx, cseg);
+        if existing != -1 {
+            if !trie_merge_node(into, existing, from, cf)  ok = false;
+        } else {
+            ni := trie_copy_subtree(into, from, cf);
+            Basic.array_add(*into.nodes[into_idx].static_children, ni);
+        }
+    }
+
+    // 3. param child (single)
+    if from.nodes[from_idx].param_child != -1 {
+        fp := from.nodes[from_idx].param_child;
+        if into.nodes[into_idx].param_child != -1 {
+            if !trie_merge_node(into, into.nodes[into_idx].param_child, from, fp)  ok = false;
+        } else {
+            ni := trie_copy_subtree(into, from, fp);
+            into.nodes[into_idx].param_child = ni;
+        }
+    }
+
+    // 4. wildcard child (single)
+    if from.nodes[from_idx].wildcard_child != -1 {
+        fw := from.nodes[from_idx].wildcard_child;
+        if into.nodes[into_idx].wildcard_child != -1 {
+            if !trie_merge_node(into, into.nodes[into_idx].wildcard_child, from, fw)  ok = false;
+        } else {
+            ni := trie_copy_subtree(into, from, fw);
+            into.nodes[into_idx].wildcard_child = ni;
+        }
+    }
+
+    return ok;
+}

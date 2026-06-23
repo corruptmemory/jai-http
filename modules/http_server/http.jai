@@ -54,9 +54,7 @@ get_header :: (request: *Request, name: string) -> (value: string, found: bool) 
 // Add a custom header to the response.
 set_header :: (response: *Response, name: string, value: string) {
     if response.header_count >= MAX_HEADERS return;
-    h := *response.headers[response.header_count];
-    h.name = name;
-    h.value = value;
+    response.headers[response.header_count] = .{ name = name, value = value };
     response.header_count += 1;
 }
 
@@ -130,15 +128,15 @@ parse_request :: (c: *Connection) -> Parse_Result {
             if colon < 0 return .ERROR;
 
             if c.req.header_count < MAX_HEADERS {
-                h := *c.req.headers[c.req.header_count];
-                h.name = make_view(c.buf.data, c.parse_offset, colon);
-
-                // Skip colon and leading whitespace
+                // Skip colon and leading whitespace before the value
                 val_start := colon + 1;
                 while val_start < crlf && c.buf[val_start] == #char " " {
                     val_start += 1;
                 }
-                h.value = make_view(c.buf.data, val_start, crlf);
+                c.req.headers[c.req.header_count] = .{
+                    name  = make_view(c.buf.data, c.parse_offset, colon),
+                    value = make_view(c.buf.data, val_start, crlf),
+                };
                 c.req.header_count += 1;
             }
 
