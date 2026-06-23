@@ -21,8 +21,7 @@ home :: (request: *Request, response: *Response) {
 }
 
 main :: () {
-    app: App;
-    app.greeting = "Hello from typed app state!";
+    app := App.{ greeting = "Hello from typed app state!" };
     http_router.get(*app, "/", home);        // *App passed where *Router is expected (implicit #as conversion)
 
     server: Server;
