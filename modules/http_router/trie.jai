@@ -185,6 +185,14 @@ chain_from_segments :: (method: string, segs: [] Pattern_Segment, handler: Route
     return t;
 }
 
+// Compile-time (#run-only) wrapper: parse + validate, and on a malformed pattern emit a build
+// error via compiler_report. Returns just the slice (one return value, so a #run can assign it).
+parse_or_report :: (pattern: string) -> [] Pattern_Segment {
+    segs, ok, err := parse_pattern(pattern);
+    if !ok  Compiler.compiler_report(Basic.tprint("http_router: % in pattern '%'", err, pattern));
+    return segs;
+}
+
 trie_dump_node :: (sb: *Basic.String_Builder, t: Trie, node_idx: s32, depth: s32) {
     node := t.nodes[node_idx];
     for 0..depth-1  Basic.append(sb, "  ");

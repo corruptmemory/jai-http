@@ -542,6 +542,55 @@ test_tm_404_405 :: () {
     print("  PASS: test_tm_404_405\n");
 }
 
+// -- Route macros (compile-time pattern parse) --
+
+macro_head_called: bool;
+macro_head_handler :: (req: *Request, resp: *Response) {
+    macro_head_called = true;
+    resp.status_code = 200;
+}
+
+test_macro_head :: () {
+    router: Router;
+    head(*router, "/ping", macro_head_handler);
+
+    req := Request.{ method = "HEAD", path = "/ping" };
+    resp: Response;
+    macro_head_called = false;
+    dispatch(*router, *req, *resp);
+    assert(macro_head_called, "HEAD handler should run");
+    assert(resp.status_code == 200, "HEAD /ping -> 200, got %", resp.status_code);
+    print("  PASS: test_macro_head\n");
+}
+
+macro_eq_id: string;
+macro_eq_handler :: (req: *Request, resp: *Response) {
+    id, _ := param("id");
+    macro_eq_id = id;
+    resp.status_code = 200;
+}
+
+test_macro_route_equivalence :: () {
+    // Same route via the get MACRO and via runtime route() must dispatch identically.
+    r_macro: Router;
+    get(*r_macro, "/users/:id", macro_eq_handler);
+
+    r_runtime: Router;
+    route(*r_runtime, "GET", "/users/:id", macro_eq_handler);
+
+    req := Request.{ method = "GET", path = "/users/42" };
+
+    resp1: Response; macro_eq_id = "";
+    dispatch(*r_macro, *req, *resp1);
+    assert(resp1.status_code == 200 && string_equals(macro_eq_id, "42"), "macro path: 200 + id=42, got % '%'", resp1.status_code, macro_eq_id);
+
+    resp2: Response; macro_eq_id = "";
+    dispatch(*r_runtime, *req, *resp2);
+    assert(resp2.status_code == 200 && string_equals(macro_eq_id, "42"), "route() path: 200 + id=42, got % '%'", resp2.status_code, macro_eq_id);
+
+    print("  PASS: test_macro_route_equivalence\n");
+}
+
 main :: () {
     print("Running http_router tests...\n\n");
 
@@ -591,6 +640,10 @@ main :: () {
     test_tm_deeper_backtrack();
     test_tm_wildcard();
     test_tm_404_405();
+
+    print("\nRoute macros:\n");
+    test_macro_head();
+    test_macro_route_equivalence();
 
     print("\nAll http_router tests passed.\n");
 }

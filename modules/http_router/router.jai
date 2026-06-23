@@ -41,20 +41,32 @@ Router :: struct {
 
 // -- Route registration --
 
-get :: (router: *Router, pattern: string, handler: Route_Handler) {
-    route(router, "GET", pattern, handler);
+// Runtime: build the chain from parsed segments and merge it into the router's trie.
+// Duplicate path+method is reported by merge (log_error); we add the method context.
+register_parsed :: (router: *Router, method: string, segs: [] Pattern_Segment, handler: Route_Handler) {
+    if !merge(*router.tree, chain_from_segments(method, segs, handler)) {
+        Basic.log_error("http_router: route registration conflict for method '%'", method);
+    }
 }
 
-post :: (router: *Router, pattern: string, handler: Route_Handler) {
-    route(router, "POST", pattern, handler);
+get :: (router: *Router, $pattern: string, handler: Route_Handler) #expand {
+    register_parsed(router, "GET", #run parse_or_report(pattern), handler);
 }
 
-put :: (router: *Router, pattern: string, handler: Route_Handler) {
-    route(router, "PUT", pattern, handler);
+post :: (router: *Router, $pattern: string, handler: Route_Handler) #expand {
+    register_parsed(router, "POST", #run parse_or_report(pattern), handler);
 }
 
-http_delete :: (router: *Router, pattern: string, handler: Route_Handler) {
-    route(router, "DELETE", pattern, handler);
+put :: (router: *Router, $pattern: string, handler: Route_Handler) #expand {
+    register_parsed(router, "PUT", #run parse_or_report(pattern), handler);
+}
+
+http_delete :: (router: *Router, $pattern: string, handler: Route_Handler) #expand {
+    register_parsed(router, "DELETE", #run parse_or_report(pattern), handler);
+}
+
+head :: (router: *Router, $pattern: string, handler: Route_Handler) #expand {
+    register_parsed(router, "HEAD", #run parse_or_report(pattern), handler);
 }
 
 route :: (router: *Router, method: string, pattern: string, handler: Route_Handler) {
