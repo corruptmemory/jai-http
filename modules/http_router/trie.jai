@@ -13,6 +13,13 @@ Seg_Kind :: enum u8 {
     WILDCARD :: 2;
 }
 
+// One parsed pattern segment. name = literal text (STATIC) or capture name (PARAM/WILDCARD),
+// a string view into the pattern literal.
+Pattern_Segment :: struct {
+    kind: Seg_Kind;
+    name: string;
+}
+
 // One HTTP method's leaf data. param_keys are ordered capture names (views into the pattern literal),
 // zipped with positionally-captured values at match time. "" method = any method.
 Trie_Endpoint :: struct {
@@ -40,21 +47,16 @@ Match_Status :: enum u8 {
     NOT_FOUND          :: 2;
 }
 
-// Parse one pattern into its (linear-chain) partial tree. ok=false on malformed pattern (e.g. a
-// non-terminal wildcard), after logging. Runs identically at compile time or runtime.
-build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) -> (tree: Trie, ok: bool) {
-    t: Trie;
-    trie_add_node(*t, .STATIC, "");   // root at index 0
-    ok := true;
+// Parse a route pattern into its segments. Returns the segments as a SLICE (a #run of this bakes;
+// a [..] field would not). ok=false + a human err on a malformed pattern (today: a '*' wildcard
+// that isn't the final segment). No logging here — callers decide compiler_report vs log_error.
+parse_pattern :: (pattern: string) -> (segs: [] Pattern_Segment, ok: bool, err: string) {
+    result: [..] Pattern_Segment;
 
-    keys: [..] string;
-    cur: s32 = 0;
-    saw_wildcard := false;
-
-    // Strip leading '/', then split the remainder on '/'. "" remainder => zero segments (root is leaf).
     rem := pattern;
     if rem.count > 0 && rem[0] == #char "/" { rem.data += 1; rem.count -= 1; }
 
+    saw_wildcard := false;
     if rem.count > 0 {
         i := 0;
         n := rem.count;
@@ -63,29 +65,15 @@ build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) 
             while j < n && rem[j] != #char "/"  j += 1;
             seg := substr(rem, i, j - i);
 
-            if saw_wildcard {
-                Basic.log_error("http_router: '*' wildcard must be the last segment in pattern '%'", pattern);
-                ok = false;
-                break;
-            }
+            if saw_wildcard  return result, false, "'*' wildcard must be the last segment";
 
             if seg.count > 0 && seg[0] == #char ":" {
-                name  := substr(seg, 1, seg.count - 1);
-                child := trie_add_node(*t, .PARAM, name);
-                t.nodes[cur].param_child = child;
-                Basic.array_add(*keys, name);
-                cur = child;
+                Basic.array_add(*result, .{ .PARAM, substr(seg, 1, seg.count - 1) });
             } else if seg.count > 0 && seg[0] == #char "*" {
-                name  := substr(seg, 1, seg.count - 1);
-                child := trie_add_node(*t, .WILDCARD, name);
-                t.nodes[cur].wildcard_child = child;
-                Basic.array_add(*keys, name);
-                cur = child;
+                Basic.array_add(*result, .{ .WILDCARD, substr(seg, 1, seg.count - 1) });
                 saw_wildcard = true;
             } else {
-                child := trie_add_node(*t, .STATIC, seg);
-                Basic.array_add(*t.nodes[cur].static_children, child);
-                cur = child;
+                Basic.array_add(*result, .{ .STATIC, seg });
             }
 
             if j >= n  break;
@@ -93,11 +81,17 @@ build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) 
         }
     }
 
-    if ok {
-        Basic.array_add(*t.nodes[cur].endpoints, .{ method = method, handler = handler, param_keys = keys });
-    }
+    return result, true, "";
+}
 
-    return t, ok;
+// Parse a pattern and build its partial chain trie. ok=false (after logging) on a malformed pattern.
+build_partial_tree :: (method: string, pattern: string, handler: Route_Handler) -> (tree: Trie, ok: bool) {
+    segs, ok, err := parse_pattern(pattern);
+    if !ok {
+        Basic.log_error("http_router: % in pattern '%'", err, pattern);
+        return .{}, false;
+    }
+    return chain_from_segments(method, segs, handler), true;
 }
 
 // Structurally union `from` into `into`. Returns false on a duplicate (same path + same method),
@@ -158,6 +152,38 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
 // -- Private helpers --
 
 #scope_module
+
+// Build the linear-chain partial trie for one route from its parsed segments + method + handler.
+// (The tree-building half of the old build_partial_tree.) INDEX DISCIPLINE: re-resolve t.nodes[cur]
+// after each trie_add_node (which may reallocate t.nodes).
+chain_from_segments :: (method: string, segs: [] Pattern_Segment, handler: Route_Handler) -> Trie {
+    t: Trie;
+    trie_add_node(*t, .STATIC, "");   // root at index 0
+    cur: s32 = 0;
+    keys: [..] string;
+
+    for segs {
+        if it.kind == {
+          case .STATIC;
+            child := trie_add_node(*t, .STATIC, it.name);
+            Basic.array_add(*t.nodes[cur].static_children, child);
+            cur = child;
+          case .PARAM;
+            child := trie_add_node(*t, .PARAM, it.name);
+            t.nodes[cur].param_child = child;
+            Basic.array_add(*keys, it.name);
+            cur = child;
+          case .WILDCARD;
+            child := trie_add_node(*t, .WILDCARD, it.name);
+            t.nodes[cur].wildcard_child = child;
+            Basic.array_add(*keys, it.name);
+            cur = child;
+        }
+    }
+
+    Basic.array_add(*t.nodes[cur].endpoints, .{ method = method, handler = handler, param_keys = keys });
+    return t;
+}
 
 trie_dump_node :: (sb: *Basic.String_Builder, t: Trie, node_idx: s32, depth: s32) {
     node := t.nodes[node_idx];

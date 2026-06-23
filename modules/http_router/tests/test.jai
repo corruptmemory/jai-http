@@ -336,6 +336,40 @@ test_context_http_set :: () {
     print("  PASS: test_context_http_set\n");
 }
 
+// -- Trie: parse_pattern --
+
+test_parse_simple :: () {
+    segs, ok, err := parse_pattern("/users/:id");
+    assert(ok, "should parse, err='%'", err);
+    assert(segs.count == 2, "expected 2 segments, got %", segs.count);
+    assert(segs[0].kind == .STATIC && string_equals(segs[0].name, "users"), "seg0 STATIC users");
+    assert(segs[1].kind == .PARAM  && string_equals(segs[1].name, "id"),    "seg1 PARAM id");
+    print("  PASS: test_parse_simple\n");
+}
+
+test_parse_root :: () {
+    segs, ok, _ := parse_pattern("/");
+    assert(ok, "root parses");
+    assert(segs.count == 0, "root has zero segments, got %", segs.count);
+    print("  PASS: test_parse_root\n");
+}
+
+test_parse_wildcard :: () {
+    segs, ok, _ := parse_pattern("/static/*filepath");
+    assert(ok);
+    assert(segs.count == 2);
+    assert(segs[0].kind == .STATIC   && string_equals(segs[0].name, "static"));
+    assert(segs[1].kind == .WILDCARD && string_equals(segs[1].name, "filepath"), "seg1 WILDCARD filepath");
+    print("  PASS: test_parse_wildcard\n");
+}
+
+test_parse_malformed :: () {
+    _, ok, err := parse_pattern("/a/*rest/b");
+    assert(!ok, "non-terminal wildcard must fail");
+    assert(err.count > 0, "should carry an error message");
+    print("  PASS: test_parse_malformed\n");
+}
+
 // -- Trie: build_partial_tree --
 
 test_build_simple_param :: () {
@@ -530,6 +564,12 @@ main :: () {
 
     print("\nRouter - context:\n");
     test_context_http_set();
+
+    print("\nTrie - parse_pattern:\n");
+    test_parse_simple();
+    test_parse_root();
+    test_parse_wildcard();
+    test_parse_malformed();
 
     print("\nTrie - build_partial_tree:\n");
     test_build_simple_param();
