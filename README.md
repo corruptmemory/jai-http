@@ -14,14 +14,30 @@ A high-performance HTTP/1.1 server library for [Jai](https://jai.community/), bu
 
 ## Performance
 
-Benchmarked on AMD Threadripper (32-core / 64-thread) with `wrk`:
+Beats nginx on the same hardware. Benchmarked with `wrk` against a release build serving
+`"Hello, World!"` (16 workers, SO_REUSEPORT, keep-alive, `performance` governor):
 
-| wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|-------------|---------|-------------|
-| 1 | 10 | 143,808 | 4.8ms |
-| 8 | 500 | 689,251 | 4.4ms |
-| 16 | 1000 | 1,360,520 | 4.4ms |
-| 32 | 2000 | ~1,600,000 | ~4ms |
+**AMD Threadripper 3970X (32C / 64T):**
+
+| wrk | jai-http | nginx (control) |
+|-----|---------:|----------------:|
+| t8 / c500   | 1.03M | 1.03M |
+| t16 / c1000 | **1.78M** | 1.65M |
+| t32 / c2000 | **1.81M** | 1.56M |
+
+**Intel i7-12800H laptop (20 logical / 6P+8E):**
+
+| wrk | jai-http | nginx (control) |
+|-----|---------:|----------------:|
+| t8 / c500   | **1.53M** | 1.35M |
+| t16 / c1000 | **1.69M** | 1.48M |
+| t32 / c2000 | **1.53M** | 1.33M |
+
+Earlier builds suffered a high-concurrency throughput *collapse*, traced to a per-response
+temporary-storage allocation in `write_response`; routing every per-request allocation through the
+per-request `Pool` removed it. Full investigation and a reproducible benchmark environment:
+[`docs/plans/2026-06-19-perf-collapse-investigation.md`](docs/plans/2026-06-19-perf-collapse-investigation.md).
+Reproduce with [`bench.sh`](bench.sh) (`./bench.sh` for the server, `./bench.sh nginx` for the control).
 
 ## Quick Start
 
