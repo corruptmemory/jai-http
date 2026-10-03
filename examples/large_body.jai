@@ -1,6 +1,11 @@
-// A 1 MB response body on every request, for exercising the pending-output path against a real
-// TCP client: `curl --limit-rate 50k` makes the socket fill, so the tail queues on EPOLLOUT.
-#import "http_server"()(Handler_Data = http_router.Router);
+// A large response body on every request, for exercising the pending-output path against a real
+// TCP client. Loopback socket buffers absorb a megabyte or more without queueing anything, so the
+// body is 8 MB, and the per-connection tail cap is raised to 16 MB. MAX_PENDING_BYTES is a
+// program-wide (group 2) parameter, so the main program sets it here and http_router's import of
+// http_server sees the same value. With a slow reader,
+//     curl --limit-rate 1M -o /dev/null http://localhost:9090/
+// the socket fills, the unsent tail queues on the connection and drains on EPOLLOUT.
+#import "http_server"()(Handler_Data = http_router.Router, MAX_PENDING_BYTES = 16777216);
 http_router :: #import "http_router";
 
 large_body: string;
@@ -12,7 +17,7 @@ large_handler :: (request: *Request, response: *Response) {
 }
 
 main :: () {
-    large_body = alloc_string(1048576);
+    large_body = alloc_string(8 * 1048576);
     memset(large_body.data, #char "x", large_body.count);
 
     router: http_router.Router;

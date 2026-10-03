@@ -20,7 +20,9 @@
     MAX_MULTIPART_PARTS : s32 = 16,
     LISTEN_BACKLOG      : s32 = 1024,
     // Cap on unsent response bytes one connection may queue when its socket is full. A tail that
-    // would exceed it closes the connection (logged). Only slow readers ever hold a tail.
+    // would exceed it closes the connection (log_error). Only slow readers ever hold a tail. Unlike
+    // the timeouts, 0 does not disable it: 0 means no tail may be queued, so every stalled
+    // response closes its connection.
     MAX_PENDING_BYTES   : s64 = 1048576,
     // Timeouts in milliseconds; 0 disables each. See docs/plans/2026-10-03-fib-lifts-design.md §5.
     IDLE_TIMEOUT_MS     : s64 = 60000,    // kept-alive connection between requests
