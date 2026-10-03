@@ -743,6 +743,312 @@ test_pending_defaults_and_release :: () {
     print("  PASS: test_pending_defaults_and_release\n");
 }
 
+// -- Socket helpers for the send-path tests --
+//
+// A connected AF_UNIX pair. fds[0] is the server side (non-blocking), fds[1] the peer. A small
+// SO_SNDBUF on the server side makes the kernel refuse bytes early, which is how these tests
+// force the pending path deterministically, without sleeping.
+make_socket_pair :: (server_sndbuf: s32 = 0) -> (server: s32, peer: s32) {
+    fds: [2] s32;
+    r := socketpair(AF_UNIX, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, .IP, *fds);
+    assert(r == 0, "socketpair failed: %", errno());
+    if server_sndbuf > 0 {
+        v := server_sndbuf;
+        r = setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, xx *v, size_of(type_of(v)));
+        assert(r == 0, "setsockopt SO_SNDBUF failed: %", errno());
+    }
+    return fds[0], fds[1];
+}
+
+// Read everything the peer can see right now (until EAGAIN or EOF), appending to `into`.
+drain_peer :: (peer: s32, into: *[..] u8) -> s64 {
+    chunk: [16384] u8;
+    got: s64 = 0;
+    while true {
+        n := read(peer, chunk.data, xx chunk.count);
+        if n > 0 { append_bytes(into, chunk.data, n); got += n; continue; }
+        if n == 0  return got;
+        err := errno();
+        if err == EINTR  continue;
+        assert(err == EAGAIN || err == EWOULDBLOCK, "unexpected read error on peer: %", err);
+        return got;
+    }
+}
+
+as_string :: (arr: [..] u8) -> string {
+    s: string;
+    s.data  = arr.data;
+    s.count = arr.count;
+    return s;
+}
+
+starts_with :: (s: string, prefix: string) -> bool {
+    if s.count < prefix.count  return false;
+    for i: 0..prefix.count - 1  if s[i] != prefix[i]  return false;
+    return true;
+}
+
+// Byte offset of the first `needle` in `haystack`, or -1. The String module's finder is not
+// imported here: its contains/starts_with would collide with the helpers in this file.
+index_of :: (haystack: string, needle: string) -> s64 {
+    i: s64 = 0;
+    while i + needle.count <= haystack.count {
+        match := true;
+        for j: 0..needle.count - 1  if haystack[i + j] != needle[j] { match = false; break; }
+        if match  return i;
+        i += 1;
+    }
+    return -1;
+}
+
+contains :: (haystack: string, needle: string) -> bool {
+    return index_of(haystack, needle) >= 0;
+}
+
+count_occurrences :: (s: string, needle: string) -> s64 {
+    n: s64 = 0;
+    pos: s64 = 0;
+    while pos + needle.count <= s.count {
+        rest: string;
+        rest.data  = s.data + pos;
+        rest.count = s.count - pos;
+        i := index_of(rest, needle);
+        if i < 0  break;
+        n += 1;
+        pos += i + needle.count;
+    }
+    return n;
+}
+
+count_byte :: (s: string, b: u8) -> s64 {
+    n: s64 = 0;
+    for i: 0..s.count - 1  if s[i] == b  n += 1;
+    return n;
+}
+
+// A Connection outside any pool with its pending allocator pinned, for writer-level tests.
+standalone_connection :: (fd: s32) -> *Connection {
+    c := New(Connection);
+    c.pending.allocator = context.allocator;
+    c.fd = fd;
+    return c;
+}
+
+big_body :: (count: s64) -> string {
+    s := alloc_string(count);
+    memset(s.data, #char "x", count);
+    return s;
+}
+
+// -- Writer (Task 3) --
+
+test_write_response_full_send :: () {
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 200, body = "Hello" };
+    r := write_response(c, *req, *resp, "");
+    assert(r == .SENT, "small response should be SENT, got %", r);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    out := as_string(got);
+    assert(starts_with(out, "HTTP/1.1 200 OK\r\n"), "status line, got '%'", out);
+    assert(contains(out, "Content-Type: text/plain\r\n"), "content type, got '%'", out);
+    assert(contains(out, "Content-Length: 5\r\n"), "content length, got '%'", out);
+    assert(!contains(out, "Connection:"), "HTTP/1.1 keep-alive must not spell out Connection, got '%'", out);
+    assert(!contains(out, "Date:"), "an empty date must omit the Date header");
+    assert(contains(out, "\r\n\r\nHello"), "body follows the blank line, got '%'", out);
+    print("  PASS: test_write_response_full_send\n");
+}
+
+test_write_response_partial_goes_pending_then_drains :: () {
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer { release_pending(c); free(c); }
+
+    body := big_body(262144);   // 256 KB, far past any SO_SNDBUF
+    defer free(body);
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 200, body = body };
+
+    r := write_response(c, *req, *resp, "");
+    assert(r == .PENDING, "256 KB into a 4 KB send buffer must go PENDING, got %", r);
+    assert(c.pending.count > 0 && c.pending.count < body.count + 256, "a tail should be queued, got % bytes", c.pending.count);
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while r == .PENDING {
+        drain_peer(peer, *got);
+        r = flush_pending(c);
+        rounds += 1;
+        assert(rounds < 100000, "flush never completed");
+    }
+    assert(r == .SENT, "flush should finish SENT, got %", r);
+    assert(c.pending.count == 0 && c.pending.data == null, "pending must be released after SENT");
+    drain_peer(peer, *got);
+
+    out := as_string(got);
+    header_end := index_of(out, "\r\n\r\n");
+    assert(header_end >= 0, "header terminator missing");
+    received_body := out.count - (header_end + 4);
+    assert(received_body == body.count, "peer must receive the whole body: % of %", received_body, body.count);
+    received: string;
+    received.data  = out.data + header_end + 4;
+    received.count = received_body;
+    assert(count_byte(received, #char "x") == body.count, "body bytes intact");   // body only: "text/plain" has an x
+    print("  PASS: test_write_response_partial_goes_pending_then_drains\n");
+}
+
+test_write_response_cap_exceeded :: () {
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+
+    body := big_body(2 * 1048576);   // 2 MB tail > MAX_PENDING_BYTES default of 1 MB
+    defer free(body);
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 200, body = body };
+
+    r := write_response(c, *req, *resp, "");
+    assert(r == .ERROR, "a tail past MAX_PENDING_BYTES must be an ERROR, got %", r);
+    assert(c.pending.count == 0, "nothing may be queued on ERROR, got %", c.pending.count);
+    print("  PASS: test_write_response_cap_exceeded\n");
+}
+
+test_flush_pending_peer_gone :: () {
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(server);
+    c := standalone_connection(server);
+    defer { release_pending(c); free(c); }
+
+    body := big_body(262144);
+    defer free(body);
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 200, body = body };
+    r := write_response(c, *req, *resp, "");
+    assert(r == .PENDING, "setup: expected PENDING, got %", r);
+
+    close(peer);   // the client leaves with a tail still queued; must not raise SIGPIPE
+    r = flush_pending(c);
+    assert(r == .ERROR, "flushing to a closed peer must be ERROR, got %", r);
+    print("  PASS: test_flush_pending_peer_gone\n");
+}
+
+test_write_response_head_sends_no_body :: () {
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+
+    req  := Request.{ method = "HEAD", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 200, body = "Hello" };
+    r := write_response(c, *req, *resp, "");
+    assert(r == .SENT, "HEAD response should be SENT, got %", r);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    out := as_string(got);
+    assert(contains(out, "Content-Length: 5\r\n"), "HEAD keeps the GET length, got '%'", out);
+    assert(out.count == index_of(out, "\r\n\r\n") + 4, "HEAD must send nothing after the headers, got '%'", out);
+    print("  PASS: test_write_response_head_sends_no_body\n");
+}
+
+test_write_response_204_is_bodiless :: () {
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 204, body = "ignored" };
+    r := write_response(c, *req, *resp, "");
+    assert(r == .SENT, "204 should be SENT, got %", r);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    out := as_string(got);
+    assert(starts_with(out, "HTTP/1.1 204 No Content\r\n"), "status line, got '%'", out);
+    assert(!contains(out, "Content-Length"), "204 must not carry Content-Length, got '%'", out);
+    assert(!contains(out, "Content-Type"), "204 must not carry Content-Type, got '%'", out);
+    assert(out.count == index_of(out, "\r\n\r\n") + 4, "204 must send no body, got '%'", out);
+    print("  PASS: test_write_response_204_is_bodiless\n");
+}
+
+test_write_response_connection_header_rules :: () {
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+    got: [..] u8;
+    defer array_free(got);
+
+    // Closing: spelled out whatever the version.
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = false };
+    resp := Response.{ status_code = 200, body = "x" };
+    write_response(c, *req, *resp, "");
+    drain_peer(peer, *got);
+    assert(contains(as_string(got), "Connection: close\r\n"), "close must be explicit, got '%'", as_string(got));
+
+    // HTTP/1.0 keep-alive: the only keep-alive case that is spelled out.
+    got.count = 0;
+    req = Request.{ method = "GET", http_version = "HTTP/1.0", keep_alive = true };
+    write_response(c, *req, *resp, "");
+    drain_peer(peer, *got);
+    assert(contains(as_string(got), "Connection: keep-alive\r\n"), "HTTP/1.0 keep-alive must be explicit, got '%'", as_string(got));
+    print("  PASS: test_write_response_connection_header_rules\n");
+}
+
+test_write_response_date_header :: () {
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+
+    req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 200, body = "x" };
+    write_response(c, *req, *resp, "Sun, 06 Nov 1994 08:49:37 GMT");
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(contains(as_string(got), "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n"), "Date header verbatim, got '%'", as_string(got));
+    print("  PASS: test_write_response_date_header\n");
+}
+
+test_canned_responses :: () {
+    assert(starts_with(canned_response(400), "HTTP/1.1 400 Bad Request\r\n"), "400");
+    assert(starts_with(canned_response(408), "HTTP/1.1 408 Request Timeout\r\n"), "408");
+    assert(starts_with(canned_response(413), "HTTP/1.1 413 Payload Too Large\r\n"), "413");
+    assert(starts_with(canned_response(431), "HTTP/1.1 431 Request Header Fields Too Large\r\n"), "431");
+    assert(contains(canned_response(431), "Connection: close\r\n\r\n"), "canned replies close");
+
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    send_canned(server, 413);
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(string_equals(as_string(got), canned_response(413)), "send_canned writes the reply verbatim");
+    print("  PASS: test_canned_responses\n");
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -759,6 +1065,17 @@ main :: () {
 
     print("\nSend-path state:\n");
     test_pending_defaults_and_release();
+
+    print("\nWriter:\n");
+    test_write_response_full_send();
+    test_write_response_partial_goes_pending_then_drains();
+    test_write_response_cap_exceeded();
+    test_flush_pending_peer_gone();
+    test_write_response_head_sends_no_body();
+    test_write_response_204_is_bodiless();
+    test_write_response_connection_header_rules();
+    test_write_response_date_header();
+    test_canned_responses();
 
     print("\nEvent engine:\n");
     test_encode_decode_connection_ptr();
@@ -832,3 +1149,5 @@ main :: () {
 
 #import "Basic";
 #import "http_server";
+#import "Socket";
+#import "POSIX";

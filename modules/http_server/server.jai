@@ -291,7 +291,7 @@ handle_client :: (w: *Worker, c: *Connection, events: u32) {
                         // Send the response while the per-request Pool is the context allocator,
                         // so write_response's header formatting (sprint/String_Builder) allocates
                         // from the Pool too — not temporary storage.
-                        write_response(c.fd, *response, c.req.keep_alive);
+                        write_response(c, *c.req, *response, "");
                     }
                     Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
 

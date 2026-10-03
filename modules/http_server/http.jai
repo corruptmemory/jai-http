@@ -185,46 +185,131 @@ reset_for_next_request :: (c: *Connection) {
     c.req.content_length = 0;
 }
 
-// Serialize and write a response to the fd.
-// Uses writev() to send headers + body in a single syscall so TCP_NODELAY does not split them
-// into two packets. The header is formatted from context.allocator — which the worker sets to the
-// per-request Pool (reset after this call, blocks recycled). It must NOT use temporary storage:
-// write_response originally used `tprint`, which is hardwired to temp storage (it ignores
-// context.allocator); under batch load the default 16 KB temp overflowed into repeated heap page
-// allocations (~45% of CPU at high concurrency). `sprint` / `String_Builder` allocate from
-// context.allocator, so routing through the per-request Pool keeps response building churn-free.
-write_response :: (fd: s32, response: *Response, keep_alive: bool) {
-    conn_str := ifx keep_alive then "keep-alive" else "close";
+Write_Result :: enum u8 #specified {
+    SENT    :: 0;   // every byte reached the kernel
+    PENDING :: 1;   // a tail is queued in c.pending; wait for EPOLLOUT
+    ERROR   :: 2;   // the peer is gone or MAX_PENDING_BYTES was exceeded; the caller closes
+}
 
-    header: string;
-    if response.header_count == 0 {
-        // Fast path: no custom headers.
-        header = Basic.sprint("HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n\r\n",
-            response.status_code, status_text(response.status_code),
-            response.content_type, response.body.count, conn_str);
-    } else {
-        // Slow path: custom headers.
-        builder: Basic.String_Builder;
-        builder.allocator = context.allocator;
-        Basic.print_to_builder(*builder, "HTTP/1.1 % %\r\nContent-Type: %\r\nContent-Length: %\r\nConnection: %\r\n",
-            response.status_code, status_text(response.status_code),
-            response.content_type, response.body.count, conn_str);
-        for i: 0..cast(s64) response.header_count - 1 {
-            Basic.print_to_builder(*builder, "%: %\r\n", response.headers[i].name, response.headers[i].value);
-        }
-        Basic.append(*builder, "\r\n");
-        header = Basic.builder_to_string(*builder,, allocator = context.allocator);
+// 1xx, 204 and 304 carry neither a body nor the body-describing headers (RFC 9110 §6.4.1, §8.6).
+status_has_body :: inline (code: u16) -> bool {
+    return code >= 200 && code != 204 && code != 304;
+}
+
+// Serialize the status line and headers from context.allocator, which the worker sets to the
+// per-request Pool (reset after the write, blocks recycled). It must NOT use temporary storage:
+// the original writer used `tprint`, which is hardwired to temp storage; under batch load the
+// default 16 KB temp overflowed into repeated heap page allocations (~45% of CPU at high
+// concurrency). `body_count` is what Content-Length reports; for HEAD that is the GET body's
+// length even though no body is sent. An empty `date` omits the Date header.
+build_response_header :: (req: *Request, response: *Response, date: string, body_count: s64) -> string {
+    builder: Basic.String_Builder;
+    builder.allocator = context.allocator;
+    Basic.print_to_builder(*builder, "HTTP/1.1 % %\r\n", response.status_code, status_text(response.status_code));
+    if date.count > 0  Basic.print_to_builder(*builder, "Date: %\r\n", date);
+    if status_has_body(response.status_code) {
+        Basic.print_to_builder(*builder, "Content-Type: %\r\nContent-Length: %\r\n", response.content_type, body_count);
     }
+    // HTTP/1.1 keeps alive by default, so only the exceptions are spelled out.
+    if !req.keep_alive {
+        Basic.append(*builder, "Connection: close\r\n");
+    } else if string_equals(req.http_version, "HTTP/1.0") {
+        Basic.append(*builder, "Connection: keep-alive\r\n");
+    }
+    for i: 0..cast(s64) response.header_count - 1 {
+        Basic.print_to_builder(*builder, "%: %\r\n", response.headers[i].name, response.headers[i].value);
+    }
+    Basic.append(*builder, "\r\n");
+    return Basic.builder_to_string(*builder,, allocator = context.allocator);
+}
 
-    if response.body.count > 0 {
-        iov: [2] iovec;
-        iov[0].iov_base = cast(*void) header.data;
-        iov[0].iov_len  = xx header.count;
-        iov[1].iov_base = cast(*void) response.body.data;
-        iov[1].iov_len  = xx response.body.count;
-        writev(fd, iov.data, 2);
-    } else {
-        send_all(fd, header.data, header.count);
+// Serialize and write a response: one sendmsg of [header, body], so TCP_NODELAY never splits
+// them into two packets, and MSG_NOSIGNAL so a client that reset the connection yields EPIPE
+// instead of killing the process. What the kernel does not take is copied into c.pending (heap)
+// before the caller resets the per-request Pool backing header and body. HEAD and bodiless
+// statuses send the header only.
+write_response :: (c: *Connection, req: *Request, response: *Response, date: string) -> Write_Result {
+    is_head   := string_equals(req.method, "HEAD");
+    send_body := response.body.count > 0 && !is_head && status_has_body(response.status_code);
+    header := build_response_header(req, response, date, response.body.count);
+    body: string;
+    if send_body  body = response.body;
+
+    iov: [2] iovec;
+    iov[0].iov_base = cast(*void) header.data;
+    iov[0].iov_len  = xx header.count;
+    iov[1].iov_base = cast(*void) body.data;
+    iov[1].iov_len  = xx body.count;
+    msg: msghdr;
+    msg.msg_iov    = iov.data;
+    msg.msg_iovlen = ifx body.count > 0 then cast(u64) 2 else cast(u64) 1;
+
+    total := header.count + body.count;
+    sent: s64 = 0;
+    while true {
+        n := sendmsg(c.fd, *msg, .NOSIGNAL);
+        if n >= 0 { sent = n; break; }
+        err := errno();
+        if err == EINTR  continue;
+        if err == EAGAIN || err == EWOULDBLOCK  break;        // sent stays 0: queue everything
+        if err == EPIPE  || err == ECONNRESET   return .ERROR; // the client left; not our failure
+        Basic.log_error("sendmsg failed on fd %: errno %", c.fd, err);
+        return .ERROR;
+    }
+    if sent == total  return .SENT;
+
+    // Slow path: the socket is full. Header and body live in per-request memory, so the unsent
+    // tail is copied into c.pending now, before the worker resets the Pool.
+    unsent := total - sent;
+    if unsent > MAX_PENDING_BYTES {
+        Basic.log("fd %: unsent response tail of % bytes exceeds MAX_PENDING_BYTES (%); closing", c.fd, unsent, MAX_PENDING_BYTES);
+        return .ERROR;
+    }
+    header_sent := ifx sent < header.count then sent else header.count;
+    body_sent   := sent - header_sent;
+    append_bytes(*c.pending, header.data + header_sent, header.count - header_sent);
+    append_bytes(*c.pending, body.data   + body_sent,   body.count   - body_sent);
+    return .PENDING;
+}
+
+// Push the queued tail toward the kernel. SENT frees the buffer.
+flush_pending :: (c: *Connection) -> Write_Result {
+    while c.pending_offset < c.pending.count {
+        remaining := c.pending.count - c.pending_offset;
+        n := send(c.fd, c.pending.data + c.pending_offset, xx remaining, .NOSIGNAL);
+        if n > 0 { c.pending_offset += n; continue; }
+        if n == 0 {
+            Basic.log_error("send returned 0 on fd % with % bytes pending", c.fd, remaining);
+            return .ERROR;
+        }
+        err := errno();
+        if err == EINTR  continue;
+        if err == EAGAIN || err == EWOULDBLOCK  return .PENDING;
+        if err == EPIPE  || err == ECONNRESET   return .ERROR;
+        Basic.log_error("send failed on fd %: errno %", c.fd, err);
+        return .ERROR;
+    }
+    release_pending(c);
+    return .SENT;
+}
+
+// Static replies for requests the server refuses before a handler runs. Connection: close always.
+canned_response :: (status: u16) -> string {
+    if status == {
+        case 400; return "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        case 408; return "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        case 413; return "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        case 431; return "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        case;     return "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    }
+}
+
+// One attempt, never queued: the connection is closing either way and the reply is tiny.
+send_canned :: (fd: s32, status: u16) {
+    s := canned_response(status);
+    while true {
+        n := send(fd, s.data, xx s.count, .NOSIGNAL);
+        if n >= 0 || errno() != EINTR  break;
     }
 }
 
@@ -244,11 +329,13 @@ status_text :: (code: u16) -> string {
         case 403; return "Forbidden";
         case 404; return "Not Found";
         case 405; return "Method Not Allowed";
+        case 408; return "Request Timeout";
         case 409; return "Conflict";
         case 413; return "Payload Too Large";
         case 415; return "Unsupported Media Type";
         case 422; return "Unprocessable Entity";
         case 429; return "Too Many Requests";
+        case 431; return "Request Header Fields Too Large";
         case 500; return "Internal Server Error";
         case 502; return "Bad Gateway";
         case 503; return "Service Unavailable";
@@ -335,20 +422,5 @@ determine_keep_alive :: (req: *Request) {
             }
             break;
         }
-    }
-}
-
-send_all :: (fd: s32, data: *u8, count: s64) {
-    remaining := count;
-    offset: s64 = 0;
-    while remaining > 0 {
-        bytes_sent := write(fd, data + offset, xx remaining);
-        if bytes_sent < 0 {
-            err := errno();
-            if err == EINTR continue;
-            break;
-        }
-        remaining -= bytes_sent;
-        offset += bytes_sent;
     }
 }

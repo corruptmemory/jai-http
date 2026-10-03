@@ -358,7 +358,7 @@ git commit -m "http_server: pending-output state, timeout stamps, new module par
   - `canned_response :: (status: u16) -> string`, `send_canned :: (fd: s32, status: u16)`
 - Removes: `send_all`, the old `write_response(fd, response, keep_alive)`.
 
-- [ ] **Step 1: Add the socket test helpers**
+- [x] **Step 1: Add the socket test helpers**
 
 Append to the test file (before the tests, after the existing helpers section near the top is fine):
 
@@ -450,7 +450,7 @@ big_body :: (count: s64) -> string {
 
 Add `#import "Socket";` and `#import "POSIX";` at the bottom of the test file next to the existing imports.
 
-- [ ] **Step 2: Write the failing writer tests**
+- [x] **Step 2: Write the failing writer tests**
 
 ```jai
 // -- Writer (Task 3) --
@@ -675,12 +675,12 @@ Register in `main` after the send-path state group:
     test_canned_responses();
 ```
 
-- [ ] **Step 3: Run to verify it fails**
+- [x] **Step 3: Run to verify it fails**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: compile error, `write_response` called with the wrong argument count (the old signature is `(fd, response, keep_alive)`).
 
-- [ ] **Step 4: Replace the writer in `http.jai`**
+- [x] **Step 4: Replace the writer in `http.jai`**
 
 Delete the old `write_response` and `send_all`. Add, in the public section (above `#scope_module`):
 
@@ -825,12 +825,12 @@ Extend `status_text` with two cases, in numeric order:
 
 (the result is ignored until Task 4 rewires the loop).
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: all nine new writer tests `PASS`, all other suites green. If `test_flush_pending_peer_gone` kills the process with `SIGPIPE`, a `send` call lost its `.NOSIGNAL` flag.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add modules/http_server/http.jai modules/http_server/server.jai modules/http_server/tests/test.jai
