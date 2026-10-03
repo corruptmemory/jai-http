@@ -2301,37 +2301,45 @@ test_drain_deadline :: () {
     print("  PASS: test_drain_deadline\n");
 }
 
-// Defaults asserted as literals: MIN_SEND_RATE 16384, WRITE_TIMEOUT_MS 30000.
-test_start_write_clock_sets_the_deadline :: () {
+// A stack Connection has fd -1, so the kernel part of owed_bytes is 0 and owed is the tail alone.
+test_start_write_clock_records_owed :: () {
     c: Connection;
     c.pending.count = 32768;   // synthetic tail
     start_write_clock(*c, 5000);
-    assert(c.last_write_ms == 5000, "the WRITE clock starts now, got %", c.last_write_ms);
-    assert(c.write_deadline_ms == 5000 + 30000 + 2000, "32 KB at 16 KB/s after a 30 s grace, got %", c.write_deadline_ms);
+    assert(c.last_write_ms == 5000 && c.write_start_ms == 5000, "both clocks start now, got % / %", c.last_write_ms, c.write_start_ms);
+    assert(c.owed_at_start == 32768 && c.owed == 32768, "owed is the tail plus the kernel's share, got % / %", c.owed_at_start, c.owed);
     c.pending.count = 0;
-    print("  PASS: test_start_write_clock_sets_the_deadline\n");
+    print("  PASS: test_start_write_clock_records_owed\n");
 }
 
+// Defaults asserted as literals: MIN_SEND_RATE 16384, WRITE_TIMEOUT_MS 30000.
 test_rate_floor_catches_a_steady_trickle :: () {
     c: Connection;
-    c.pending.count     = 1;       // synthetic tail; the deadline is set directly
-    c.write_deadline_ms = 94000;
-    c.last_write_ms     = 93000;   // progress a second ago: not a stall
-    t, s := is_timed_out(*c, 93999);
-    assert(!t && s == .WRITE, "before its deadline a progressing tail is fine");
-    c.last_write_ms = 93500;
-    t, s = is_timed_out(*c, 94000);
-    assert(t && s == .WRITE, "a tail that keeps trickling still times out at its deadline");
-    c.write_deadline_ms = 0;       // no floor: only a stall counts
-    c.last_write_ms     = 199000;
-    t, s = is_timed_out(*c, 200000);
-    assert(!t, "without a deadline, steady progress never times out");
+    c.pending.count  = 1;          // synthetic tail; owed is set directly
+    c.write_start_ms = 1000;
+    c.owed_at_start  = 4000000;
+    // The peer took 60 s worth at the floor: the deadline is 1000 + 30000 + 60000.
+    c.owed          = 4000000 - 16384 * 60;
+    c.last_write_ms = 90000;       // recent progress: not a stall
+    t, s := is_timed_out(*c, 90999);
+    assert(!t && s == .WRITE, "before the floor's deadline a progressing tail is fine");
+    c.last_write_ms = 90500;
+    t, s = is_timed_out(*c, 91000);
+    assert(t && s == .WRITE, "a peer that keeps taking bytes below the floor is cut at the deadline");
+    // A peer exactly at the floor is never cut: its deadline stays the grace ahead of now.
+    c.owed          = 4000000 - 16384 * 200;   // 200 s at the floor
+    c.last_write_ms = 200500;
+    t, s = is_timed_out(*c, 201000);
+    assert(!t, "a peer at the floor is never cut (deadline % vs now 201000)", drain_deadline(1000, 16384 * 200, 30000, 16384));
+    c.write_start_ms = 0;          // no tail clock: only a stall counts
+    t, s = is_timed_out(*c, 230000);
+    assert(!t, "without a drain clock, recent progress never times out");
     c.pending.count = 0;
     print("  PASS: test_rate_floor_catches_a_steady_trickle\n");
 }
 
 // Review focus 5 (deadline half). A 400 queued behind a full socket is a tail like any other.
-test_canned_tail_gets_a_drain_deadline :: () {
+test_canned_tail_starts_the_drain_clock :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -2344,10 +2352,11 @@ test_canned_tail_gets_a_drain_deadline :: () {
     send_to_server(peer, "GARBAGE\r\n\r\n");
     handle_client(*w, c, EPOLLIN);
     assert(c.pending.count > 0 && c.close_after_send, "setup: the 400 is queued behind the full socket");
-    want := c.last_write_ms + 30000 + c.pending.count * 1000 / 16384;
-    assert(c.write_deadline_ms == want, "a queued canned reply gets a drain deadline: % vs %", c.write_deadline_ms, want);
+    assert(c.write_start_ms == c.last_write_ms && c.write_start_ms > 0, "a queued canned reply starts the drain clock");
+    assert(c.owed_at_start >= c.pending.count && c.owed == c.owed_at_start, "owed covers the tail and the kernel's share: % / % for a % byte tail",
+        c.owed_at_start, c.owed, c.pending.count);
     close_connection(*w, c);
-    print("  PASS: test_canned_tail_gets_a_drain_deadline\n");
+    print("  PASS: test_canned_tail_starts_the_drain_clock\n");
 }
 
 test_check_timeouts_closes_a_slow_drain :: () {
@@ -2363,20 +2372,64 @@ test_check_timeouts_closes_a_slow_drain :: () {
     send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     handle_client(*w, c, EPOLLIN);
     assert(c.pending.count > 0, "setup: the response stalls");
-    want := c.last_write_ms + 30000 + c.pending.count * 1000 / 16384;
-    assert(c.write_deadline_ms == want, "the dispatch path starts the drain clock: % vs %", c.write_deadline_ms, want);
+    assert(c.write_start_ms == c.last_write_ms && c.owed_at_start >= c.pending.count, "the dispatch path starts the drain clock");
 
     rec: Error_Recorder;
     ctx := context;
     ctx.logger      = record_errors;
     ctx.logger_data = *rec;
-    now := c.write_deadline_ms;
-    c.last_write_ms = now - 1000;   // progress a second ago: not a stall
+    now := c.write_start_ms + 30000;   // the grace is over and the peer has taken nothing
+    c.last_write_ms = now - 1000;      // progress a second ago: not a stall
     closed: s32;
     push_context ctx { closed = check_timeouts(*w, now); }
     assert(closed == 1 && c.state == .FREE, "a tail past its drain deadline is closed; closed=% state=%", closed, c.state);
     assert(rec.errors == 0, "a slow client is the client's doing: info, not an error (got % errors)", rec.errors);
     print("  PASS: test_check_timeouts_closes_a_slow_drain\n");
+}
+
+// The kernel's count of bytes the peer has not taken yet (TIOCOUTQ: unsent plus unacknowledged on TCP).
+kernel_outq :: (fd: s32) -> s64 {
+    n: s32;
+    if ioctl(fd, TIOCOUTQ, *n) != 0  return -1;
+    return n;
+}
+
+// I1 (final review). With a large kernel send buffer, EPOLLOUT comes only after about a third of it
+// has drained, so a reader can take bytes for a long time while our tail never moves. Bytes leaving
+// the kernel toward the peer are progress: the stall check must not cut such a reader.
+test_kernel_drain_counts_as_progress :: () {
+    big_test_body = big_body(524288);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, client := make_tcp_pair(server_sndbuf = 65536, client_rcvbuf = 65536);
+    defer close(client);
+    c := attach(*w, server);
+
+    send_to_server(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response stalls");
+    t0 := c.last_write_ms;
+
+    // The client reads; handle_client(EPOLLOUT) is deliberately not called, as if no edge had come.
+    outq_before := kernel_outq(server);
+    assert(outq_before > 0, "setup: the kernel holds response bytes (TIOCOUTQ %)", outq_before);
+    got: [..] u8;
+    defer array_free(got);
+    spins := 0;
+    while kernel_outq(server) >= outq_before {
+        got.count = 0;
+        client_read(client, *got);
+        spins += 1;
+        assert(spins < 10000000, "setup: the kernel never reported the client's reads");
+    }
+
+    closed := check_timeouts(*w, t0 + 30000);
+    assert(closed == 0 && c.state == .ACTIVE, "a peer taking bytes is progress, flushed or not; closed=% state=%", closed, c.state);
+    assert(c.last_write_ms == t0 + 30000, "the observed drain restarts the WRITE clock, got %", c.last_write_ms);
+    close_connection(*w, c);
+    print("  PASS: test_kernel_drain_counts_as_progress\n");
 }
 
 // Defaults asserted as literals: HEADER_TIMEOUT_MS 10000.
@@ -2393,6 +2446,16 @@ test_new_connection_state :: () {
     t, s = is_timed_out(*c, 5000 + 10000);
     assert(t && s == .HEADER, "once bytes arrive it is a HEADER wait, still timed from accept");
     print("  PASS: test_new_connection_state\n");
+}
+
+// M1 (final review, re-graded Important). With HEADER_TIMEOUT_MS = 0 a NEW connection had no limit
+// and a silent socket held its slot forever; before the NEW state it was IDLE and reaped at 60 s.
+// The limits are compile-time parameters, so the rule is a pure helper.
+test_new_connection_limit_falls_back_to_idle :: () {
+    assert(new_connection_limit(10000, 60000) == 10000, "the header limit applies from accept");
+    assert(new_connection_limit(0, 60000) == 60000, "header timeouts off: a silent connection is still reaped as idle");
+    assert(new_connection_limit(0, 0) == 0, "both off: no limit, as configured");
+    print("  PASS: test_new_connection_limit_falls_back_to_idle\n");
 }
 
 test_new_connection_closed_silently :: () {
@@ -2853,11 +2916,13 @@ main :: () {
     test_check_timeouts_skips_free_slots_and_listener();
     test_reads_do_not_extend_write_timeout();
     test_drain_deadline();
-    test_start_write_clock_sets_the_deadline();
+    test_start_write_clock_records_owed();
     test_rate_floor_catches_a_steady_trickle();
-    test_canned_tail_gets_a_drain_deadline();
+    test_canned_tail_starts_the_drain_clock();
     test_check_timeouts_closes_a_slow_drain();
+    test_kernel_drain_counts_as_progress();
     test_new_connection_state();
+    test_new_connection_limit_falls_back_to_idle();
     test_new_connection_closed_silently();
     print("\nPending budget:\n");
     test_tail_refusal();

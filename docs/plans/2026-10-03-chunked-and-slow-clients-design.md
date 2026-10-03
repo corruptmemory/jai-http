@@ -157,32 +157,44 @@ what the client sent; no `Content-Length` header is made up.
 
 A new parameter, `MIN_SEND_RATE`, in bytes per second: 16384 by default; 0 means no floor.
 
-When a tail is queued (the two call sites where a write returns PENDING: `dispatch_buffered`
-and `refuse_and_close`), one helper, `start_write_clock(c, now)`, sets:
-- `last_write_ms = now`, as today;
-- `write_deadline_ms = drain_deadline(now, c.pending.count, WRITE_TIMEOUT_MS, MIN_SEND_RATE)`.
+**Amended after the final review (finding I1).** The first version measured progress as our own
+flushes and gave each tail a fixed deadline, `grace + tail / rate`. Verification showed the flaw: a
+flush happens only at an edge-triggered EPOLLOUT, which on a full socket comes only after about a
+third of the kernel's send buffer has drained, and on loopback that buffer is 2.4-2.8 MB. A reader
+could take bytes for tens of seconds while our tail never moved, so the 30 s stall check cut readers
+below about 26-44 KB/s, and the fixed deadline would still have cut readers between 16 and about
+26 KB/s. Both checks now count the bytes the peer actually takes.
 
-`drain_deadline(now, bytes, grace_ms, rate)` returns 0 (no deadline) when `rate <= 0`, and
-otherwise `now + grace_ms + bytes * 1000 / rate`. It takes its parameters instead of reading the
-module constants, so tests can drive any value. An `#assert` guards the multiplication against
-a `MAX_PENDING_BYTES` large enough to overflow it.
-
-In the WRITE state a connection times out when either:
-- it has made no progress for `WRITE_TIMEOUT_MS` (unchanged: catches dead peers quickly), or
-- `write_deadline_ms` is set and has passed (new: catches peers that make progress too slowly).
-
-Either way the connection closes without a reply, since a response is already in flight, and a
-`log` line says which limit fired. `get_connection` and `release_pending` clear
-`write_deadline_ms`, so a deadline never outlives its tail.
-
+- **Owed bytes.** `owed_bytes(c)` is what is left of our tail plus what the kernel still holds for
+  the peer (`TIOCOUTQ`: unsent and unacknowledged bytes on TCP). A flush moves bytes from the tail
+  into the kernel without changing it; only the peer taking bytes lowers it. If the query fails, the
+  kernel part counts as 0 and progress falls back to our flushes.
+- **Starting the clock.** When a tail is queued (the two call sites where a write returns PENDING:
+  `dispatch_buffered` and `refuse_and_close`), `start_write_clock(c, now)` records `last_write_ms`,
+  `write_start_ms` and `owed_at_start`.
+- **Observing.** Before judging a WRITE connection, the sweep calls `observe_drain`: when owed has
+  dropped since the last look, that is progress and `last_write_ms` moves to now.
+- **The stall check** is unchanged in form: no progress for `WRITE_TIMEOUT_MS`.
+- **The rate floor.** `drain_deadline(write_start_ms, taken, WRITE_TIMEOUT_MS, MIN_SEND_RATE)`, with
+  `taken = owed_at_start - owed`, is the moment the bytes taken so far stop honoring the floor. The
+  connection is cut once now passes it. The deadline moves forward with every byte the peer takes,
+  so a reader at or above `MIN_SEND_RATE` is never cut, and a peer that takes nothing is cut when
+  the grace ends.
+- Either way the connection closes without a reply, since a response is already in flight, and a
+  `log` line says which limit fired. `get_connection` and `release_pending` clear the clock, so it
+  never outlives its tail.
 - **One tail at a time.** Dispatch pauses while output is pending, and canned replies queue only
-  behind an empty tail, so a deadline is set once and never extended.
-- **The arithmetic.** With the defaults, a 1 MB tail must drain within 30 + 64 = 94 s, and a
-  64 KB tail within 34 s.
-- **What the floor covers.** Only the bytes this process holds. Bytes already in the kernel's
-  send buffer are bounded by the kernel (`tcp_wmem`).
-- **Behind Caddy.** Caddy's reverse proxy streams responses by default rather than buffering
-  them, so the pace the floor measures is the end user's.
+  behind an empty tail.
+- **Cost.** One `ioctl` per queued tail and one per WRITE connection per sweep.
+- **A limit TCP sets.** A peer is visible only through its ACKs. A client with a small receive
+  buffer that reads slowly can leave our socket in zero-window persist mode, whose probe interval
+  backs off past 30 s, so neither check can see its reads in between. Measured on loopback with the
+  defaults and a 2.9 MB response: 8 KB/s readers (below the floor) showed 30 s silences and were
+  cut; 17 KB/s readers with a 128 KB or an autotuned receive buffer completed, the longest silence
+  15 s; a 20 KB/s reader completed in 145 s, where the flush-only version cut it at 30 s.
+- **What the floor measures.** The peer's pace while a tail exists, including bytes the kernel
+  already held. Behind Caddy that is Caddy's pace, which the end user's pace bounds only once the
+  buffering in between has filled.
 
 ### 4.2 Per-worker pending budget
 
@@ -275,7 +287,9 @@ chunk_phase:       Chunk_Phase;
 chunk_remaining:   s64;                // bytes of the current chunk not yet arrived
 body_start:        s64;                // decoded chunked body: buf[body_start .. body_end)
 body_end:          s64;
-write_deadline_ms: s64;                // a queued tail must have drained by then; 0: no deadline
+write_start_ms:    s64;                // when the queued tail started; 0: no tail
+owed_at_start:     s64;                // owed_bytes (tail + TIOCOUTQ) when it started (amended, I1)
+owed:              s64;                // owed_bytes at the last sweep; a drop is progress
 
 // connection.jai: Connection_Pool
 pending_total:           s64;          // bytes reserved by every queued tail in this pool

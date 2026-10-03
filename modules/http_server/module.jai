@@ -32,11 +32,14 @@
     IDLE_TIMEOUT_MS     : s64 = 60000,    // kept-alive connection between requests
     HEADER_TIMEOUT_MS   : s64 = 10000,    // from a request's first byte until its headers are complete
     BODY_TIMEOUT_MS     : s64 = 30000,    // from a request's first byte until its body is complete
-    WRITE_TIMEOUT_MS    : s64 = 30000,    // a pending response making no progress toward the peer
-    // Minimum average rate, in bytes per second, at which a queued response tail must drain once
-    // the WRITE_TIMEOUT_MS grace has passed: a tail of N bytes must be gone within
-    // WRITE_TIMEOUT_MS + N / MIN_SEND_RATE. The WRITE timeout alone only catches a stall; this
-    // bounds how long a reader that trickles may hold its tail. 0: no floor.
+    // A queued response making no progress toward the peer: neither our tail nor the bytes the
+    // kernel holds for the peer (TIOCOUTQ) shrank. Also the grace before MIN_SEND_RATE applies, so
+    // 0 here makes the floor apply from the first sweep.
+    WRITE_TIMEOUT_MS    : s64 = 30000,
+    // Minimum average rate, in bytes per second, at which the peer must take a queued response
+    // once the WRITE_TIMEOUT_MS grace has passed, counted from when the tail was queued and
+    // including the bytes the kernel already held. A reader at or above it is never cut; one below
+    // it frees its slot and tail. The WRITE timeout alone only catches a stall. 0: no floor.
     MIN_SEND_RATE       : s64 = 16384,
     // Lingering close: after a final response the server half-closes and discards input until the
     // peer's EOF, for at most this long, so a close never turns into a reset that destroys the

@@ -181,26 +181,61 @@ timeout_state :: (c: *Connection) -> Timeout_State {
     return .HEADER;
 }
 
-// drain_deadline multiplies a tail's size by 1000, and arithmetic overflow is FATAL in every build.
+// drain_deadline multiplies the bytes a peer has taken (at most a tail plus the kernel's send
+// buffer) by 1000, and arithmetic overflow is FATAL in every build.
 #assert MAX_PENDING_BYTES <= 9000000000000 "MAX_PENDING_BYTES is too large for drain_deadline's arithmetic";
 
-// When a tail of `bytes` queued at `now` must have drained to honor a minimum average rate after a
-// grace period: now + grace_ms + bytes / rate (rate in bytes per second). 0 when rate <= 0: no
-// floor. Takes its limits as arguments so tests can drive any value.
-drain_deadline :: (now: s64, bytes: s64, grace_ms: s64, rate: s64) -> s64 {
+// When `bytes` taken by the peer since `start` stop honoring a minimum average rate after a grace
+// period: start + grace_ms + bytes / rate (rate in bytes per second). The deadline moves forward with
+// every byte the peer takes. 0 when rate <= 0: no floor. Takes its limits as arguments so tests can
+// drive any value.
+drain_deadline :: (start: s64, bytes: s64, grace_ms: s64, rate: s64) -> s64 {
     if rate <= 0  return 0;
-    return now + grace_ms + bytes * 1000 / rate;
+    return start + grace_ms + bytes * 1000 / rate;
+}
+
+// Bytes still owed to the peer: what is left of our tail plus what the kernel holds for it (TIOCOUTQ:
+// unsent and unacknowledged bytes on TCP). A flush moves bytes from the tail into the kernel without
+// changing this; only the peer taking bytes lowers it. If the query fails, the kernel part counts as
+// 0 and progress falls back to our own flushes.
+owed_bytes :: (c: *Connection) -> s64 {
+    kernel: s32;
+    if ioctl(c.fd, TIOCOUTQ, *kernel) != 0  kernel = 0;
+    return (c.pending.count - c.pending_offset) + kernel;
 }
 
 // A response tail was just queued: start the clocks the WRITE timeout and the rate floor read.
 start_write_clock :: (c: *Connection, now: s64) {
-    c.last_write_ms     = now;
-    c.write_deadline_ms = drain_deadline(now, c.pending.count, WRITE_TIMEOUT_MS, MIN_SEND_RATE);
+    c.last_write_ms  = now;
+    c.write_start_ms = now;
+    c.owed_at_start  = owed_bytes(c);
+    c.owed           = c.owed_at_start;
 }
 
-// The queued tail has missed its drain deadline, however steadily it has been moving.
+// The sweep's look at a connection with a queued tail. Bytes leaving the kernel toward the peer are
+// progress even when no EPOLLOUT edge has let us flush: with a multi-megabyte send buffer that edge
+// comes only after about a third of the buffer has drained, tens of seconds for a slow reader.
+observe_drain :: (c: *Connection, now: s64) {
+    o := owed_bytes(c);
+    if o < c.owed  c.last_write_ms = now;
+    c.owed = o;
+}
+
+// The rate floor: once the WRITE_TIMEOUT_MS grace has passed, the peer must have taken at least
+// MIN_SEND_RATE bytes per second, on average, since the tail started. Counted in bytes the peer took
+// (including those the kernel already held), so a reader at or above the floor is never cut.
 write_too_slow :: inline (c: *Connection, now: s64) -> bool {
-    return c.write_deadline_ms > 0 && now >= c.write_deadline_ms;
+    if MIN_SEND_RATE <= 0 || c.write_start_ms == 0  return false;
+    taken := c.owed_at_start - c.owed;
+    if taken < 0  taken = 0;
+    return now >= drain_deadline(c.write_start_ms, taken, WRITE_TIMEOUT_MS, MIN_SEND_RATE);
+}
+
+// The NEW limit: HEADER_TIMEOUT_MS from accept, or IDLE_TIMEOUT_MS when header timeouts are off, so
+// a silent connection is never held forever (it was IDLE before the NEW state existed). 0 only when
+// both are off.
+new_connection_limit :: (header_ms: s64, idle_ms: s64) -> s64 {
+    return ifx header_ms > 0 then header_ms else idle_ms;
 }
 
 is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_State) {
@@ -215,7 +250,7 @@ is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_S
     since: s64 = 0;
     if state == {
         case .IDLE;   limit = IDLE_TIMEOUT_MS;   since = c.last_activity_ms;
-        case .NEW;    limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;   // from accept
+        case .NEW;    limit = new_connection_limit(HEADER_TIMEOUT_MS, IDLE_TIMEOUT_MS); since = c.request_start_ms;   // from accept
         case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
         case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
         case .LINGER; limit = LINGER_TIMEOUT_MS; since = c.last_activity_ms;   // set on entering linger
@@ -233,6 +268,7 @@ check_timeouts :: (w: *Worker, now: s64) -> s32 {
     for * w.pool.connections {
         c := it;
         if c.state != .ACTIVE || c == w.listen_conn  continue;
+        if timeout_state(c) == .WRITE  observe_drain(c, now);   // before judging: the peer may have taken bytes
         timed_out, state := is_timed_out(c, now);
         if !timed_out  continue;
         if state == .HEADER || state == .BODY {
