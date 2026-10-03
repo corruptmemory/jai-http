@@ -2092,7 +2092,7 @@ git commit -m "http_server: per-worker cached Date header, overlap-safe pipeline
 - Create: `examples/large_body.jai`
 - Modify: `CLAUDE.md` (Project Overview status line, http_server module bullets, Key Patterns, Remaining Library Gaps)
 
-- [ ] **Step 1: Add the example**
+- [x] **Step 1: Add the example**
 
 ```jai
 // A 1 MB response body on every request, for exercising the pending-output path against a real
@@ -2137,7 +2137,7 @@ main :: () {
 #import "Basic";
 ```
 
-- [ ] **Step 2: Build everything and run every suite, debug and release**
+- [x] **Step 2: Build everything and run every suite, debug and release**
 
 ```bash
 ~/jai/jai/bin/jai-linux first.jai -
@@ -2146,7 +2146,7 @@ main :: () {
 ```
 Expected: five examples in `build_debug/`; every suite prints `All tests passed.` in both modes.
 
-- [ ] **Step 3: Manual protocol checks against `hello_world`**
+- [x] **Step 3: Manual protocol checks against `hello_world`**
 
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - hello_world && ./build_debug/hello_world & sleep 1
@@ -2161,7 +2161,7 @@ kill %1
 ```
 Expected, in order: `HTTP/1.1 200 OK` with `Content-Length: 13` and nothing after the headers; `HTTP/1.1 405` and `Allow: GET, HEAD`; `Connection: close`; `Connection: keep-alive`; `0`; `HTTP/1.1 431`; `HTTP/1.1 400`.
 
-- [ ] **Step 4: Slow client against the 1 MB body**
+- [x] **Step 4: Slow client against the 1 MB body**
 
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - large_body && ./build_debug/large_body & sleep 1
@@ -2171,7 +2171,7 @@ kill %1
 ```
 Expected: `downloaded=1048576 http=200` twice, around 5 s each. Before this plan the first number was short and the server logged nothing. Also confirm the server printed no `log_error` lines.
 
-- [ ] **Step 5: Benchmark grid and compare to the Task 1 baseline**
+- [x] **Step 5: Benchmark grid and compare to the Task 1 baseline**
 
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - hello_world -release
@@ -2182,7 +2182,7 @@ kill %1
 ```
 Expected: within noise of the Task 1 baseline at every point, zero socket errors, zero non-2xx. The response now carries a `Date` header and a shorter header without `Connection`, so bytes per response change by a few bytes either way. If t16 or t32 drop more than ~5%, profile `build_response_header` first: restoring a `sprint` fast path for `header_count == 0` is the known cheap fix. Record the five numbers under **Appendix: wrk after**.
 
-- [ ] **Step 6: Update `CLAUDE.md`**
+- [x] **Step 6: Update `CLAUDE.md`**
 
 Make these edits (keep the existing voice):
 
@@ -2195,7 +2195,7 @@ Make these edits (keep the existing voice):
 7. Remaining Library Gaps: note under "Static file serving handler" that its prerequisite (correct partial-write handling) is done.
 8. Add a line to the Benchmark History with the Task 1 and Task 8 numbers, labeled `fib lifts (2026-10)`.
 
-- [ ] **Step 7: Commit and open the PR**
+- [x] **Step 7: Commit and open the PR**
 
 ```bash
 git add examples/large_body.jai CLAUDE.md docs/plans/2026-10-03-fib-lifts-implementation.md
@@ -2236,4 +2236,33 @@ Matches the 2026-06-22 mitigations-ON ceiling (~1.3M at t16/t32).
 
 ## Appendix: wrk after (Task 8)
 
-_(fill in the same five lines)_
+2026-10-03, same box and state as the baseline, after all eight tasks plus two perf fixes
+(sprint fast path for the common header; `CLOCK_MONOTONIC_COARSE` for `now_ms`). Zero socket
+errors and zero non-2xx at every point. Responses now carry `Date` and drop `Connection` on
+HTTP/1.1 keep-alive.
+
+| wrk         |  baseline |     after | delta |
+|-------------|----------:|----------:|------:|
+| t1 / c10    |   131,893 |   138,334 | +4.9% |
+| t4 / c100   |   384,035 |   378,924 | -1.3% |
+| t8 / c500   |   695,974 |   699,597 | +0.5% |
+| t16 / c1000 | 1,360,956 | 1,371,443 | +0.8% |
+| t32 / c2000 | 1,342,797 | 1,312,911 | -2.2% |
+
+t1 is bimodal on this box (core placement): master itself measured 97K, 98K and 146K in three
+back-to-back runs, the branch 133K, 144K and 138K; the median branch run is recorded. A
+same-session control against a fresh master build (t4 / t16 / t32: 372,579 / 1,391,519 /
+1,336,297 vs branch 375,972 / 1,344,027 / 1,317,561) puts the branch within run-to-run noise.
+Before the two perf fixes the branch trailed master by 2.7-4.0% at t4/t32 (see commit 11f9abb).
+
+Real-TCP slow-client check (`curl --limit-rate 1M`, 2-worker scratch server):
+
+| body | master                            | fib-lifts                                               |
+|------|-----------------------------------|---------------------------------------------------------|
+| 2 MB | complete                          | complete                                                |
+| 4 MB | truncated at 3.4 MB, client hangs | complete (tail drained via EPOLLOUT)                    |
+| 8 MB | truncated at 3.9 MB, client hangs | closed, logged: 4.5 MB tail exceeds `MAX_PENDING_BYTES` |
+
+The plan's 1 MB `large_body` check passes on both master and the branch over loopback: loopback
+autotuning buffers the whole megabyte, so the old bug only shows on bodies larger than the socket
+buffer.
