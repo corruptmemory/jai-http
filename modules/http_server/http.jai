@@ -40,6 +40,13 @@ Parse_Result :: enum u8 #specified {
     ERROR      :: 2;
 }
 
+// Why parse_request returned .ERROR; decides the canned reply (400 vs 413).
+Parse_Error :: enum u8 #specified {
+    NONE           :: 0;
+    MALFORMED      :: 1;
+    BODY_TOO_LARGE :: 2;
+}
+
 // Look up a request header by name (case-insensitive).
 get_header :: (request: *Request, name: string) -> (value: string, found: bool) {
     for i: 0..cast(s64) request.header_count - 1 {

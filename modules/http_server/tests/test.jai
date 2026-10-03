@@ -716,6 +716,33 @@ test_multipart_value_missing :: () {
     print("  PASS: test_multipart_value_missing\n");
 }
 
+// -- Send-path state (Task 2) --
+
+test_pending_defaults_and_release :: () {
+    pool: Connection_Pool;
+    init_pool(*pool, 2);
+    defer destroy_pool(*pool);
+
+    c := get_connection(*pool);
+    assert(c.pending.count == 0 && c.pending_offset == 0, "fresh connection has no pending output");
+    assert(c.pending.allocator.proc != null, "pending allocator must be pinned at init_pool");
+    assert(!c.close_after_send && !c.read_stalled, "send-path flags start clear");
+    assert(c.last_activity_ms == 0 && c.request_start_ms == 0, "timestamps start at zero");
+    assert(c.parse_error == .NONE, "parse_error starts NONE");
+
+    bytes := "hello";
+    append_bytes(*c.pending, bytes.data, bytes.count);
+    append_bytes(*c.pending, bytes.data, 0);   // zero-length append is a no-op
+    assert(c.pending.count == 5, "append_bytes should grow pending to 5, got %", c.pending.count);
+    assert(c.pending[0] == #char "h" && c.pending[4] == #char "o", "bytes copied in order");
+
+    free_connection(*pool, c);
+    assert(c.pending.count == 0 && c.pending.data == null, "free_connection must release pending");
+    assert(c.pending.allocator.proc != null, "release keeps the pinned allocator");
+
+    print("  PASS: test_pending_defaults_and_release\n");
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -729,6 +756,9 @@ main :: () {
     test_pool_free_and_reuse();
     test_pool_instance_bit();
     test_pool_connections_are_distinct();
+
+    print("\nSend-path state:\n");
+    test_pending_defaults_and_release();
 
     print("\nEvent engine:\n");
     test_encode_decode_connection_ptr();

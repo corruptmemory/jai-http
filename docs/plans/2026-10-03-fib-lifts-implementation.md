@@ -105,7 +105,7 @@ git commit -m "docs(fib-lifts): record wrk baseline before any change"
 **Interfaces:**
 - Produces: parameters `MAX_PENDING_BYTES: s64`, `IDLE_TIMEOUT_MS: s64`, `HEADER_TIMEOUT_MS: s64`, `BODY_TIMEOUT_MS: s64`, `WRITE_TIMEOUT_MS: s64`; `Parse_Error` enum; `Connection` fields `pending`, `pending_offset`, `close_after_send`, `read_stalled`, `last_activity_ms`, `request_start_ms`, `parse_error`; procs `release_pending :: (c: *Connection)` and `append_bytes :: (arr: *[..] u8, data: *u8, count: s64)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the test file, before `main`:
 
@@ -145,12 +145,12 @@ Register in `main` after the "Connection pool" group:
     test_pending_defaults_and_release();
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: compile error in the tests workspace, `Undeclared identifier 'append_bytes'` (or `pending`).
 
-- [ ] **Step 3: Add the parameters**
+- [x] **Step 3: Add the parameters**
 
 Replace the group-1 block in `modules/http_server/module.jai`:
 
@@ -180,7 +180,7 @@ Replace the group-1 block in `modules/http_server/module.jai`:
 );
 ```
 
-- [ ] **Step 4: Add `Parse_Error` to `http.jai`**
+- [x] **Step 4: Add `Parse_Error` to `http.jai`**
 
 Directly after the `Parse_Result` enum:
 
@@ -193,7 +193,7 @@ Parse_Error :: enum u8 #specified {
 }
 ```
 
-- [ ] **Step 5: Rewrite `connection.jai`**
+- [x] **Step 5: Rewrite `connection.jai`**
 
 ```jai
 
@@ -327,12 +327,12 @@ append_bytes :: (arr: *[..] u8, data: *u8, count: s64) {
 }
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: `PASS: test_pending_defaults_and_release` and every other suite green. If `array_reserve` ignores the pinned allocator in your version (the test's second allocator assert fails after `append_bytes`), replace the `Basic.array_reserve` call with a manual grow: allocate `new_cap` bytes with `Basic.alloc(new_cap,, allocator = arr.allocator)`, `memcpy` the old contents, free the old block with the same allocator, and set `arr.allocated`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add modules/http_server/module.jai modules/http_server/connection.jai modules/http_server/http.jai modules/http_server/tests/test.jai
