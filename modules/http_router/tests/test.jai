@@ -733,6 +733,59 @@ test_nested_mounts_dispatch :: () {
     print("  PASS: test_nested_mounts_dispatch\n");
 }
 
+// -- Second review (codex, with the Jai reference) of the fix round: R25, R26 --
+
+review_failures: s32;
+
+review_check :: (ok: bool, name: string, fmt: string, args: ..Any) {
+    if ok { print("  PASS: %\n", name); return; }
+    review_failures += 1;
+    print("  FAIL: %: ", name);
+    print(fmt, ..args);
+    print("\n");
+}
+
+// R25 (R19 incomplete). Stripping a mount prefix that ends in '/' (or is "/") drops the leading
+// slash, so the delegated path is `v1/users` and a nested `/v1` mount never matches.
+test_review_nested_mount_under_slash_prefix :: () {
+    v1: Router;
+    get(*v1, "/users", get_probe_handler);
+    api: Router;
+    mount(*api, "/v1", *v1);
+    root: Router;
+    mount(*root, "/api/", *api);
+    req := Request.{ method = "GET", path = "/api/v1/users" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*root, *req, *resp);
+
+    top: Router;
+    mount(*top, "/", *api);
+    req2 := Request.{ method = "GET", path = "/v1/users" };
+    resp2: Response;
+    dispatch(*top, *req2, *resp2);
+    review_check(resp.status_code == 200 && resp2.status_code == 200 && get_probe_calls == 2, "R25 nested_mount_under_slash_prefix",
+        "nested mounts below '/api/' and '/' must resolve; statuses % and %, handler ran %", resp.status_code, resp2.status_code, get_probe_calls);
+}
+
+// R26 (partly a regression from the R17 fix). allow_header_for kept at most 32 methods, so a
+// path with more registered methods silently lost GET (and its implied HEAD) from Allow.
+test_review_allow_has_no_silent_caps :: () {
+    methods :: string.["M01","M02","M03","M04","M05","M06","M07","M08","M09","M10","M11",
+                       "M12","M13","M14","M15","M16","M17","M18","M19","M20","M21","M22",
+                       "M23","M24","M25","M26","M27","M28","M29","M30","M31","M32","M33"];
+    router: Router;
+    for methods  route(*router, it, "/x", get_probe_handler);
+    get(*router, "/x", get_probe_handler);
+    req := Request.{ method = "DELETE", path = "/x" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    allow, found := response_header(*resp, "Allow");
+    review_check(resp.status_code == 405 && found && review_contains(allow, "M33") && review_contains(allow, "GET") && review_contains(allow, "HEAD"),
+        "R26 allow_has_no_silent_caps", "Allow must list all 34 methods plus HEAD; status %, Allow ends '...%'",
+        resp.status_code, ifx allow.count > 30 then string.{30, allow.data + allow.count - 30} else allow);
+}
+
 main :: () {
     print("Running http_router tests...\n\n");
 
@@ -796,6 +849,11 @@ main :: () {
     test_allow_unions_overlapping_routes();
     test_mount_prefix_is_segment_aligned();
     test_nested_mounts_dispatch();
+
+    print("\nSecond review (2026-10-03):\n");
+    test_review_nested_mount_under_slash_prefix();
+    test_review_allow_has_no_silent_caps();
+    assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll http_router tests passed.\n");
 }

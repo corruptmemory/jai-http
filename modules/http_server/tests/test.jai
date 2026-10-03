@@ -1550,7 +1550,7 @@ record_errors :: (message: string, data: *void, info: Log_Info) {
 // A connected TCP loopback pair; server side non-blocking as accept_connections makes it, client
 // non-blocking too. TCP, not AF_UNIX, because the R1 failure is TCP's: a close with unread input
 // sends RST, and the kernel discards response bytes it has not transmitted yet.
-make_tcp_pair :: (server_sndbuf: s32 = 0, client_rcvbuf: s32 = 0) -> (server: s32, client: s32) {
+make_tcp_pair :: (server_sndbuf: s32 = 0, client_rcvbuf: s32 = 0, server_rcvbuf: s32 = 0, client_sndbuf: s32 = 0) -> (server: s32, client: s32) {
     lfd := socket(AF_INET, .SOCK_STREAM | .SOCK_CLOEXEC, 0);
     assert(lfd >= 0, "socket failed");
     defer close(lfd);
@@ -1565,6 +1565,10 @@ make_tcp_pair :: (server_sndbuf: s32 = 0, client_rcvbuf: s32 = 0) -> (server: s3
         v := client_rcvbuf;
         setsockopt(client, SOL_SOCKET, SO_RCVBUF, xx *v, size_of(type_of(v)));
     }
+    if client_sndbuf > 0 {
+        v := client_sndbuf;
+        setsockopt(client, SOL_SOCKET, SO_SNDBUF, xx *v, size_of(type_of(v)));
+    }
     assert(connect(client, cast(*sockaddr) *addr, len) == 0, "connect failed: %", errno());
     fcntl(client, F_SETFL, O_NONBLOCK);
     server := accept4(lfd, null, null, .NONBLOCK | .CLOEXEC);
@@ -1572,6 +1576,10 @@ make_tcp_pair :: (server_sndbuf: s32 = 0, client_rcvbuf: s32 = 0) -> (server: s3
     if server_sndbuf > 0 {
         v := server_sndbuf;
         setsockopt(server, SOL_SOCKET, SO_SNDBUF, xx *v, size_of(type_of(v)));
+    }
+    if server_rcvbuf > 0 {
+        v := server_rcvbuf;
+        setsockopt(server, SOL_SOCKET, SO_RCVBUF, xx *v, size_of(type_of(v)));
     }
     return server, client;
 }
@@ -1650,19 +1658,20 @@ test_content_length_overflow_rejected :: () {
     pid := fork();
     if pid == 0 {
         c: Connection;
-        s := "POST / HTTP/1.1\r\nContent-Length: 18446744073709551621\r\n\r\nhello";
+        s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 18446744073709551621\r\n\r\nhello";
         memcpy(c.buf.data, s.data, s.count);
         c.bytes_used = s.count;
         r := parse_request(*c);
-        _exit(10 + cast(s32) r);
+        _exit(100 + 10 * cast(s32) r + cast(s32) c.parse_error);   // result and cause in one code
     }
     status: s32;
     waitpid(pid, *status, 0);
     exited := (status & 0x7f) == 0;
     code := (status >> 8) & 0xff;
     what := ifx !exited then "died on a signal" else ifx code == 1 then "PANICKED (arithmetic overflow; a live server dies)"
-            else tprint("returned Parse_Result %", code - 10);
-    assert(exited && code == 10 + cast(s32) Parse_Result.ERROR, "a 20-digit Content-Length must parse as an error; the parse %", what);
+            else tprint("returned exit code % (100 + 10 * Parse_Result + Parse_Error)", code);
+    assert(exited && code == 100 + 10 * cast(s32) Parse_Result.ERROR + cast(s32) Parse_Error.BODY_TOO_LARGE,
+        "a 20-digit Content-Length must be BODY_TOO_LARGE; the parse %", what);
     print("  PASS: test_content_length_overflow_rejected\n");
 }
 
@@ -1700,11 +1709,11 @@ test_too_many_headers_refused :: () {
 // §6.3 item 5: an invalid Content-Length (differing values) is unrecoverable; respond 400.
 test_duplicate_content_length_rejected :: () {
     c: Connection;
-    s := "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+    s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    assert(r == .ERROR, "differing Content-Length values must be an error; got % with content_length %", r, c.req.content_length);
+    assert(r == .ERROR && c.parse_error == .MALFORMED, "differing Content-Length values must be MALFORMED; got % (%) with content_length %", r, c.parse_error, c.req.content_length);
     print("  PASS: test_duplicate_content_length_rejected\n");
 }
 
@@ -1829,11 +1838,11 @@ test_accept_errors_are_logged :: () {
 // `Content-Length : 5` hides the body length (desync). RFC 9112 §5.1: reject with 400.
 test_field_name_whitespace_rejected :: () {
     c: Connection;
-    s := "POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello";
+    s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length : 5\r\n\r\nhello";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    assert(r == .ERROR, "whitespace between a field name and its colon must be an error; got % with content_length %", r, c.req.content_length);
+    assert(r == .ERROR && c.parse_error == .MALFORMED, "whitespace between a field name and its colon must be MALFORMED; got % (%) with content_length %", r, c.parse_error, c.req.content_length);
     print("  PASS: test_field_name_whitespace_rejected\n");
 }
 
@@ -2016,6 +2025,126 @@ test_bad_version_rejected :: () {
     print("  PASS: test_bad_version_rejected\n");
 }
 
+// -- Second review (codex, with the Jai reference) of the fix round: R22-R28 --
+
+review_failures: s32;
+
+review_check :: (ok: bool, name: string, fmt: string, args: ..Any) {
+    if ok { print("  PASS: %\n", name); return; }
+    review_failures += 1;
+    print("  FAIL: %: ", name);
+    print(fmt, ..args);
+    print("\n");
+}
+
+// R22. Field values keep raw CR, LF and NUL: `X-Test: a\nInjected: b` stores a bare LF that a
+// front end treating LF as a line end reads as a second field (desync / header injection).
+// RFC 9110 §5.5: field values contain no CR, LF or NUL; reject with 400.
+test_review_field_value_controls_rejected :: () {
+    bad := string.["GET / HTTP/1.1\r\nHost: x\r\nX-Test: a\nInjected: b\r\n\r\n",
+                   "GET / HTTP/1.1\r\nHost: x\r\nX-Test: a\rb\r\n\r\n",
+                   "GET / HTTP/1.1\r\nHost: x\r\nX-Test: a\0b\r\n\r\n"];
+    results: [3] Parse_Result;
+    for bad {
+        c: Connection;
+        memcpy(c.buf.data, it.data, it.count);
+        c.bytes_used = it.count;
+        results[it_index] = parse_request(*c);
+    }
+    review_check(results[0] == .ERROR && results[1] == .ERROR && results[2] == .ERROR, "R22 field_value_controls_rejected",
+        "bare LF / CR / NUL in a field value must be errors; got % % %", results[0], results[1], results[2]);
+}
+
+// R23. Host is counted but not validated: `Host: a b` reaches the handler. RFC 9112 §3.2: an
+// invalid Host field value gets 400 (RFC 3986 authority: no spaces; `,` is a legal sub-delim).
+test_review_host_syntax_validated :: () {
+    c: Connection;
+    s := "GET / HTTP/1.1\r\nHost: a b\r\n\r\n";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    c2: Connection;
+    s2 := "GET / HTTP/1.1\r\nHost: a,b.example:8080\r\n\r\n";
+    memcpy(c2.buf.data, s2.data, s2.count);
+    c2.bytes_used = s2.count;
+    r2 := parse_request(*c2);
+    review_check(r == .ERROR && r2 == .COMPLETE, "R23 host_syntax_validated",
+        "`Host: a b` must be rejected while `Host: a,b.example:8080` is legal; got % and %", r, r2);
+}
+
+// R24 (regression from the R2 fix). The 18-digit bound counted leading zeros, so a small
+// zero-padded Content-Length was refused with 413. RFC 9110 §8.6: 1*DIGIT, leading zeros allowed.
+test_review_zero_padded_content_length :: () {
+    c: Connection;
+    s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0000000000000000005\r\n\r\nhello";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .COMPLETE && c.req.content_length == 5, "R24 zero_padded_content_length",
+        "a zero-padded small Content-Length must parse; got % (%) with content_length %", r, c.parse_error, c.req.content_length);
+}
+
+// R28 (R1 incomplete). linger_close discarded at most 64 KB and then closed: with more unread
+// input than that, or input arriving after the drain, the close still turns into a reset and the
+// kernel drops untransmitted response bytes. A lingering close keeps discarding until the peer's
+// EOF or a timeout.
+test_review_lingering_close_survives_more_input :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, client := make_tcp_pair(server_sndbuf = 65536, client_rcvbuf = 4096, server_rcvbuf = 1048576, client_sndbuf = 1048576);
+    defer close(client);
+    c := attach(*w, server);
+
+    // A `Connection: close` request, then ~120 KB of input that stays unread (more than 64 KB).
+    send_to_server(client, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    junk := big_body(122880);
+    defer free(junk);
+    sent: s64 = 0;
+    while sent < junk.count {
+        n := send(client, junk.data + sent, xx (junk.count - sent), .NOSIGNAL);
+        if n <= 0  break;
+        sent += n;
+    }
+    assert(sent > 80000, "setup: need more than 64 KB of unread input, sent %", sent);
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    n: s64;
+    ended, err: s32;
+    rounds := 0;
+    while c.state == .ACTIVE && c.pending.count > 0 && rounds < 200000 {
+        n, ended, err = client_read(client, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+    }
+    // More input after the server finished writing: a lingering server discards it.
+    more := big_body(16384);
+    defer free(more);
+    send(client, more.data, xx more.count, .NOSIGNAL);
+    if c.state == .ACTIVE  handle_client(*w, c, EPOLLIN);
+
+    fcntl(client, F_SETFL, 0);
+    tv: timeval;
+    tv.tv_sec = 2;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, xx *tv, size_of(timeval));
+    while ended == 0 {
+        n, ended, err = client_read(client, *got);
+        if n == 0 && ended == 0  break;
+    }
+    out := as_string(got);
+    header_end := index_of(out, "\r\n\r\n");
+    body_got := ifx header_end >= 0 then out.count - (header_end + 4) else 0;
+    how := ifx ended == 1 then "EOF" else ifx ended == 2 then "a reset/error" else "nothing";
+    review_check(ended == 1 && body_got == big_test_body.count, "R28 lingering_close_survives_more_input",
+        "the whole response then EOF despite >64 KB of unread input and late input; got % of % body bytes, then % (errno %)",
+        body_got, big_test_body.count, how, err);
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -2153,6 +2282,13 @@ main :: () {
     test_parse_multipart_with_filename();
     test_parse_multipart_missing_header();
     test_multipart_value_missing();
+
+    print("\nSecond review (2026-10-03):\n");
+    test_review_field_value_controls_rejected();
+    test_review_host_syntax_validated();
+    test_review_zero_padded_content_length();
+    test_review_lingering_close_survives_more_input();
+    assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll tests passed.\n");
 }
