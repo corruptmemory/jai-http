@@ -111,18 +111,20 @@ tree_to_string :: (t: Trie) -> string {
 }
 
 // Match method+path against the tree. Fills out_params/out_count (capture names from the matched
-// leaf zipped with positionally-captured values). Read-only over the tree; uses only stack locals.
-tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS] Param, out_count: *s32) -> (handler: Route_Handler, status: Match_Status) {
+// leaf zipped with positionally-captured values). Read-only over the tree; uses only stack locals,
+// except that a 405 builds its `allow` value (the Allow header) from context.allocator.
+tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS] Param, out_count: *s32) -> (handler: Route_Handler, status: Match_Status, allow: string) {
     out_count.* = 0;
     null_handler: Route_Handler;
-    if t.nodes.count == 0  return null_handler, .NOT_FOUND;
+    no_allow: string;
+    if t.nodes.count == 0  return null_handler, .NOT_FOUND, no_allow;
 
     sp := path;
     if sp.count > 0 && sp[0] == #char "/" { sp.data += 1; sp.count -= 1; }
 
     segs_buf: [MAX_PATH_SEGMENTS] string;
     seg_count, ok := split_path_segments(sp, *segs_buf);
-    if !ok  return null_handler, .NOT_FOUND;
+    if !ok  return null_handler, .NOT_FOUND, no_allow;
 
     segs: [] string;
     segs.data  = segs_buf.data;
@@ -130,9 +132,11 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
 
     values: [MAX_PARAMS] string;
     vcount: s32 = 0;
-    saw_leaf := false;
+    mismatched: Mismatched_Leaves;   // every leaf reached whose methods did not match
+    mismatched.allocator = context.allocator;
+    defer if mismatched.data  Basic.array_free(mismatched);   // the common path never allocates
 
-    leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *saw_leaf);
+    leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *mismatched);
     if leaf != -1 {
         ep := find_endpoint(*t.nodes[leaf], method);
         if ep != null {
@@ -142,11 +146,11 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
                 out_params.*[i] = .{ name = ep.param_keys[i], value = values[i] };
             }
             out_count.* = n;
-            return ep.handler, .MATCHED;
+            return ep.handler, .MATCHED, no_allow;
         }
     }
-    if saw_leaf  return null_handler, .METHOD_NOT_ALLOWED;
-    return null_handler, .NOT_FOUND;
+    if mismatched.count > 0  return null_handler, .METHOD_NOT_ALLOWED, allow_header_for(t, mismatched);
+    return null_handler, .NOT_FOUND, no_allow;
 }
 
 // -- Private helpers --
@@ -287,26 +291,72 @@ split_path_segments :: (sp: string, segs: *[MAX_PATH_SEGMENTS] string) -> (count
 }
 
 node_has_method :: (node: *Trie_Node, method: string) -> bool {
-    for * node.endpoints  if it.method.count == 0 || string_equals(it.method, method)  return true;
-    return false;
+    return find_endpoint(node, method) != null;
 }
 
 find_endpoint :: (node: *Trie_Node, method: string) -> *Trie_Endpoint {
     for * node.endpoints  if string_equals(it.method, method)  return it;   // exact method
-    for * node.endpoints  if it.method.count == 0              return it;   // then "any"
+    if string_equals(method, "HEAD") {
+        for * node.endpoints  if string_equals(it.method, "GET")  return it;  // a GET route answers HEAD (RFC 9110 §9.3.2)
+    }
+    for * node.endpoints  if it.method.count == 0  return it;                 // then "any"
     return null;
+}
+
+// Leaves that matched the whole path but not the method, collected across backtracking: a 405's
+// Allow must list every method that would succeed for this path, not only the first leaf's.
+// Growable (no silent cap); allocated only when a mismatch occurs, from context.allocator.
+Mismatched_Leaves :: [..] s32;
+
+add_mismatched :: (m: *Mismatched_Leaves, node_idx: s32) {
+    Basic.array_add(m, node_idx);
+}
+
+// The Allow value for a 405: the union of the mismatched leaves' methods in discovery order, with
+// HEAD appended whenever GET is present and HEAD is not. Built from context.allocator, which
+// during dispatch is the per-request Pool.
+allow_header_for :: (t: *Trie, mismatched: Mismatched_Leaves) -> string {
+    methods: [..] string;
+    methods.allocator = context.allocator;
+    defer Basic.array_free(methods);
+    for leaf: mismatched {
+        node := *t.nodes[leaf];
+        for * ep: node.endpoints {
+            if ep.method.count == 0  continue;   // an "any" endpoint would have matched; defensive
+            seen := false;
+            for m: methods  if string_equals(m, ep.method) { seen = true; break; }
+            if !seen  Basic.array_add(*methods, ep.method);
+        }
+    }
+    method_count := methods.count;
+    has_get, has_head := false, false;
+    for m: 0..method_count-1 {
+        if string_equals(methods[m], "GET")   has_get  = true;
+        if string_equals(methods[m], "HEAD")  has_head = true;
+    }
+    builder: Basic.String_Builder;
+    builder.allocator = context.allocator;
+    for m: 0..method_count-1 {
+        if m > 0  Basic.append(*builder, ", ");
+        Basic.append(*builder, methods[m]);
+    }
+    if has_get && !has_head {
+        if method_count > 0  Basic.append(*builder, ", ");
+        Basic.append(*builder, "HEAD");
+    }
+    return Basic.builder_to_string(*builder,, allocator = context.allocator);
 }
 
 // Precedence static -> param -> wildcard, with backtracking. Returns the matched leaf index, or -1.
 // `sp` is the stripped path (for wildcard raw-remainder capture); `segs[k..]` are the unconsumed segments.
 trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32, method: string,
-                   values: *[MAX_PARAMS] string, vcount: *s32, saw_leaf: *bool) -> s32 {
+                   values: *[MAX_PARAMS] string, vcount: *s32, mismatched: *Mismatched_Leaves) -> s32 {
     node := *t.nodes[node_idx];
 
     if k == segs.count {
         if node.endpoints.count > 0 {
-            saw_leaf.* = true;
             if node_has_method(node, method)  return node_idx;
+            add_mismatched(mismatched, node_idx);
         }
         return -1;
     }
@@ -316,7 +366,7 @@ trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32,
     // 1. STATIC
     sidx := find_static_child(t, node_idx, seg);
     if sidx != -1 {
-        r := trie_match_rec(t, sidx, sp, segs, k + 1, method, values, vcount, saw_leaf);
+        r := trie_match_rec(t, sidx, sp, segs, k + 1, method, values, vcount, mismatched);
         if r != -1  return r;
     }
 
@@ -324,7 +374,7 @@ trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32,
     if node.param_child != -1 && seg.count > 0 && vcount.* < MAX_PARAMS {
         values.*[vcount.*] = seg;
         vcount.* += 1;
-        r := trie_match_rec(t, node.param_child, sp, segs, k + 1, method, values, vcount, saw_leaf);
+        r := trie_match_rec(t, node.param_child, sp, segs, k + 1, method, values, vcount, mismatched);
         if r != -1  return r;
         vcount.* -= 1;   // backtrack
     }
@@ -339,8 +389,8 @@ trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32,
             vcount.* += 1;
             wnode := *t.nodes[node.wildcard_child];
             if wnode.endpoints.count > 0 {
-                saw_leaf.* = true;
                 if node_has_method(wnode, method)  return node.wildcard_child;
+                add_mismatched(mismatched, node.wildcard_child);
             }
             vcount.* -= 1;   // backtrack
         }

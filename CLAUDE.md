@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Experimental HTTP server in Jai using epoll-based event-driven I/O on Linux. Features a worker thread pool with SO_REUSEPORT shared-nothing architecture, chi-style router with middleware and context integration, per-request pool allocator, and comprehensive HTTP helpers.
 
-**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. Plus a vendored JSON module (rluba/jaison, MIT): typed struct ⇄ JSON and a generic `JSON_Value` tree. Routing now lives in its own `http_router` module layered on the routing-agnostic `http_server` core (GetRect↔Simp-style split: the core invokes a bare `Handler` and delivers bound state via `#add_context handler_data: *Handler_Data`; `http_router` supplies the dispatch adapter, now **cast-free**). The cast-free path requires the consuming **main program** to wire the core's `Handler_Data` to a Router-compatible type — program parameters can only be supplied from main, never a library, so the consumer that pulls in the optional routing layer does the explicit wiring (no library magic); a consumer that forgets gets a clean, actionable `compiler_report` error, not a silent fallback. `Handler_Data` may be **`Router` itself** *or* **any struct that embeds `Router` via `#as using`** (structural single-inheritance, `$T/Router`-style): the router dispatches cast-free through the embedded `Router`, and handlers read the full typed app-state off `context.handler_data` (also cast-free) — so an app reclaims the single program-wide slot for its own state without giving up routing. See `examples/app_state.jai`. Path matching is backed by a **segment trie** matched in O(path-segments) — built by folding per-route partial trees through a `merge` primitive, with duplicate routes and malformed patterns reported as loud errors — which replaced the former O(route-count) linear `match_pattern` scan (now retired). See `docs/plans/2026-06-22-trie-path-matcher-{design,implementation}.md`. The method helpers (`get`/`post`/`put`/`http_delete`/`head`) are **compile-time macros** that parse + validate the pattern via `#run` over a baked `[]Pattern_Segment` slice — a malformed pattern is a **build error** (`compiler_report`), not a startup log; `route()` remains the runtime escape hatch for computed patterns. See `docs/plans/2026-06-22-route-macros-{design,implementation}.md`. 130 unit tests passing (50 http_server + 31 http_router + 19 datetime + 15 channel + 15 CSV), plus the vendored JSON suite (leak + round-trip harness). ~1.8M req/s at 32t/2000c, beating nginx on a 3970X under matched conditions (2026-06-19) after fixing a per-response temporary-storage allocation in `write_response`. A controlled 2026-06-22 re-measure (mitigations ON) shows the trie + route macros are throughput-neutral vs the old linear scan and that **route count is free** (1 route ≈ 10 routes, ~1.3M) — no routing regression; the 1.8M was a more-favorable machine state (`mitigations=off`), not lost code. See Benchmark History. Builds and all tests pass on Jai beta 0.2.029. The project has refocused to a **library + examples** layout: build targets are `examples/<name>.jai` driven by `first.jai`'s shape-based grammar (`-release`/`-run`/`run-tests`/`++`), and the native HTTP client was dropped in favor of a future libcurl wrapper.
+**Current status:** Milestone 3 (routing + helpers) complete, plus datetime, channel, and CSV modules. Chi-style router with path params (`:name`), wildcard segments (`*name`), middleware chains, sub-router mounting, and `#add_context` integration. Response helpers (json/text/html/redirect), URL decoding, query param access, form body parsing, and multipart/form-data parsing. Datetime helpers: RFC3339 parsing, date formatting, Unix epoch conversions, start-of-day, relative time, duration bucketing. CSV module: compile-time validated struct-to-CSV with `#code` AST rewriting for override API, RFC 4180 parsing, header-mapped row reading. Plus a vendored JSON module (rluba/jaison, MIT): typed struct ⇄ JSON and a generic `JSON_Value` tree. Routing now lives in its own `http_router` module layered on the routing-agnostic `http_server` core (GetRect↔Simp-style split: the core invokes a bare `Handler` and delivers bound state via `#add_context handler_data: *Handler_Data`; `http_router` supplies the dispatch adapter, now **cast-free**). The cast-free path requires the consuming **main program** to wire the core's `Handler_Data` to a Router-compatible type — program parameters can only be supplied from main, never a library, so the consumer that pulls in the optional routing layer does the explicit wiring (no library magic); a consumer that forgets gets a clean, actionable `compiler_report` error, not a silent fallback. `Handler_Data` may be **`Router` itself** *or* **any struct that embeds `Router` via `#as using`** (structural single-inheritance, `$T/Router`-style): the router dispatches cast-free through the embedded `Router`, and handlers read the full typed app-state off `context.handler_data` (also cast-free) — so an app reclaims the single program-wide slot for its own state without giving up routing. See `examples/app_state.jai`. Path matching is backed by a **segment trie** matched in O(path-segments) — built by folding per-route partial trees through a `merge` primitive, with duplicate routes and malformed patterns reported as loud errors — which replaced the former O(route-count) linear `match_pattern` scan (now retired). See `docs/plans/2026-06-22-trie-path-matcher-{design,implementation}.md`. The method helpers (`get`/`post`/`put`/`http_delete`/`head`) are **compile-time macros** that parse + validate the pattern via `#run` over a baked `[]Pattern_Segment` slice — a malformed pattern is a **build error** (`compiler_report`), not a startup log; `route()` remains the runtime escape hatch for computed patterns. See `docs/plans/2026-06-22-route-macros-{design,implementation}.md`. 192 unit tests passing (102 http_server + 41 http_router + 19 datetime + 15 channel + 15 CSV), plus the vendored JSON suite (leak + round-trip harness). ~1.8M req/s at 32t/2000c, beating nginx on a 3970X under matched conditions (2026-06-19) after fixing a per-response temporary-storage allocation in `write_response`. A controlled 2026-06-22 re-measure (mitigations ON) shows the trie + route macros are throughput-neutral vs the old linear scan and that **route count is free** (1 route ≈ 10 routes, ~1.3M) — no routing regression; the 1.8M was a more-favorable machine state (`mitigations=off`), not lost code. See Benchmark History. Builds and all tests pass on Jai beta 0.2.030. The core's write path is now correct under a full socket buffer (SENT/PENDING/ERROR writer, permanent edge-triggered EPOLLOUT, heap-pinned per-connection pending tail capped by `MAX_PENDING_BYTES`, dispatch paused while output is queued), requests are answered before hangups are honored, idle/header/body/write timeouts are swept once per second, and HEAD/405 Allow/204-304/400-413-431 semantics follow RFC 9110. All socket writes use `MSG_NOSIGNAL`. See `docs/plans/2026-10-03-fib-lifts-{design,implementation}.md`. A whole-PR review (author, Codex, fresh-eyes agent; report on PR #5) then hardened request parsing against desync and crashes (bounded Content-Length, duplicate lengths, Transfer-Encoding 501, header-count 431, token field names, Host required, HTTP/1.x only), cleared stale request views that leaked across clients, made every close after a response a lingering close, gave the WRITE timeout its own write-progress clock, and fixed router Allow unions and mount matching; each finding is pinned by a test. The project has refocused to a **library + examples** layout: build targets are `examples/<name>.jai` driven by `first.jai`'s shape-based grammar (`-release`/`-run`/`run-tests`/`++`), and the native HTTP client was dropped in favor of a future libcurl wrapper.
 
 **Target hardware:** 32-core / 64-thread AMD Threadripper. Be aggressive with threading when we get there.
 
@@ -48,16 +48,16 @@ Run an example: `./build_debug/hello_world` (listens on 0.0.0.0:9090)
 **Build metaprogram** (`first.jai`): Creates one compiler workspace per build target — an example (`examples/<name>.jai`, discovered dynamically) or a test suite. The `modules/` directory is prepended to the import path for all workspaces. The `build_example` helper compiles an example into `build_debug/`/`build_release/` and optionally runs it (forwarding `++` passthrough args); `build_and_run_test` compiles a test suite and auto-runs it via `Autorun`. Adding a new example is just dropping a file into `examples/`; adding a test suite is a one-line `build_and_run_test` call. See "Build Commands" for the full target grammar.
 
 **HTTP Server module — the routing-agnostic core** (`modules/http_server/`):
-- `module.jai` — Module definition. Group-1 (per-import) params: `CACHE_LINE_SIZE`, `READ_BUFFER_SIZE`, `MAX_HEADERS`, `MAX_FORM_VALUES`, `MAX_MULTIPART_PARTS`, `LISTEN_BACKLOG`. Group-2 (program-wide) param: `Handler_Data: Type = void` — the type of the bound state delivered to handlers via `#add_context handler_data: *Handler_Data` (`*void` by default; a concrete `*T` when a consumer injects one, then cast-free). Imports Basic, Pool, POSIX, Linux, Socket, Thread. The core never references `Router` — routing is the optional `http_router` layer.
-- `http.jai` — HTTP types (Request, Response, Header, Parse_State, Parse_Result), the bare `Handler :: #type (req, resp)` contract, zero-copy incremental parser, response serializer, string helpers (string_equals, string_equals_ci, to_lower). `to_lower` is `#scope_module` so helpers.jai can use it without conflicting with `Basic.to_lower` for importers.
-- `connection.jai` — Connection struct with per-connection read buffer, parse state, and request; connection pool with free list and instance-bit recycling.
+- `module.jai` — Module definition. **Every parameter is program-wide (group 2); group 1 is deliberately empty** (see Key Patterns for why): `Handler_Data: Type = void` — the type of the bound state delivered to handlers via `#add_context handler_data: *Handler_Data` (`*void` by default; a concrete `*T` when a consumer injects one, then cast-free) — plus `READ_BUFFER_SIZE` (4096), `MAX_HEADERS` (64), `MAX_FORM_VALUES` (64), `MAX_MULTIPART_PARTS` (16), `LISTEN_BACKLOG` (1024), and the send-path / timeout params `MAX_PENDING_BYTES` (1048576), `IDLE_TIMEOUT_MS` (60000), `HEADER_TIMEOUT_MS` (10000), `BODY_TIMEOUT_MS` (30000), `WRITE_TIMEOUT_MS` (30000), `LINGER_TIMEOUT_MS` (5000); 0 disables a timeout (for LINGER: close right after one drain). Override from main: `#import "http_server"()(Handler_Data = http_router.Router, MAX_PENDING_BYTES = 16777216);`. Imports Basic, Pool, POSIX, Linux, Socket, Thread. The core never references `Router` — routing is the optional `http_router` layer.
+- `http.jai` — HTTP types (Request, Response, Header, Parse_State, Parse_Result), the bare `Handler :: #type (req, resp)` contract, zero-copy incremental parser that validates as it goes (token method and field names, `HTTP/1.x` version, no control bytes in the target or in field values, OWS-trimmed values, leading CRLFs skipped; `finish_headers` checks framing (Transfer-Encoding → 501, Content-Length digits-only, ≤18 significant digits, duplicates must agree, must fit the buffer) and then Host (exactly one for HTTP/1.1, RFC 3986 authority characters); `reset_request` clears every view between requests) and sets `Connection.parse_error`, mapped to 400/413/431/501/505 by `parse_error_status`, the writer (`write_response` → `Write_Result` SENT / PENDING / ERROR via one `sendmsg(.NOSIGNAL)`, copying any unsent tail into `Connection.pending`; `flush_pending`; `build_response_header` with a `sprint` fast path for the common shape; bodiless 1xx/204/304; HEAD sends headers only), canned refusals with `Date` (`canned_response(status, date)`), `write_or_queue` (a small reply whose unsent tail queues like a response tail), `format_http_date` (IMF-fixdate), an overlap-safe pipelined buffer shift, string helpers (string_equals, string_equals_ci, to_lower). `to_lower` is `#scope_module` so helpers.jai can use it without conflicting with `Basic.to_lower` for importers.
+- `connection.jai` — Connection struct with per-connection read buffer, parse state, and request; send-path state (`pending` tail + `pending_offset`, `close_after_send`, `read_stalled`, `peer_closed`) and timeout stamps (`last_activity_ms`, `last_write_ms` (the WRITE clock, moved only by write progress), `request_start_ms`); connection pool with free list and instance-bit recycling; `release_pending`, `append_bytes`.
 - `event.jai` — Event_Engine wrapping epoll, connection pointer + instance bit encoding for stale event detection.
 - `helpers.jai` — Response helpers (json/text/html/redirect), url_decode with zero-copy fast path, query_param lookup, form body parsing (Form_Data/parse_form/form_value), and multipart/form-data parsing (Multipart_Data/parse_multipart/multipart_value). Routing-independent — stays in the core.
-- `server.jai` — Worker/Server structs, SO_REUSEPORT per-worker sockets, edge-triggered epoll event loop, per-request Pool allocator (reset after each dispatch via `push_context`). `serve(*Server, Handler, *Handler_Data)` wires any bare handler in; the core is unaware of routing.
+- `server.jai` — Worker/Server structs, SO_REUSEPORT per-worker sockets, edge-triggered epoll event loop, per-request Pool allocator (reset after each dispatch via `push_context`). Connections register `EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP` once. `handle_client` runs flush → read-and-dispatch → hangups, so a request that arrives with the peer's FIN is answered; `dispatch_buffered` stops at the first PENDING response and resumes on the drain (`read_stalled` re-reads a socket whose bytes arrived while the read buffer was full; `peer_closed` keeps serving pipelined requests after a half-close). `refuse_and_close` sends a canned status through `write_or_queue` (under backpressure it queues and closes after the drain). Every close that follows a response goes through `linger_close`: half-close, then keep discarding input (`lingering`, timeout state LINGER) until the peer's EOF or `LINGER_TIMEOUT_MS`, because closing with unread input makes TCP send RST and the kernel discards untransmitted response bytes. `accept4` failures other than EAGAIN/EINTR/ECONNABORTED and pool exhaustion are `log_error`; on EMFILE/ENFILE/ENOBUFS/ENOMEM accepts pause and `worker_sweep` (the once-a-second work: timeouts plus the accept retry) resumes them, since an edge-triggered listen socket would not report the waiting backlog again. A once-per-second sweep (`check_timeouts`) applies one timeout per connection by state (IDLE / HEADER / BODY / WRITE; 408 for slow requests); stamps come from `now_ms` (`CLOCK_MONOTONIC_COARSE`). Each worker caches the Date header per second (`refresh_date`, per epoll batch). `serve(*Server, Handler, *Handler_Data)` wires any bare handler in; the core is unaware of routing.
 
 **HTTP Router module — optional routing layer** (`modules/http_router/`):
 - `module.jai` — Own group-1 params (`MAX_ROUTES`, `MAX_PARAMS`, `MAX_MIDDLEWARE`, `MAX_MOUNTS` — they describe the router, not the core). Bare `#import "http_server"` (inherits the program-wide `Handler_Data`), `#import "Basic"`, `Compiler :: #import "Compiler"` (compile-time only, for the friendly error), `#load "router.jai"`.
-- `router.jai` — Chi-style router: `#add_context http: *HTTP_Context`, route types (Route, Router, Mount_Point), route registration (get/post/put/http_delete/route), middleware chains (use/proceed), sub-router mounting (mount), path param access (param), and dispatch with per-request context setup. Pattern matching supports literal segments, `:name` param capture, and `*name` wildcard (rest-of-path) segments. The `route_handler` adapter bridges the core's bare `Handler` to `dispatch()` **cast-free**: `#if #run handler_data_is_router(type_of(context.handler_data))` it dispatches directly (the `*Handler_Data → *Router` conversion is implicit); the `else` arm is `#run Compiler.compiler_report(...)` — a hard, human-friendly compile error (no silent fallback). `handler_data_is_router` is a compile-time `type_info` predicate (in the `#scope_file` region): true when `Handler_Data` is `Router` or a struct with an `#as` member (flag `AS`) of type `Router`, recursively — i.e. exactly when `*Handler_Data` is assignable to `*Router`. `serve(*Server, *$T/Router)` is **polymorphic** (`$T/Router` structural restriction) so the full `*T` passes straight through as the core's bound state (no downcast), keeping `context.handler_data` typed `*T` for handlers. **Consumers wire it in `main`:** `#import "http_server"()(Handler_Data = http_router.Router)` (or `= App` where `App` embeds Router via `#as using`) + `http_router :: #import "http_router"` (named, to namespace `serve`); tests import both anonymously and reference `Router` directly. Needs `Compiler :: #import "Compiler"` (compile-time only). See `docs/plans/2026-06-19-handler-context-refactor-design.md`.
+- `router.jai` — Chi-style router: `#add_context http: *HTTP_Context`, route types (Route, Router, Mount_Point), route registration (get/post/put/http_delete/route), middleware chains (use/proceed), sub-router mounting (mount), path param access (param), and dispatch with per-request context setup. Pattern matching supports literal segments, `:name` param capture, and `*name` wildcard (rest-of-path) segments. A GET route answers HEAD unless an explicit HEAD route exists (`find_endpoint` in `trie.jai`); `tree_match` returns a third value, `allow`, and a 405 carries an `Allow` header: the union of the methods of every leaf that matched the path across backtracking (`Mismatched_Leaves`), plus HEAD when GET is present. `dispatch` resolves mounts recursively (`dispatch_in`), carrying every enclosing router's middleware outermost first; mount prefixes match whole path segments (`mount_matches`: `/api` never matches `/apiary`). The `route_handler` adapter bridges the core's bare `Handler` to `dispatch()` **cast-free**: `#if #run handler_data_is_router(type_of(context.handler_data))` it dispatches directly (the `*Handler_Data → *Router` conversion is implicit); the `else` arm is `#run Compiler.compiler_report(...)` — a hard, human-friendly compile error (no silent fallback). `handler_data_is_router` is a compile-time `type_info` predicate (in the `#scope_file` region): true when `Handler_Data` is `Router` or a struct with an `#as` member (flag `AS`) of type `Router`, recursively — i.e. exactly when `*Handler_Data` is assignable to `*Router`. `serve(*Server, *$T/Router)` is **polymorphic** (`$T/Router` structural restriction) so the full `*T` passes straight through as the core's bound state (no downcast), keeping `context.handler_data` typed `*T` for handlers. **Consumers wire it in `main`:** `#import "http_server"()(Handler_Data = http_router.Router)` (or `= App` where `App` embeds Router via `#as using`) + `http_router :: #import "http_router"` (named, to namespace `serve`); tests import both anonymously and reference `Router` directly. Needs `Compiler :: #import "Compiler"` (compile-time only). See `docs/plans/2026-06-19-handler-context-refactor-design.md`.
 
 **Datetime module** (`modules/datetime/`):
 - `module.jai` — RFC3339 parsing (handles both `T` and `+` separators for AmbientWeather), date formatting (`YYYY-MM-DD`), Unix epoch conversions (`to_unix`/`from_unix`), `start_of_day`, `hours_ago`/`days_ago` relative time, `bucket_start` for duration-aligned bucketing. Uses anonymous `#import "Basic"` (not named) to bring Apollo_Time operators into scope.
@@ -97,7 +97,7 @@ Run an example: `./build_debug/hello_world` (listens on 0.0.0.0:9090)
 
 **MANDATORY:** Before writing or modifying ANY Jai code — including in subagents, plan tasks, and background agents — you MUST first invoke the `jai-language` skill using the Skill tool. This loads the comprehensive language reference (syntax, semantics, import rules, operator overloading, named vs anonymous imports, and common pitfalls). This is NOT optional. Do not rely on prior knowledge of Jai; always load the skill first. Additionally, read `.claude/jai-stdlib-reference.md` for a cheat-sheet of all standard library modules and their key APIs.
 
-**Jai compiler version:** Builds and all tests pass on beta 0.2.029 (verified 2026-06-18). When the compiler is updated, check `~/jai/jai/CHANGELOG.txt` (top of file) for breaking changes — especially renamed APIs, deprecated syntax, and removed modules.
+**Jai compiler version:** Builds and all tests pass on beta 0.2.030 (verified 2026-10-03). When the compiler is updated, check `~/jai/jai/CHANGELOG.txt` (top of file) for breaking changes — especially renamed APIs, deprecated syntax, and removed modules.
 
 The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not exist, ask the user where the Jai distribution is located on this machine. Standard library modules are at `<jai>/modules/` — consult these when using or understanding Jai standard library APIs (Socket, Thread, POSIX, Linux, Atomics, etc.). The `<jai>/how_to/` directory contains detailed annotated examples of every language feature.
 
@@ -109,6 +109,9 @@ The Jai compiler distribution is expected at `~/jai/jai/`. If this path does not
 - **Module scoping gotchas:** `#scope_file` restricts to the file, `#scope_module` makes visible within the module but not to importers, default scope exports to importers. When utility functions are needed across module files but shouldn't conflict with standard library names (e.g. `to_lower`), use `#scope_module`.
 - **Named vs anonymous imports and operators:** A named import (`Basic :: #import "Basic"`) namespaces everything under `Basic.`, meaning bare `assert`, `free`, `NewArray` etc. won't compile — they need `Basic.assert`, `Basic.free`, etc. Operator overloads for types like `Apollo_Time` (inherited from `S128` via `#type,isa`) also don't propagate through namespaces. **Prefer anonymous imports** (`#import "Basic"`) for modules that use Basic broadly (datetime, channel modules). Named imports are useful when you want to avoid polluting the namespace or only call a few qualified functions (http_server module).
 - **Module parameters aren't exported:** Importers can't reference `MAX_PARAMS` etc. In test code, use `type_of(HTTP_Context.params)` to get the array type instead.
+- **Permanent EPOLLOUT:** registered once with EPOLLET; an OUT with nothing queued is ignored; never `epoll_ctl` MOD. Edge-triggered OUT fires only on the full-to-writable transition, so it costs nothing while the socket has room.
+- **Pending tail lives on the heap:** `Connection.pending`'s allocator is pinned in `init_pool`, because the request Pool and temp storage are reset underneath a stalled response.
+- **`MAX_PENDING_BYTES` bounds response size for slow readers:** a response whose unsent tail exceeds it (1 MB) closes the connection, logged. On a fresh real-network connection the kernel send buffer starts small, so responses much over ~1 MB can be refused for any client that reads slower than the server writes. Raise the param, or (static-file plan) send long-lived bodies without copying.
 - Workers use `reset_temporary_storage()` per epoll iteration for memory efficiency
 - Epoll for scalable I/O multiplexing; each worker has its own listen socket via SO_REUSEPORT (shared-nothing, no inter-worker communication)
 - Zero-copy parsing throughout: HTTP parser, URL decoder, form parser, multipart parser all use string views into the connection buffer where possible
@@ -130,7 +133,7 @@ The 16 SO_REUSEPORT workers are shared-nothing — they don't communicate with e
 
 Before the weather station app can be rebuilt in Jai, these library-level features are needed:
 
-1. **Static file serving handler** — Thin wrapper: map wildcard path to embedded bytes (via `#run read_entire_file()`), set Content-Type from file extension, write body. Wildcard routes (`*filepath`) are already implemented.
+1. **Static file serving handler** — Thin wrapper: map wildcard path to embedded bytes (via `#run read_entire_file()`), set Content-Type from file extension, write body. Wildcard routes (`*filepath`) are already implemented. Its prerequisite, correct partial-write handling, landed with the fib-lifts work (2026-10). Design note for this plan: a pending tail is copied to the heap and capped by `MAX_PENDING_BYTES` (1 MB), so assets bigger than that need either a raised cap or a zero-copy path for bodies that outlive the request (embedded `#run` bytes do), which means a way to mark a `Response` body as static.
 2. **CSV read overrides** — `read_row` has no override mechanism (write path has `#code` overrides). Needed for custom parse functions per field (e.g., percentage strings, custom date formats). Should be symmetric with write overrides.
 
 **NOT gaps** (already covered):
@@ -147,10 +150,12 @@ Before the weather station app can be rebuilt in Jai, these library-level featur
 
 ## Future Considerations
 
+- **DONE (2026-10-03, branch `fib-lifts`) — correctness lifts from `lesismal/fib`.** A review of fib (Go epoll library, commit `0034f60`) against the core found three latent bugs the loopback benchmarks never hit: (1) `write_response` ignores writev's result and `send_all` treats EAGAIN as success, so a full socket buffer **silently drops response bytes** and tears the stream; (2) `handle_client` honors RDHUP/HUP before IN, so a request that arrives with the peer's FIN is **never answered**; (3) **SIGPIPE is unhandled**, so a client reset mid-write kills the process. Plus HTTP-semantics gaps (HEAD on a GET route is a 405, 405 lacks `Allow`, 204/304 carry `Content-Length`, parse failures close with no status) and no timeouts at all. Approved design + 8-task TDD plan: `docs/plans/2026-10-03-fib-lifts-{design,implementation}.md`. Decisions already made (don't re-ask): permanent edge-triggered EPOLLOUT; `SENT/PENDING/ERROR` writer with a heap-pinned per-connection tail capped by `MAX_PENDING_BYTES` (1 MB, close on overflow); dispatch pauses while output is pending; timeouts idle 60s / header 10s / body 30s / write 30s as module params; `MSG_NOSIGNAL` on every send; GET answers HEAD; the static-file handler is a separate, later plan. fib's throughput tricks (pipelined coalescing, loop/worker split, GC-shaped pools) were reviewed and **not** lifted — coalescing is the lever declined 2026-06-22. Implemented with tested deviations (a `peer_closed` flag so a FIN is not treated as `Connection: close`; drain-before-close; a buffered partial request's header clock restarts at the drain; doubling growth in `append_bytes`), two perf fixes (header `sprint` fast path; coarse clock for timeout stamps), and every `http_server` parameter moved to group 2. A whole-PR review then found 21 defects (two HIGH and pre-existing: a 20-digit Content-Length panicked the release server; stale request views leaked one client's body to the next), all fixed with tests; a second Codex pass (with the Jai reference) over the fixes found 8 more (3 regressions from the fixes, 5 incomplete or new), also fixed with tests (R22-R28, plus the refusal cap). Reports are on PR #5. No throughput regression; see Benchmark History. **Open from the review:** chunked request bodies are refused with 501 but Caddy and cloudflared forward unknown-length bodies chunked, so chunked decoding is needed before such traffic is expected; slow readers can pin `MAX_PENDING_BYTES` per connection indefinitely (the WRITE timeout measures stalls, not rate) and there is no aggregate pending budget. The dead `CACHE_LINE_SIZE` parameter and the stray, unloaded `modules/http_server/channel.jai` (an old copy of `modules/channel/`) were deleted.
 - **DONE (2026-06-22, PR #4) — routing layer: segment trie + Jai route macros.** `dispatch` now walks a **segment trie** in O(path-segments), independent of route count, replacing the old O(route-count) linear `match_pattern` scan (retired). `get`/`post`/`put`/`http_delete`/`head` are compile-time `#expand` macros that parse + validate the pattern via `#run` over a baked `[]Pattern_Segment` slice — a malformed pattern is now a **build error** (`compiler_report`), not a startup log; `route()` stays the runtime escape hatch for computed patterns. Routing lives in its own `http_router` module (cast-free `Handler_Data`). Controlled benchmark: no regression vs the old linear scan, route count is free, multi-path costs ~4–10% (see Benchmark History). Design + plans: `docs/plans/2026-06-22-trie-path-matcher-{design,implementation}.md` and `docs/plans/2026-06-22-route-macros-{design,implementation}.md`.
 - **Performance — DECLINED (2026-06-22): not chasing the TechEmpower plaintext leaders.** We beat nginx on the same hardware under realistic multi-path load (see Benchmark History) — that's the bar, and it's met. The research below is kept as *analysis of how the TFB leaders win*, **not a to-do list.** Why declined: the Round-23 plaintext top 10 (~28M req/s) all win the same way — **HTTP/1.1 pipelining with response coalescing** — which optimizes *pipelined-plaintext*, a workload real browser/htmx traffic never produces (and we're edge-terminated behind Cloudflare anyway — see the HTTP/2-3 OUT-OF-SCOPE note above). For this project's targets that's leaderboard theater, so we stop here. *Analysis, informational only* (research vendored under `research-sources/`; synthesis in `docs/research/README.md`; closest analogue `research-sources/03-libreactor/`, a C epoll reactor): the leaders' levers, highest-impact first — (1) pipelining + response coalescing **[the declined one]**; (2) cached `Date` header (1/sec, memcpy); (3) precomputed response prefix via Jai `#run`/`#insert` specialization; (4) per-worker CPU pinning + `SO_ATTACH_REUSEPORT_CBPF` (`SKF_AD_CPU`) steering; (5) `-march=native` + SIMD parser scans. #2–#5 would help any workload but are **not a priority** — perf work resumes only from a real measured bottleneck on a real workload, never the leaderboard.
+- **Per-instance `http_server` configuration (not now; Jim, 2026-10-03).** Today every `http_server` parameter is program-wide (group 2), because `http_router`'s bare import cannot see group-1 values set in main. The way to get per-instance configuration back is to pass the `http_server` module **instance** to `http_router` as a module parameter, so the router uses main's instantiation instead of importing its own. A build global is perfectly fine until a program actually needs two differently configured servers.
 - **Backend abstraction via module parameter:** Current backend is EPOLL (Linux). Future possibilities: kqueue (macOS), io_uring (Linux alternative), Windows. Could be a `BACKEND` module parameter with conditional compilation — Jai's compile-time `#if` (not a preprocessor!) makes this clean. **Note (from the perf research above): io_uring is NOT the lever for plaintext throughput — every TFB top-10 entry runs on plain epoll; io_uring is opt-in/disabled in those builds and worth <5–10%. Treat it as a portability/ergonomics option, not a performance one.**
-- **Any plausible tunable constant should be a module parameter** — they're compile-time constants but configurable at import time.
+- **Any plausible tunable constant should be a module parameter** — they're compile-time constants but configurable at import time. **In `http_server`, they all go in group 2** (all moved there 2026-10-03; group 1 is empty). A group-1 value set in main does not reach `http_router`'s bare `#import "http_server"`: that import is a second, default instantiation of the module, its `Request`/`Response` types do not unify with main's, and the program fails with `Type mismatch ... *Request (http.jai:7); type given: *Request (http.jai:7)`. Group 2 is set once by main and inherited by every importer, so it is the only group a routed program can override (verified 2026-10-03, beta 0.2.030: a routed program with `READ_BUFFER_SIZE = 8192` accepts a 5000-byte header the default refuses with 431). The cost is one configuration per program, a "build global", which is fine for now (see Future Considerations for the per-instance route). `http_router`'s own params (`MAX_ROUTES` etc.) are still group 1; that is safe while only main imports `http_router`.
 - **HTTP/2, HTTP/3, and TLS are explicitly OUT OF SCOPE (edge-terminated).** The library speaks plain HTTP/1.1 (keep-alive) only. Modern-web concerns are handled at the edge: apps deploy on `node-0` (home server) as systemd units behind Caddy, with a `cloudflared` outbound tunnel to the Cloudflare edge, which provides HTTP/2 + HTTP/3, HTTPS/TLS, and DDoS protection. The `cloudflared → node-0 → app` hop is low-RTT where HTTP/1.1 is optimal, so the app's hot path stays simple and fast. End-state targets are a personal blog + smallish demo apps — low-traffic, not asset-farm SPAs. Rationale, the deployment topology, and the HTTP/1→2→3 architecture analysis (incl. how nginx layers h2/h3 onto an h1-shaped core) are in `docs/http2-http3-architecture.md`.
 
 ## Benchmarking
@@ -172,41 +177,41 @@ kill %1
 
 **Milestone 1** (single-threaded, Connection: close, hardcoded Hello World):
 | wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|------------|---------|-------------|
-| 1 | 10 | 25,693 | 138us |
-| 4 | 100 | 54,963 | 1.7ms |
-| 8 | 500 | 48,439 | 10.1ms |
-| 16 | 1000 | 45,283 | 21.6ms |
+|-------------|-------------|---------|-------------|
+| 1           | 10          | 25,693  | 138us       |
+| 4           | 100         | 54,963  | 1.7ms       |
+| 8           | 500         | 48,439  | 10.1ms      |
+| 16          | 1000        | 45,283  | 21.6ms      |
 
 **Milestone 1 + Keep-Alive** (single-threaded, keep-alive enabled, hardcoded Hello World):
 | wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|------------|---------|-------------|
-| 1 | 10 | 163,686 | 39us |
-| 4 | 100 | 158,671 | 627us |
-| 8 | 500 | 142,924 | 3.5ms |
-| 16 | 1000 | 142,542 | 6.9ms |
+|-------------|-------------|---------|-------------|
+| 1           | 10          | 163,686 | 39us        |
+| 4           | 100         | 158,671 | 627us       |
+| 8           | 500         | 142,924 | 3.5ms       |
+| 16          | 1000        | 142,542 | 6.9ms       |
 
 **Milestone 2** (16 SO_REUSEPORT workers, keep-alive, hardcoded Hello World):
-| wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|------------|---------|-------------|
-| 1 | 10 | 130,548 | 47us |
-| 4 | 100 | 386,276 | 148us |
-| 8 | 500 | 712,990 | 387us |
-| 16 | 1000 | 1,451,350 | 422us |
+| wrk Threads | Connections | Req/sec   | Avg Latency |
+|-------------|-------------|-----------|-------------|
+| 1           | 10          | 130,548   | 47us        |
+| 4           | 100         | 386,276   | 148us       |
+| 8           | 500         | 712,990   | 387us       |
+| 16          | 1000        | 1,451,350 | 422us       |
 
 **Milestone 2 + HTTP Parser** (16 workers, zero-copy parser, handler callback, Hello World):
-| wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|------------|---------|-------------|
-| 1 | 10 | 143,808 | 4.8ms |
-| 4 | 100 | 392,882 | 4.4ms |
-| 8 | 500 | 689,251 | 4.4ms |
-| 16 | 1000 | 1,360,520 | 4.4ms |
-| 32 | 2000 | 2,489,878 | 4.2ms |
+| wrk Threads | Connections | Req/sec   | Avg Latency |
+|-------------|-------------|-----------|-------------|
+| 1           | 10          | 143,808   | 4.8ms       |
+| 4           | 100         | 392,882   | 4.4ms       |
+| 8           | 500         | 689,251   | 4.4ms       |
+| 16          | 1000        | 1,360,520 | 4.4ms       |
+| 32          | 2000        | 2,489,878 | 4.2ms       |
 
 **Milestone 3** (16 workers, chi-style router + middleware + pool allocator, Hello World):
-| wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|------------|---------|-------------|
-| 32 | 2000 | ~1,600,000 | ~4ms |
+| wrk Threads | Connections | Req/sec    | Avg Latency |
+|-------------|-------------|------------|-------------|
+| 32          | 2000        | ~1,600,000 | ~4ms        |
 
 Router dispatch adds ~36% overhead at 32t/2000c vs raw handler callback (2.49M → 1.6M). Investigated: pool allocator is NOT the cause (same numbers with/without it). The overhead is from push_context, match_pattern segment scanning, and middleware chain setup. Acceptable cost for routing functionality — optimization opportunity for later (e.g. radix tree, compiled dispatch table).
 
@@ -214,12 +219,12 @@ Router dispatch adds ~36% overhead at 32t/2000c vs raw handler callback (2.49M �
 
 **Milestone 3 + TCP_NODELAY + writev** (i7-12800H laptop, 20 logical cores, sysctl-tuned):
 | wrk Threads | Connections | Req/sec | Avg Latency |
-|-------------|------------|---------|-------------|
-| 1 | 10 | 245,591 | 25us |
-| 4 | 100 | 630,698 | 88us |
-| 8 | 500 | 951,780 | 505us |
-| 16 | 1000 | 929,938 | 1.26ms |
-| 32 | 2000 | 859,438 | 2.42ms |
+|-------------|-------------|---------|-------------|
+| 1           | 10          | 245,591 | 25us        |
+| 4           | 100         | 630,698 | 88us        |
+| 8           | 500         | 951,780 | 505us       |
+| 16          | 1000        | 929,938 | 1.26ms      |
+| 32          | 2000        | 859,438 | 2.42ms      |
 
 Numbers plateau and drop above 8t/500c: 16 server workers + 32 wrk threads = 48 threads on 20 cores causes scheduler oversubscription. These numbers are hardware-limited by the laptop. The Threadripper (64 logical cores, no oversubscription) is the meaningful benchmark target.
 
@@ -235,13 +240,13 @@ Numbers plateau and drop above 8t/500c: 16 server workers + 32 wrk threads = 48 
 
 **Routing-overhead A/B** (2026-06-19, 64 logical cores, post handler/context refactor; `hello_world` routed vs `hello_world_raw` bare handler — identical `"Hello, World!"` response through the *same* core machinery):
 
-| wrk | raw (no routing) | routed (chi router) | delta |
-|-----|------------------|---------------------|-------|
-| t1 / c10  (3-rep avg) | 115,040 | 115,696 | +0.6% (noise) |
-| t4 / c100 (3-rep avg) | 351,106 | 351,251 | +0.04% (noise) |
-| t8 / c500  (1 run)    | 669,576 | 676,263 | — |
-| t16 / c1000 (1 run)   | 764,377 | 938,276 | — (variance) |
-| t32 / c2000 (1 run)   | 891,857 | 976,468 | — (variance) |
+| wrk                   | raw (no routing) | routed (chi router) | delta          |
+|-----------------------|------------------|---------------------|----------------|
+| t1 / c10  (3-rep avg) | 115,040          | 115,696             | +0.6% (noise)  |
+| t4 / c100 (3-rep avg) | 351,106          | 351,251             | +0.04% (noise) |
+| t8 / c500  (1 run)    | 669,576          | 676,263             | —              |
+| t16 / c1000 (1 run)   | 764,377          | 938,276             | — (variance)   |
+| t32 / c2000 (1 run)   | 891,857          | 976,468             | — (variance)   |
 
 **Finding:** for a *single* route, routing adds **no measurable overhead** — the low-noise points (3 reps each) overlap, so routed-vs-raw is ≈ 0. The router's fixed per-request cost (one `match_pattern` on `/`, method check, `HTTP_Context` build, inner `push_context`) is lost in the noise. The high-concurrency single-run points are variance-dominated (routed nominally ≥ raw is noise, not a real speedup — would need averaging). The real routing cost is **O(route count)**: `dispatch` linearly scans routes calling `match_pattern` per route, so it grows with the number of routes and a late match pays for every earlier miss — *that* is the radix-tree / compiled-dispatch target, not fixed overhead, and it only shows up as routes multiply. Absolute numbers here are NOT comparable to the milestone entries above (different machine/build/date); only the raw-vs-routed delta measured together is meaningful. Methodology + design: `docs/plans/2026-06-19-handler-context-refactor-design.md`.
 
@@ -249,11 +254,11 @@ Numbers plateau and drop above 8t/500c: 16 server workers + 32 wrk threads = 48 
 
 **High-concurrency collapse — root-caused and fixed** (2026-06-19, Threadripper 3970X 64T, tuned; mitigations toggled during investigation, final state ON):
 
-| wrk | collapse (bug) | **fixed (Pool)** | nginx (control, 16w + reuseport) |
-|-----|---------------:|-----------------:|---------------------------------:|
-| t8 / c500   | 819K  | 1.03M | 1.03M |
-| t16 / c1000 | ~480K | **1.78M** | 1.65M |
-| t32 / c2000 | ~519K | **1.81M** | 1.56M |
+| wrk         | collapse (bug) | **fixed (Pool)** | nginx (control, 16w + reuseport) |
+|-------------|---------------:|-----------------:|---------------------------------:|
+| t8 / c500   |           819K |            1.03M |                            1.03M |
+| t16 / c1000 |          ~480K |        **1.78M** |                            1.65M |
+| t32 / c2000 |          ~519K |        **1.81M** |                            1.56M |
 
 Throughput collapsed at t16+ (to ~half of t8) while the box sat ~70% idle. Root cause: `write_response` formatted the header with `tprint`, which is **hardwired to temporary storage** (ignores `context.allocator`). The default temp storage is **16 KB per worker thread**, reset only per epoll *batch*; under load a batch serves dozens of requests, overflowing temp storage into repeated heap page allocations (`add_new_page` — perf showed ~45% of CPU). Fix: route header formatting through the **per-request Pool** (`sprint`/`String_Builder` on `context.allocator`) and send the response *inside* the Pool `push_context`, resetting the Pool after — so every per-request allocation (handler scratch + response header) recycles through one allocator. The collapse vanished and we now beat nginx on the same box. The nginx control was decisive: it scaled cleanly under identical conditions, proving the ceiling was our code (the one path that bypassed the Pool), not the kernel/loopback/governor/mitigations. Full investigation + **reproducible environment setup**: `docs/plans/2026-06-19-perf-collapse-investigation.md`.
 
@@ -261,13 +266,13 @@ Throughput collapsed at t16+ (to ~half of t8) while the box sat ~70% idle. Root 
 
 **Multi-path + controlled re-measure** (2026-06-22, Threadripper 3970X 64T, governor pinned `performance`, **mitigations ON**; `examples/multipath.jai` + `bench/multipath.lua`):
 
-| wrk | master `/` (linear-scan, 1 route) | trie+macros `/` (1 route) | trie+macros `/`-only (10 routes) | trie+macros multi-path (10 routes) |
-|-----|----------------------------------:|--------------------------:|---------------------------------:|-----------------------------------:|
-| t1 / c10    |   115,147 |   122,259 |   119,493 |   111,234 |
-| t4 / c100   |   363,822 |   361,982 |   356,712 |   329,504 |
-| t8 / c500   |   694,938 |   684,318 |   684,838 |   617,301 |
-| t16 / c1000 | 1,330,888 | 1,330,377 | 1,300,997 | 1,331,494 |
-| t32 / c2000 | 1,302,279 | 1,291,733 | 1,295,974 | 1,246,224 |
+| wrk         | master `/` (linear-scan, 1 route) | trie+macros `/` (1 route) | trie+macros `/`-only (10 routes) | trie+macros multi-path (10 routes) |
+|-------------|----------------------------------:|--------------------------:|---------------------------------:|-----------------------------------:|
+| t1 / c10    |                           115,147 |                   122,259 |                          119,493 |                            111,234 |
+| t4 / c100   |                           363,822 |                   361,982 |                          356,712 |                            329,504 |
+| t8 / c500   |                           694,938 |                   684,318 |                          684,838 |                            617,301 |
+| t16 / c1000 |                         1,330,888 |                 1,330,377 |                        1,300,997 |                          1,331,494 |
+| t32 / c2000 |                         1,302,279 |                 1,291,733 |                        1,295,974 |                          1,246,224 |
 
 Zero socket errors / non-2xx / crashes across the whole grid (2000 concurrent connections, every config) — **does not break under pressure**. All findings are same-day controls on one box:
 - **No regression from the trie + compile-time macros.** Old master (linear-scan, 1 route) ≈ new (trie, 1 route) at every grid point — the segment trie and `#run` route macros are throughput-neutral vs the old `match_pattern` scan.
@@ -276,12 +281,24 @@ Zero socket errors / non-2xx / crashes across the whole grid (2000 concurrent co
 - **The 1.78–1.81M above was machine state, not code.** The *same old master code* benched today gives ~1.3M, not 1.8M — so 2026-06-19's peak was the more-favorable `mitigations=off` window (+~50% ≈ 1.95M). Today's mitigations-ON ceiling on this box is ~1.3M for both old and new code; no routing perf was lost.
 **Laptop re-validation, collapse fix (2026-06-20, i7-12800H, 20 logical cores / 6P+8E hybrid, Artix/OpenRC, transient `performance` governor, fixed code):**
 
-| wrk | pre-fix (M3+writev) | **post-fix** | nginx control |
-|-----|--------------------:|-------------:|--------------:|
-| t1 / c10    | 245,591 | 330,294   | 311,025 |
-| t4 / c100   | 630,698 | 979,749   | 867,517 |
-| t8 / c500   | 951,780 | 1,529,583 | 1,351,095 |
-| t16 / c1000 | 929,938 | **1,694,035** | 1,475,180 |
-| t32 / c2000 | 859,438 | **1,527,782** | 1,328,462 |
+| wrk         | pre-fix (M3+writev) |  **post-fix** | nginx control |
+|-------------|--------------------:|--------------:|--------------:|
+| t1 / c10    |             245,591 |       330,294 |       311,025 |
+| t4 / c100   |             630,698 |       979,749 |       867,517 |
+| t8 / c500   |             951,780 |     1,529,583 |     1,351,095 |
+| t16 / c1000 |             929,938 | **1,694,035** |     1,475,180 |
+| t32 / c2000 |             859,438 | **1,527,782** |     1,328,462 |
 
 **The collapse fix generalizes from AMD Zen2 to Intel hybrid.** Pre-fix, the laptop showed the *same* collapse signature as the desktop — t16/t32 (930K/859K) *below* t8 (952K), i.e. throughput regressing under load. Post-fix it scales correctly (+77–80% at t16/t32), confirming the root cause was the `tprint`→temp-storage overflow in `write_response`, not anything AMD/board-specific. jai-http now **beats the nginx control at every point** (+6–15%). The residual t32<t16 dip (1.53M vs 1.69M) is plain oversubscription (16 workers + 32 wrk threads on 20 cores), not collapse. As on the desktop, the box still had **CPU headroom at peak** (t32/c2000) — even on a mere 20 hybrid cores, kernel tuning (C-states, IRQ/flow steering, `SO_INCOMING_CPU`) could push further; not pursued, we're good for now. Reproduced via `bench.sh` (transient `performance` governor with per-CPU restore on exit — never persisted, to protect laptop battery).
+
+**fib lifts (2026-10-03, Threadripper 3970X 64T, governor `performance`, mitigations ON, beta 0.2.030):** baseline = branch point before any change; after = all eight tasks plus the two perf fixes. Responses now carry `Date` and omit `Connection` on HTTP/1.1 keep-alive.
+
+| wrk         |  baseline |     after | delta |
+|-------------|----------:|----------:|------:|
+| t1 / c10    |   131,893 |   138,334 | +4.9% |
+| t4 / c100   |   384,035 |   378,924 | -1.3% |
+| t8 / c500   |   695,974 |   699,597 | +0.5% |
+| t16 / c1000 | 1,360,956 | 1,371,443 | +0.8% |
+| t32 / c2000 | 1,342,797 | 1,312,911 | -2.2% |
+
+Within noise, confirmed by a same-session control against a fresh master build. t1/c10 is bimodal on this box (core placement: master measured 97K, 98K and 146K back to back), so single t1 runs mean little. Before the perf fixes the branch trailed master by 2.7-4.0% at t4/t32: `now_ms` went through `seconds_since_init` (TSC read plus S128 math) two or three times per request, and every header went through a `String_Builder`. Real-TCP slow-client check: on master a 4 MB body was silently truncated at 3.4 MB and the client hung; on the branch it arrives complete, and an 8 MB body is refused and logged (`MAX_PENDING_BYTES`). Full numbers: the appendices of `docs/plans/2026-10-03-fib-lifts-implementation.md`.

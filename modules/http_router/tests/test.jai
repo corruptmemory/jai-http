@@ -591,6 +591,191 @@ test_macro_route_equivalence :: () {
     print("  PASS: test_macro_route_equivalence\n");
 }
 
+// -- HEAD and Allow (Task 5) --
+
+head_probe_calls: s32;
+get_probe_calls:  s32;
+
+head_probe_handler :: (req: *Request, resp: *Response) { head_probe_calls += 1; resp.status_code = 200; }
+get_probe_handler  :: (req: *Request, resp: *Response) { get_probe_calls  += 1; resp.status_code = 200; resp.body = "get"; }
+
+response_header :: (resp: *Response, name: string) -> (value: string, found: bool) {
+    for i: 0..cast(s64) resp.header_count - 1 {
+        if string_equals(resp.headers[i].name, name)  return resp.headers[i].value, true;
+    }
+    empty: string;
+    return empty, false;
+}
+
+test_head_falls_back_to_get :: () {
+    router: Router;
+    get(*router, "/thing", get_probe_handler);
+    req := Request.{ method = "HEAD", path = "/thing" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 200 && get_probe_calls == 1, "HEAD must be served by the GET route; status %, calls %", resp.status_code, get_probe_calls);
+    assert(string_equals(resp.body, "get"), "the handler runs so Content-Length is right; the writer drops the body");
+    print("  PASS: test_head_falls_back_to_get\n");
+}
+
+test_explicit_head_route_wins :: () {
+    router: Router;
+    get(*router, "/thing", get_probe_handler);
+    head(*router, "/thing", head_probe_handler);
+    req := Request.{ method = "HEAD", path = "/thing" };
+    resp: Response;
+    get_probe_calls = 0;
+    head_probe_calls = 0;
+    dispatch(*router, *req, *resp);
+    assert(head_probe_calls == 1 && get_probe_calls == 0, "an explicit HEAD route beats the GET fallback; head %, get %", head_probe_calls, get_probe_calls);
+    print("  PASS: test_explicit_head_route_wins\n");
+}
+
+test_405_carries_allow :: () {
+    router: Router;
+    get(*router, "/thing", get_probe_handler);
+    post(*router, "/thing", get_probe_handler);
+    req := Request.{ method = "PUT", path = "/thing" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 405, "PUT on a GET/POST path is 405, got %", resp.status_code);
+    allow, found := response_header(*resp, "Allow");
+    assert(found, "405 must carry Allow");
+    assert(string_equals(allow, "GET, POST, HEAD"), "Allow lists registered methods plus HEAD for GET, got '%'", allow);
+    print("  PASS: test_405_carries_allow\n");
+}
+
+test_405_allow_without_get_has_no_head :: () {
+    router: Router;
+    post(*router, "/thing", get_probe_handler);
+    req := Request.{ method = "GET", path = "/thing" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 405, "GET on a POST-only path is 405, got %", resp.status_code);
+    allow, found := response_header(*resp, "Allow");
+    assert(found && string_equals(allow, "POST"), "no GET means no implied HEAD, got '%'", allow);
+    print("  PASS: test_405_allow_without_get_has_no_head\n");
+}
+
+test_mount_405_carries_allow :: () {
+    api: Router;
+    get(*api, "/x", get_probe_handler);
+    root: Router;
+    mount(*root, "/api", *api);
+    req := Request.{ method = "DELETE", path = "/api/x" };
+    resp: Response;
+    dispatch(*root, *req, *resp);
+    assert(resp.status_code == 405, "mounted 405, got %", resp.status_code);
+    allow, found := response_header(*resp, "Allow");
+    assert(found && string_equals(allow, "GET, HEAD"), "mounted routers set Allow too, got '%'", allow);
+    print("  PASS: test_mount_405_carries_allow\n");
+}
+
+// -- Hardening from the PR #5 review (2026-10-03); R-numbers match the review report --
+
+review_contains :: (haystack: string, needle: string) -> bool {
+    i := 0;
+    while i + needle.count <= haystack.count {
+        match := true;
+        for j: 0..needle.count - 1  if haystack[i + j] != needle[j] { match = false; break; }
+        if match  return true;
+        i += 1;
+    }
+    return false;
+}
+
+// R17. Allow is built from the FIRST leaf that matched the path but not the method. With
+// overlapping routes, backtracking reaches other leaves whose methods would succeed, and they are
+// left out: here POST /users/new is served by the :id route, yet Allow says only GET.
+// RFC 9110 §10.2.1: Allow lists the methods the target resource supports.
+test_allow_unions_overlapping_routes :: () {
+    router: Router;
+    get(*router, "/users/new", get_probe_handler);
+    post(*router, "/users/:id", get_probe_handler);
+    req := Request.{ method = "DELETE", path = "/users/new" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    allow, found := response_header(*resp, "Allow");
+    assert(resp.status_code == 405 && found && review_contains(allow, "GET") && review_contains(allow, "POST"), "Allow must include POST (served via /users/:id) as well as GET; status %, Allow '%'", resp.status_code, allow);
+    print("  PASS: test_allow_unions_overlapping_routes\n");
+}
+
+// R18. Mount prefixes are matched as raw string prefixes, not path segments: /apiary reaches the
+// sub-router mounted at /api as its route /ary.
+test_mount_prefix_is_segment_aligned :: () {
+    api: Router;
+    get(*api, "/ary", get_probe_handler);
+    root: Router;
+    mount(*root, "/api", *api);
+    req := Request.{ method = "GET", path = "/apiary" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*root, *req, *resp);
+    assert(resp.status_code == 404 && get_probe_calls == 0, "/apiary is not under the /api mount; status %, mounted handler ran %", resp.status_code, get_probe_calls);
+    print("  PASS: test_mount_prefix_is_segment_aligned\n");
+}
+
+// R19. A sub-router's own mounts are never consulted: dispatch_with_middleware matches only the
+// sub-router's trie, so /api/v1/users is a 404.
+test_nested_mounts_dispatch :: () {
+    v1: Router;
+    get(*v1, "/users", get_probe_handler);
+    api: Router;
+    mount(*api, "/v1", *v1);
+    root: Router;
+    mount(*root, "/api", *api);
+    req := Request.{ method = "GET", path = "/api/v1/users" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*root, *req, *resp);
+    assert(resp.status_code == 200 && get_probe_calls == 1, "a route in a mount inside a mount must be reachable; status %, handler ran %", resp.status_code, get_probe_calls);
+    print("  PASS: test_nested_mounts_dispatch\n");
+}
+
+// -- Hardening from the second review (Codex with the Jai reference) of the fix round: R25, R26 --
+
+// R25 (R19 incomplete). Stripping a mount prefix that ends in '/' (or is "/") drops the leading
+// slash, so the delegated path is `v1/users` and a nested `/v1` mount never matches.
+test_nested_mount_under_slash_prefix :: () {
+    v1: Router;
+    get(*v1, "/users", get_probe_handler);
+    api: Router;
+    mount(*api, "/v1", *v1);
+    root: Router;
+    mount(*root, "/api/", *api);
+    req := Request.{ method = "GET", path = "/api/v1/users" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*root, *req, *resp);
+
+    top: Router;
+    mount(*top, "/", *api);
+    req2 := Request.{ method = "GET", path = "/v1/users" };
+    resp2: Response;
+    dispatch(*top, *req2, *resp2);
+    assert(resp.status_code == 200 && resp2.status_code == 200 && get_probe_calls == 2, "nested mounts below '/api/' and '/' must resolve; statuses % and %, handler ran %", resp.status_code, resp2.status_code, get_probe_calls);
+    print("  PASS: test_nested_mount_under_slash_prefix\n");
+}
+
+// R26 (partly a regression from the R17 fix). allow_header_for kept at most 32 methods, so a
+// path with more registered methods silently lost GET (and its implied HEAD) from Allow.
+test_allow_has_no_silent_caps :: () {
+    methods :: string.["M01","M02","M03","M04","M05","M06","M07","M08","M09","M10","M11",
+                       "M12","M13","M14","M15","M16","M17","M18","M19","M20","M21","M22",
+                       "M23","M24","M25","M26","M27","M28","M29","M30","M31","M32","M33"];
+    router: Router;
+    for methods  route(*router, it, "/x", get_probe_handler);
+    get(*router, "/x", get_probe_handler);
+    req := Request.{ method = "DELETE", path = "/x" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    allow, found := response_header(*resp, "Allow");
+    assert(resp.status_code == 405 && found && review_contains(allow, "M33") && review_contains(allow, "GET") && review_contains(allow, "HEAD"), "Allow must list all 34 methods plus HEAD; status %, Allow ends '...%'",
+        resp.status_code, ifx allow.count > 30 then string.{30, allow.data + allow.count - 30} else allow);
+    print("  PASS: test_allow_has_no_silent_caps\n");
+}
+
 main :: () {
     print("Running http_router tests...\n\n");
 
@@ -644,6 +829,18 @@ main :: () {
     print("\nRoute macros:\n");
     test_macro_head();
     test_macro_route_equivalence();
+
+    print("\nHEAD and Allow:\n");
+    test_head_falls_back_to_get();
+    test_explicit_head_route_wins();
+    test_405_carries_allow();
+    test_405_allow_without_get_has_no_head();
+    test_mount_405_carries_allow();
+    test_allow_unions_overlapping_routes();
+    test_allow_has_no_silent_caps();
+    test_mount_prefix_is_segment_aligned();
+    test_nested_mounts_dispatch();
+    test_nested_mount_under_slash_prefix();
 
     print("\nAll http_router tests passed.\n");
 }

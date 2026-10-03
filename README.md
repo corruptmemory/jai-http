@@ -19,19 +19,19 @@ Beats nginx on the same hardware. Benchmarked with `wrk` against a release build
 
 **AMD Threadripper 3970X (32C / 64T):**
 
-| wrk | jai-http | nginx (control) |
-|-----|---------:|----------------:|
-| t8 / c500   | 1.03M | 1.03M |
-| t16 / c1000 | **1.78M** | 1.65M |
-| t32 / c2000 | **1.81M** | 1.56M |
+| wrk         |  jai-http | nginx (control) |
+|-------------|----------:|----------------:|
+| t8 / c500   |     1.03M |           1.03M |
+| t16 / c1000 | **1.78M** |           1.65M |
+| t32 / c2000 | **1.81M** |           1.56M |
 
 **Intel i7-12800H laptop (20 logical / 6P+8E):**
 
-| wrk | jai-http | nginx (control) |
-|-----|---------:|----------------:|
-| t8 / c500   | **1.53M** | 1.35M |
-| t16 / c1000 | **1.69M** | 1.48M |
-| t32 / c2000 | **1.53M** | 1.33M |
+| wrk         |  jai-http | nginx (control) |
+|-------------|----------:|----------------:|
+| t8 / c500   | **1.53M** |           1.35M |
+| t16 / c1000 | **1.69M** |           1.48M |
+| t32 / c2000 | **1.53M** |           1.33M |
 
 Earlier builds suffered a high-concurrency throughput *collapse*, traced to a per-response
 temporary-storage allocation in `write_response`; routing every per-request allocation through the
@@ -199,25 +199,41 @@ Run a built example:
 
 ## Module Parameters
 
-All tunables are compile-time module parameters with sensible defaults:
+All tunables are compile-time module parameters with sensible defaults.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `CACHE_LINE_SIZE` | 64 | Cache line size for alignment |
-| `READ_BUFFER_SIZE` | 4096 | Per-connection read buffer |
-| `MAX_HEADERS` | 64 | Max headers per request/response |
-| `MAX_ROUTES` | 128 | Max routes per router |
-| `MAX_PARAMS` | 8 | Max path params per route |
-| `MAX_MIDDLEWARE` | 16 | Max middleware per router |
-| `MAX_MOUNTS` | 16 | Max sub-router mounts |
-| `MAX_FORM_VALUES` | 64 | Max form fields |
-| `MAX_MULTIPART_PARTS` | 16 | Max multipart parts |
-| `LISTEN_BACKLOG` | 1024 | TCP listen backlog |
+**`http_server`.** Every parameter is program-wide: the main program sets it once, and every
+module that imports `http_server` (including `http_router`) sees the same value.
 
-Override at import time:
+| Parameter             | Default | Description                                                       |
+|-----------------------|---------|-------------------------------------------------------------------|
+| `Handler_Data`        | `void`  | Type of the bound state handlers read from `context.handler_data` |
+| `READ_BUFFER_SIZE`    | 4096    | Per-connection read buffer; a request's head and body must fit    |
+| `MAX_HEADERS`         | 64      | Max headers per request/response (more is refused with 431)       |
+| `MAX_FORM_VALUES`     | 64      | Max form fields                                                   |
+| `MAX_MULTIPART_PARTS` | 16      | Max multipart parts                                               |
+| `LISTEN_BACKLOG`      | 1024    | TCP listen backlog                                                |
+| `MAX_PENDING_BYTES`   | 1048576 | Max unsent response bytes queued per connection for a slow reader |
+| `IDLE_TIMEOUT_MS`     | 60000   | Kept-alive connection between requests (0 disables)               |
+| `HEADER_TIMEOUT_MS`   | 10000   | From a request's first byte until its headers are complete        |
+| `BODY_TIMEOUT_MS`     | 30000   | From a request's first byte until its body is complete            |
+| `WRITE_TIMEOUT_MS`    | 30000   | A queued response making no progress toward the client            |
+| `LINGER_TIMEOUT_MS`   | 5000    | Lingering close: discard input until the client's EOF             |
+
+**`http_router`.** These describe the router and are set where `http_router` is imported.
+
+| Parameter           | Default | Description                       |
+|---------------------|---------|-----------------------------------|
+| `MAX_PARAMS`        | 8       | Max path params per route         |
+| `MAX_MIDDLEWARE`    | 16      | Max middleware per router         |
+| `MAX_MOUNTS`        | 16      | Max sub-router mounts             |
+| `MAX_PATH_SEGMENTS` | 32      | Max segments in a route's pattern |
+
+Override `http_server` parameters in the main program's import, in the second (program-wide)
+parameter list:
 
 ```jai
-#import "http_server"(MAX_ROUTES = 256, READ_BUFFER_SIZE = 8192);
+#import "http_server"()(Handler_Data = http_router.Router, READ_BUFFER_SIZE = 8192);
+http_router :: #import "http_router"(MAX_PARAMS = 16);
 ```
 
 ## Architecture
