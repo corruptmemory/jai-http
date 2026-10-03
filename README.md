@@ -204,20 +204,22 @@ All tunables are compile-time module parameters with sensible defaults.
 **`http_server`.** Every parameter is program-wide: the main program sets it once, and every
 module that imports `http_server` (including `http_router`) sees the same value.
 
-| Parameter             | Default | Description                                                       |
-|-----------------------|---------|-------------------------------------------------------------------|
-| `Handler_Data`        | `void`  | Type of the bound state handlers read from `context.handler_data` |
-| `READ_BUFFER_SIZE`    | 4096    | Per-connection read buffer; a request's head and body must fit    |
-| `MAX_HEADERS`         | 64      | Max headers per request/response (more is refused with 431)       |
-| `MAX_FORM_VALUES`     | 64      | Max form fields                                                   |
-| `MAX_MULTIPART_PARTS` | 16      | Max multipart parts                                               |
-| `LISTEN_BACKLOG`      | 1024    | TCP listen backlog                                                |
-| `MAX_PENDING_BYTES`   | 1048576 | Max unsent response bytes queued per connection for a slow reader |
-| `IDLE_TIMEOUT_MS`     | 60000   | Kept-alive connection between requests (0 disables)               |
-| `HEADER_TIMEOUT_MS`   | 10000   | From a request's first byte until its headers are complete        |
-| `BODY_TIMEOUT_MS`     | 30000   | From a request's first byte until its body is complete            |
-| `WRITE_TIMEOUT_MS`    | 30000   | A queued response making no progress toward the client            |
-| `LINGER_TIMEOUT_MS`   | 5000    | Lingering close: discard input until the client's EOF             |
+| Parameter                | Default  | Description                                                                                                          |
+|--------------------------|----------|----------------------------------------------------------------------------------------------------------------------|
+| `Handler_Data`           | `void`   | Type of the bound state handlers read from `context.handler_data`                                                    |
+| `READ_BUFFER_SIZE`       | 4096     | Per-connection read buffer; a request's head and body must fit                                                       |
+| `MAX_HEADERS`            | 64       | Max headers per request/response (more is refused with 431)                                                          |
+| `MAX_FORM_VALUES`        | 64       | Max form fields                                                                                                      |
+| `MAX_MULTIPART_PARTS`    | 16       | Max multipart parts                                                                                                  |
+| `LISTEN_BACKLOG`         | 1024     | TCP listen backlog                                                                                                   |
+| `MAX_PENDING_BYTES`      | 1048576  | Max unsent response bytes queued per connection for a slow reader                                                    |
+| `MAX_PENDING_PER_WORKER` | 67108864 | Response bytes all of one worker's connections may queue together                                                    |
+| `IDLE_TIMEOUT_MS`        | 60000    | Kept-alive connection between requests (0 disables)                                                                  |
+| `HEADER_TIMEOUT_MS`      | 10000    | Until a request's headers are complete: from accept for a connection's first request, from the first byte after that |
+| `BODY_TIMEOUT_MS`        | 30000    | From a request's first byte until its body is complete                                                               |
+| `WRITE_TIMEOUT_MS`       | 30000    | A queued response making no progress toward the client                                                               |
+| `MIN_SEND_RATE`          | 16384    | Bytes/s a queued response must average after the `WRITE_TIMEOUT_MS` grace (0: no floor)                              |
+| `LINGER_TIMEOUT_MS`      | 5000     | Lingering close: discard input until the client's EOF                                                                |
 
 **`http_router`.** These describe the router and are set where `http_router` is imported.
 

@@ -1,8 +1,7 @@
 # Design: chunked request bodies and slow-client defenses
 
 **Date:** 2026-10-03
-**Status:** direction approved in chat 2026-10-03; this spec is under review. The implementation
-plan follows its approval.
+**Status:** implemented (plan: 2026-10-03-chunked-and-slow-clients-implementation.md).
 **Branch:** `chunked-slow-clients`, from master after PR #5 (fib-lifts) merged.
 **Origin:** the two open items from PR #5's review: chunked request bodies are refused with 501
 (R5), and slow readers can pin memory (D1).

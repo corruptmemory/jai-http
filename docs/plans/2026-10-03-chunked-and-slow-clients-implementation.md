@@ -1854,10 +1854,12 @@ Write `$SCRATCH/pr-body.md` first, with these sections: **Summary** (one line pe
 
 ## Appendix: wrk A/B (Task 6, same session)
 
-| wrk         | master | branch | delta |
-|-------------|-------:|-------:|------:|
-| t1 / c10    |        |        |       |
-| t4 / c100   |        |        |       |
-| t8 / c500   |        |        |       |
-| t16 / c1000 |        |        |       |
-| t32 / c2000 |        |        |       |
+| wrk         |    master |    branch | delta |
+|-------------|----------:|----------:|------:|
+| t1 / c10    |   119,862 |   113,036 | -5.7% |
+| t4 / c100   |   359,893 |   383,461 | +6.5% |
+| t8 / c500   |   702,636 |   700,748 | -0.3% |
+| t16 / c1000 | 1,363,381 | 1,388,513 | +1.8% |
+| t32 / c2000 | 1,293,530 | 1,309,505 | +1.2% |
+
+Zero socket errors and no non-2xx responses at every point. The first attempt was invalid: a scratch server from the Step 2 probes still held port 9090 through SO_REUSEPORT.
