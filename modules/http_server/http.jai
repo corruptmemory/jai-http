@@ -78,12 +78,12 @@ parse_request :: (c: *Connection) -> Parse_Result {
 
         // Find first space (end of method)
         sp1 := find_byte(c.buf.data, line_start, crlf, #char " ");
-        if sp1 < 0 return .ERROR;
+        if sp1 < 0 { c.parse_error = .MALFORMED; return .ERROR; }
         c.req.method = make_view(c.buf.data, line_start, sp1);
 
         // Find second space (end of URI)
         sp2 := find_byte(c.buf.data, sp1 + 1, crlf, #char " ");
-        if sp2 < 0 return .ERROR;
+        if sp2 < 0 { c.parse_error = .MALFORMED; return .ERROR; }
 
         // Split URI into path and query string at '?'
         qmark := find_byte(c.buf.data, sp1 + 1, sp2, #char "?");
@@ -116,10 +116,10 @@ parse_request :: (c: *Connection) -> Parse_Result {
                 cl_str, has_cl := get_header(*c.req, "Content-Length");
                 if has_cl {
                     cl := parse_s64(cl_str);
-                    if cl < 0 return .ERROR;
+                    if cl < 0 { c.parse_error = .MALFORMED; return .ERROR; }
                     if cl > 0 {
                         max_body := cast(s64) READ_BUFFER_SIZE - c.parse_offset;
-                        if cl > max_body return .ERROR;  // Body won't fit in buffer
+                        if cl > max_body { c.parse_error = .BODY_TOO_LARGE; return .ERROR; }   // Body won't fit in buffer
                         c.req.content_length = cl;
                         c.parse_state = .BODY;
                         break;  // Fall through to BODY check below
@@ -132,7 +132,7 @@ parse_request :: (c: *Connection) -> Parse_Result {
 
             // Find colon separator
             colon := find_byte(c.buf.data, c.parse_offset, crlf, #char ":");
-            if colon < 0 return .ERROR;
+            if colon < 0 { c.parse_error = .MALFORMED; return .ERROR; }
 
             if c.req.header_count < MAX_HEADERS {
                 // Skip colon and leading whitespace before the value
@@ -164,6 +164,7 @@ parse_request :: (c: *Connection) -> Parse_Result {
     }
 
     if c.parse_state == .COMPLETE return .COMPLETE;
+    c.parse_error = .MALFORMED;
     return .ERROR;
 }
 
@@ -183,6 +184,7 @@ reset_for_next_request :: (c: *Connection) {
     c.req.header_count = 0;
     c.req.keep_alive = false;
     c.req.content_length = 0;
+    c.request_start_ms = ifx remaining > 0 then now_ms() else 0;   // a pipelined next request is timed from now
 }
 
 Write_Result :: enum u8 #specified {

@@ -1049,6 +1049,279 @@ test_canned_responses :: () {
     print("  PASS: test_canned_responses\n");
 }
 
+// -- Fake worker for event-handling tests --
+
+test_handler_calls: s32;
+
+ok_handler :: (req: *Request, resp: *Response) {
+    test_handler_calls += 1;
+    resp.status_code = 200;
+    resp.body = "ok";
+}
+
+big_test_body: string;
+
+big_handler :: (req: *Request, resp: *Response) {
+    test_handler_calls += 1;
+    resp.status_code = 200;
+    resp.body = big_test_body;
+}
+
+make_test_worker :: (w: *Worker, handler: Handler) {
+    ok := init_event_engine(*w.engine);
+    assert(ok, "init_event_engine failed");
+    init_pool(*w.pool, 4);
+    set_allocators(*w.request_pool);
+    w.handler      = handler;
+    w.handler_data = null;
+    test_handler_calls = 0;
+}
+
+destroy_test_worker :: (w: *Worker) {
+    destroy_event_engine(*w.engine);
+    destroy_pool(*w.pool);
+    release(*w.request_pool);
+}
+
+// Register a server-side fd as a live connection on the fake worker, as accept_connections would.
+attach :: (w: *Worker, fd: s32) -> *Connection {
+    c := get_connection(*w.pool);
+    assert(c != null, "pool exhausted");
+    c.fd = fd;
+    c.last_activity_ms = now_ms();
+    ok := epoll_add_connection(*w.engine, c, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+    assert(ok, "epoll_add_connection failed");
+    return c;
+}
+
+send_to_server :: (peer: s32, s: string) {
+    n := write(peer, s.data, xx s.count);
+    assert(n == s.count, "short write from peer: % of %", n, s.count);
+}
+
+// -- Event handling (Task 4) --
+
+test_handle_client_answers_before_honoring_rdhup :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    shutdown(peer, .WR);   // request and FIN together: IN and RDHUP arrive in one event
+
+    handle_client(*w, c, EPOLLIN | EPOLLRDHUP);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    out := as_string(got);
+    assert(test_handler_calls == 1, "handler must run once, ran %", test_handler_calls);
+    assert(starts_with(out, "HTTP/1.1 200 OK"), "the request must be answered before the close, got '%'", out);
+    assert(c.state == .FREE, "connection closes after the response");
+    print("  PASS: test_handle_client_answers_before_honoring_rdhup\n");
+}
+
+test_handle_client_pending_blocks_dispatch :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "the first response must stall");
+    assert(test_handler_calls == 1, "the second request must wait for the drain; handler ran % times", test_handler_calls);
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while test_handler_calls < 2 || c.pending.count > 0 {
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    drain_peer(peer, *got);
+    out := as_string(got);
+    assert(test_handler_calls == 2, "both requests served, got %", test_handler_calls);
+    assert(count_occurrences(out, "HTTP/1.1 200 OK\r\n") == 2, "two responses on the wire, got '%'", count_occurrences(out, "HTTP/1.1 200 OK\r\n"));
+    body_x := count_byte(out, #char "x") - count_occurrences(out, "text/plain");   // each header has one x
+    assert(body_x == 2 * big_test_body.count, "both bodies intact and in full: % of %", body_x, 2 * big_test_body.count);
+    assert(c.state == .ACTIVE, "keep-alive connection stays open");
+    close_connection(*w, c);
+    print("  PASS: test_handle_client_pending_blocks_dispatch\n");
+}
+
+test_handle_client_full_buffer_while_pending_stalls_read :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    // One request, then enough pipelined requests to overflow the 4096-byte read buffer.
+    one := "GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_to_server(peer, one);
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: first response must stall");
+    // ~8 KB of requests behind the stalled response, in ONE write: AF_UNIX charges every write
+    // its full skb truesize (~1 KB for 28 bytes), so 300 small writes overflow the peer's SO_SNDBUF.
+    batch: [..] u8;
+    defer array_free(batch);
+    for 1..300  append_bytes(*batch, one.data, one.count);
+    send_to_server(peer, as_string(batch));
+    handle_client(*w, c, EPOLLIN);
+    assert(c.state == .ACTIVE, "a full buffer behind pending output is not a 431");
+    assert(c.read_stalled, "read must be marked stalled, not refused");
+    assert(test_handler_calls == 1, "nothing dispatched while pending, got %", test_handler_calls);
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while test_handler_calls < 301 || c.pending.count > 0 {
+        got.count = 0;   // ~77 MB crosses the wire; keep only the current chunk
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 1000000, "never drained; handler calls = %", test_handler_calls);
+    }
+    assert(test_handler_calls == 301, "every pipelined request is eventually served, got %", test_handler_calls);
+    close_connection(*w, c);
+    print("  PASS: test_handle_client_full_buffer_while_pending_stalls_read\n");
+}
+
+test_handle_client_oversized_header_gets_431 :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    pad := big_body(5000);   // one header line longer than READ_BUFFER_SIZE, no terminator
+    defer free(pad);
+    send_to_server(peer, "GET / HTTP/1.1\r\nX-Pad: ");
+    send_to_server(peer, pad);
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(starts_with(as_string(got), "HTTP/1.1 431 "), "oversized header gets 431, got '%'", as_string(got));
+    assert(c.state == .FREE && test_handler_calls == 0, "refused and closed without a handler run");
+    print("  PASS: test_handle_client_oversized_header_gets_431\n");
+}
+
+test_handle_client_oversized_body_gets_413 :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(starts_with(as_string(got), "HTTP/1.1 413 "), "a body past the read buffer gets 413, got '%'", as_string(got));
+    assert(c.state == .FREE && test_handler_calls == 0, "refused and closed without a handler run");
+    print("  PASS: test_handle_client_oversized_body_gets_413\n");
+}
+
+test_handle_client_malformed_gets_400 :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GARBAGE\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(starts_with(as_string(got), "HTTP/1.1 400 "), "a malformed request line gets 400, got '%'", as_string(got));
+    assert(c.state == .FREE && test_handler_calls == 0, "refused and closed without a handler run");
+    print("  PASS: test_handle_client_malformed_gets_400\n");
+}
+
+test_handle_client_out_with_nothing_queued_is_ignored :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    handle_client(*w, c, EPOLLOUT);   // the registration edge: nothing to do
+    assert(c.state == .ACTIVE && test_handler_calls == 0, "a spurious OUT must change nothing");
+    close_connection(*w, c);
+    print("  PASS: test_handle_client_out_with_nothing_queued_is_ignored\n");
+}
+
+test_parse_error_classification :: () {
+    c: Connection;
+    bad := "GARBAGE\r\n\r\n";
+    memcpy(c.buf.data, bad.data, bad.count);
+    c.bytes_used = bad.count;
+    assert(parse_request(*c) == .ERROR && c.parse_error == .MALFORMED, "no spaces in the request line is MALFORMED");
+
+    c2: Connection;
+    big := "POST / HTTP/1.1\r\nContent-Length: 100000\r\n\r\n";
+    memcpy(c2.buf.data, big.data, big.count);
+    c2.bytes_used = big.count;
+    assert(parse_request(*c2) == .ERROR && c2.parse_error == .BODY_TOO_LARGE, "Content-Length past the buffer is BODY_TOO_LARGE");
+    print("  PASS: test_parse_error_classification\n");
+}
+
+test_handle_client_half_close_serves_pipelined :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    // Two pipelined keep-alive requests, then the peer's FIN, all before the server looks.
+    send_to_server(peer, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    shutdown(peer, .WR);
+    handle_client(*w, c, EPOLLIN | EPOLLRDHUP);
+    assert(c.state == .ACTIVE && c.pending.count > 0, "the first response stalls; the connection must wait for it");
+    assert(c.peer_closed && !c.close_after_send, "a FIN is not a Connection: close; the second request is still owed");
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while c.state == .ACTIVE {
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    drain_peer(peer, *got);
+    out := as_string(got);
+    assert(test_handler_calls == 2, "both pipelined requests answered before the close, got %", test_handler_calls);
+    assert(count_occurrences(out, "HTTP/1.1 200 OK\r\n") == 2, "two responses on the wire");
+    print("  PASS: test_handle_client_half_close_serves_pipelined\n");
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -1076,6 +1349,17 @@ main :: () {
     test_write_response_connection_header_rules();
     test_write_response_date_header();
     test_canned_responses();
+
+    print("\nEvent handling:\n");
+    test_parse_error_classification();
+    test_handle_client_out_with_nothing_queued_is_ignored();
+    test_handle_client_answers_before_honoring_rdhup();
+    test_handle_client_pending_blocks_dispatch();
+    test_handle_client_full_buffer_while_pending_stalls_read();
+    test_handle_client_oversized_header_gets_431();
+    test_handle_client_oversized_body_gets_413();
+    test_handle_client_malformed_gets_400();
+    test_handle_client_half_close_serves_pipelined();
 
     print("\nEvent engine:\n");
     test_encode_decode_connection_ptr();
@@ -1151,3 +1435,5 @@ main :: () {
 #import "http_server";
 #import "Socket";
 #import "POSIX";
+#import "Pool";
+#import "Linux";

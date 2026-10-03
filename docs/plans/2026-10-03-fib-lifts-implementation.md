@@ -857,7 +857,7 @@ git commit -m "http_server: writer reports SENT/PENDING/ERROR, queues the unsent
   - `close_connection :: (w: *Worker, c: *Connection)`, `accept_connections :: (w: *Worker)`
   - `Worker.date: string` (empty until Task 7 fills it)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Fake-worker helpers, appended to the test file after the socket helpers:
 
@@ -1116,12 +1116,12 @@ Register in `main`:
     test_handle_client_malformed_gets_400();
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: compile error, `handle_client` is not visible (it is under `#scope_file`) or `now_ms` undeclared.
 
-- [ ] **Step 3: Classify parse errors in `http.jai`**
+- [x] **Step 3: Classify parse errors in `http.jai`**
 
 In `parse_request`, every `return .ERROR;` sets the cause first. The two in the request-line and header sections become:
 
@@ -1158,7 +1158,7 @@ The final fallthrough `return .ERROR;` at the bottom of `parse_request` becomes:
     return .ERROR;
 ```
 
-- [ ] **Step 4: Rewrite the connection handling in `server.jai`**
+- [x] **Step 4: Rewrite the connection handling in `server.jai`**
 
 Add `date: string;` to `Worker` (after `request_pool`). Then replace everything from `accept_connections` through `close_connection` with the block below, and move the `#scope_file` line so that only `worker_thread_proc`, `worker_listen`, `worker_run` and `destroy_worker` remain file-scoped (place the new procs **above** `#scope_file`, after `server_run`).
 
@@ -1338,12 +1338,12 @@ In `reset_for_next_request` (`http.jai`), add at the end so a pipelined next req
     c.request_start_ms = ifx remaining > 0 then now_ms() else 0;
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: the eight new event-handling tests `PASS`; all suites green.
 
-- [ ] **Step 6: Build the examples and smoke one**
+- [x] **Step 6: Build the examples and smoke one**
 
 Run: `~/jai/jai/bin/jai-linux first.jai -`
 Expected: all four examples build unchanged.
@@ -1356,7 +1356,7 @@ kill %1
 ```
 Expected: `HTTP/1.1 200 OK` with no `Connection` header on the first; `Connection: close` on the second.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add modules/http_server/server.jai modules/http_server/http.jai modules/http_server/tests/test.jai

@@ -25,6 +25,7 @@ Connection :: struct {
     pending_offset:   s64;      // bytes of `pending` already handed to the kernel
     close_after_send: bool;     // close once `pending` drains
     read_stalled:     bool;     // read buffer filled while output was pending; re-read after drain
+    peer_closed:      bool;     // the peer finished sending (EOF / RDHUP); close once every answer drains
 
     // Timeouts: monotonic milliseconds from now_ms() in server.jai
     last_activity_ms: s64;      // accept, or the last successful read / write progress
@@ -94,6 +95,7 @@ get_connection :: (pool: *Connection_Pool) -> *Connection {
     release_pending(c);
     c.close_after_send = false;
     c.read_stalled     = false;
+    c.peer_closed      = false;
     c.last_activity_ms = 0;
     c.request_start_ms = 0;
 
@@ -119,10 +121,12 @@ release_pending :: (c: *Connection) {
     c.pending_offset = 0;
 }
 
-// Append raw bytes to a resizable byte array using the array's own allocator.
+// Append raw bytes to a resizable byte array using the array's own allocator. Grows by doubling:
+// array_reserve allocates exactly what it is asked for, so repeated appends would be quadratic.
 append_bytes :: (arr: *[..] u8, data: *u8, count: s64) {
     if count <= 0  return;
-    Basic.array_reserve(arr, arr.count + count);
+    needed := arr.count + count;
+    if needed > arr.allocated  Basic.array_reserve(arr, ifx needed > 2 * arr.allocated then needed else 2 * arr.allocated);
     memcpy(arr.data + arr.count, data, count);
     arr.count += count;
 }

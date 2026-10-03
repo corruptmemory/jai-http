@@ -19,6 +19,7 @@ Worker :: struct {
     handler:      Handler;
     handler_data: *Handler_Data;
     request_pool: Pool_Module.Pool;  // Per-request allocator, reset after each dispatch
+    date:         string;            // Date header value for responses; empty omits the header
     thread:       Thread;
 }
 
@@ -125,6 +126,191 @@ server_run :: (server: *Server) {
     }
 }
 
+// Monotonic milliseconds for the timeout stamps.
+now_ms :: inline () -> s64 {
+    return cast(s64) (Basic.seconds_since_init() * 1000.0);
+}
+
+accept_connections :: (w: *Worker) {
+    while true {
+        addr: sockaddr_in;
+        addrlen: u32 = size_of(sockaddr_in);
+        conn_fd := accept4(w.listen_fd, cast(*sockaddr) *addr, xx *addrlen, .NONBLOCK | .CLOEXEC);
+
+        if conn_fd < 0 break;  // EAGAIN — no more pending
+
+        // Disable Nagle's algorithm — send response bytes immediately
+        nodelay: s32 = 1;
+        setsockopt(conn_fd, xx IPPROTO.TCP, TCP_NODELAY, xx *nodelay, size_of(type_of(nodelay)));
+
+        c := get_connection(*w.pool);
+        if c == null {
+            Basic.log("fd %: connection pool exhausted; dropping", conn_fd);
+            close(conn_fd);
+            continue;
+        }
+        c.fd = conn_fd;
+        c.last_activity_ms = now_ms();
+
+        // Write interest is armed once for the connection's whole life. Edge-triggered OUT only
+        // fires on the full-to-writable transition, so it costs nothing while there is room, and
+        // a stalled response never needs an epoll_ctl MOD to be resumed.
+        ok := epoll_add_connection(*w.engine, c, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+        if !ok {
+            close(conn_fd);
+            free_connection(*w.pool, c);
+        }
+    }
+}
+
+handle_client :: (w: *Worker, c: *Connection, events: u32) {
+    // 1. Output first. OUT also fires on registration and after every drain; with nothing
+    //    queued it means nothing.
+    if (events & EPOLLOUT) != 0 && c.pending.count > 0 {
+        r := flush_pending(c);
+        if r == .ERROR { close_connection(w, c); return; }
+        c.last_activity_ms = now_ms();
+        if r == .SENT && !resume_after_drain(w, c)  return;
+    }
+
+    // 2. Input next, so a request that arrived together with the peer's FIN is still answered.
+    if (events & EPOLLIN) != 0 {
+        if !read_and_dispatch(w, c)  return;
+    }
+
+    // 3. Hangups last. ERR/HUP: the socket is unusable. RDHUP: the peer half-closed its write
+    //    side and can still read a pending response.
+    if (events & (EPOLLERR | EPOLLHUP)) != 0 { close_connection(w, c); return; }
+    if (events & EPOLLRDHUP) != 0 {
+        if c.pending.count > 0  c.peer_closed = true;
+        else                    close_connection(w, c);
+    }
+}
+
+// The pending tail just drained. Close after a final (Connection: close) response; otherwise
+// serve the requests the read buffer already holds, re-read a socket whose bytes arrived while
+// the buffer was full (no new edge will announce them), and close once a peer that has finished
+// sending holds every answer. Returns false when the connection was closed.
+resume_after_drain :: (w: *Worker, c: *Connection) -> bool {
+    if c.close_after_send { close_connection(w, c); return false; }
+    if !dispatch_buffered(w, c)  return false;
+    if c.read_stalled && c.pending.count == 0 {
+        c.read_stalled = false;
+        if !read_and_dispatch(w, c)  return false;
+    }
+    if c.peer_closed && c.pending.count == 0 { close_connection(w, c); return false; }
+    return true;
+}
+
+// Read until EAGAIN (edge-triggered), dispatching complete requests as they land unless output
+// is pending. Returns false when the connection was closed.
+read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
+    while true {
+        available := READ_BUFFER_SIZE - c.bytes_used;
+        if available <= 0 {
+            if c.pending.count > 0 {
+                // Pipelined requests are waiting behind a stalled response. The socket keeps the
+                // rest; the drain re-reads it, since no new edge will announce bytes already there.
+                c.read_stalled = true;
+                return true;
+            }
+            // A full buffer with no complete request: the header block alone exceeds READ_BUFFER_SIZE.
+            refuse_and_close(w, c, 431);
+            return false;
+        }
+
+        n := read(c.fd, c.buf.data + c.bytes_used, xx available);
+        if n < 0 {
+            err := errno();
+            if err == EAGAIN || err == EWOULDBLOCK  return true;
+            if err == EINTR  continue;
+            if err != ECONNRESET  Basic.log_error("read failed on fd %: errno %", c.fd, err);
+            close_connection(w, c);
+            return false;
+        }
+        if n == 0 {
+            // EOF: answer whatever is complete, then close once any pending tail has gone.
+            if !dispatch_buffered(w, c)  return false;
+            if c.pending.count > 0 { c.peer_closed = true; return true; }
+            close_connection(w, c);
+            return false;
+        }
+
+        c.bytes_used += n;
+        c.last_activity_ms = now_ms();
+        if c.request_start_ms == 0  c.request_start_ms = c.last_activity_ms;
+        if !dispatch_buffered(w, c)  return false;
+    }
+    return true;   // unreachable; `while true` alone does not satisfy the return-path check
+}
+
+// Parse and serve every complete request in the read buffer. Stops, without reading more, as
+// soon as a response goes PENDING. Returns false when the connection was closed.
+dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
+    while c.pending.count == 0 {
+        result := parse_request(c);
+        if result == .INCOMPLETE  return true;
+        if result == .ERROR {
+            status: u16 = 400;
+            if c.parse_error == .BODY_TOO_LARGE  status = 413;
+            refuse_and_close(w, c, status);
+            return false;
+        }
+
+        // COMPLETE. The request has fully arrived: no deadline bounds the handler.
+        c.request_start_ms = 0;
+        response: Response;
+        wr: Write_Result;
+
+        // Invoke the handler under the per-request pool allocator, with the handler's bound state
+        // poked into the context. The core is routing-agnostic — for a routed server, w.handler is
+        // router.jai's adapter. The response is written inside the same context so the header is
+        // built from the Pool (never temporary storage), and any unsent tail is copied to the heap
+        // before the Pool is reset below.
+        new_ctx := context;
+        new_ctx.allocator    = .{Pool_Module.pool_allocator_proc, *w.request_pool};
+        new_ctx.handler_data = w.handler_data;
+        push_context new_ctx {
+            if w.handler  w.handler(*c.req, *response);
+            wr = write_response(c, *c.req, *response, w.date);
+        }
+        Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
+        c.last_activity_ms = now_ms();
+
+        if wr == .ERROR { close_connection(w, c); return false; }
+        keep_alive := c.req.keep_alive;
+        reset_for_next_request(c);
+        if wr == .PENDING {
+            if !keep_alive  c.close_after_send = true;
+            return true;    // dispatch resumes when EPOLLOUT drains the tail
+        }
+        if !keep_alive { close_connection(w, c); return false; }
+    }
+    return true;
+}
+
+// Answer a request the server will not serve with a canned status, then close.
+refuse_and_close :: (w: *Worker, c: *Connection, status: u16) {
+    Basic.log("fd %: refusing request with %", c.fd, status);
+    send_canned(c.fd, status);
+    // Closing with unread bytes in the receive queue makes the kernel reset the connection, and
+    // the reset can destroy the reply before the client reads it. Half-close so the reply is
+    // followed by a FIN, then discard what has already arrived. Bounded: a client still streaming
+    // a large body can still see a reset; a full lingering close would need a timer state.
+    shutdown(c.fd, .WR);
+    discard: [4096] u8;
+    for 1..16 {
+        if read(c.fd, discard.data, discard.count) <= 0  break;
+    }
+    close_connection(w, c);
+}
+
+close_connection :: (w: *Worker, c: *Connection) {
+    epoll_del_connection(*w.engine, c);
+    close(c.fd);
+    free_connection(*w.pool, c);
+}
+
 #scope_file
 
 worker_thread_proc :: (thread: *Thread) -> s64 {
@@ -214,108 +400,6 @@ destroy_worker :: (w: *Worker) {
     destroy_event_engine(*w.engine);
     destroy_pool(*w.pool);
     Pool_Module.release(*w.request_pool);
-}
-
-accept_connections :: (w: *Worker) {
-    while true {
-        addr: sockaddr_in;
-        addrlen: u32 = size_of(sockaddr_in);
-        conn_fd := accept4(w.listen_fd, cast(*sockaddr) *addr, xx *addrlen, .NONBLOCK | .CLOEXEC);
-
-        if conn_fd < 0 break;  // EAGAIN — no more pending
-
-        // Disable Nagle's algorithm — send response bytes immediately
-        nodelay: s32 = 1;
-        setsockopt(conn_fd, xx IPPROTO.TCP, TCP_NODELAY, xx *nodelay, size_of(type_of(nodelay)));
-
-        c := get_connection(*w.pool);
-        if c == null {
-            close(conn_fd);
-            continue;
-        }
-        c.fd = conn_fd;
-
-        ok := epoll_add_connection(*w.engine, c, EPOLLIN | EPOLLET | EPOLLRDHUP);
-        if !ok {
-            close(conn_fd);
-            free_connection(*w.pool, c);
-        }
-    }
-}
-
-handle_client :: (w: *Worker, c: *Connection, events: u32) {
-    // Error or hangup
-    if events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP) {
-        close_connection(w, c);
-        return;
-    }
-
-    if events & EPOLLIN {
-        // Edge-triggered: read until EAGAIN
-        while true {
-            available := READ_BUFFER_SIZE - c.bytes_used;
-            if available <= 0 {
-                // Buffer full but request incomplete — too large
-                close_connection(w, c);
-                return;
-            }
-
-            bytes_read := read(c.fd, c.buf.data + c.bytes_used, xx available);
-            if bytes_read < 0 {
-                err := errno();
-                if err == EAGAIN || err == EWOULDBLOCK break;
-                close_connection(w, c);
-                return;
-            }
-            if bytes_read == 0 {
-                close_connection(w, c);
-                return;
-            }
-
-            c.bytes_used += bytes_read;
-
-            // Process complete requests (handles pipelining)
-            while true {
-                result := parse_request(c);
-                if result == .COMPLETE {
-                    response: Response;
-
-                    // Invoke the handler under the per-request pool allocator, with the
-                    // handler's bound state poked into the context. The core is routing-
-                    // agnostic — for a routed server, w.handler is router.jai's adapter.
-                    new_ctx := context;
-                    new_ctx.allocator    = .{Pool_Module.pool_allocator_proc, *w.request_pool};
-                    new_ctx.handler_data = w.handler_data;
-                    push_context new_ctx {
-                        if w.handler  w.handler(*c.req, *response);
-                        // Send the response while the per-request Pool is the context allocator,
-                        // so write_response's header formatting (sprint/String_Builder) allocates
-                        // from the Pool too — not temporary storage.
-                        write_response(c, *c.req, *response, "");
-                    }
-                    Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
-
-                    if !c.req.keep_alive {
-                        close_connection(w, c);
-                        return;
-                    }
-
-                    reset_for_next_request(c);
-                } else if result == .ERROR {
-                    close_connection(w, c);
-                    return;
-                } else {
-                    break;  // INCOMPLETE — need more data
-                }
-            }
-        }
-    }
-}
-
-close_connection :: (w: *Worker, c: *Connection) {
-    epoll_del_connection(*w.engine, c);
-    close(c.fd);
-    free_connection(*w.pool, c);
 }
 
 #import "System";
