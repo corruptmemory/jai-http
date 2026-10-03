@@ -26,6 +26,7 @@ Connection :: struct {
     close_after_send: bool;     // close once `pending` drains
     read_stalled:     bool;     // read buffer filled while output was pending; re-read after drain
     peer_closed:      bool;     // the peer finished sending (EOF / RDHUP); close once every answer drains
+    lingering:        bool;     // final response sent and write side shut; discarding input until EOF
 
     // Timeouts: monotonic milliseconds from now_ms() in server.jai
     last_activity_ms: s64;      // accept, or the last successful read / write progress
@@ -95,6 +96,7 @@ get_connection :: (pool: *Connection_Pool) -> *Connection {
     c.close_after_send = false;
     c.read_stalled     = false;
     c.peer_closed      = false;
+    c.lingering        = false;
     c.last_activity_ms = 0;
     c.last_write_ms    = 0;
     c.request_start_ms = 0;

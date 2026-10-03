@@ -133,6 +133,8 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
     values: [MAX_PARAMS] string;
     vcount: s32 = 0;
     mismatched: Mismatched_Leaves;   // every leaf reached whose methods did not match
+    mismatched.allocator = context.allocator;
+    defer if mismatched.data  Basic.array_free(mismatched);   // the common path never allocates
 
     leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *mismatched);
     if leaf != -1 {
@@ -303,36 +305,30 @@ find_endpoint :: (node: *Trie_Node, method: string) -> *Trie_Endpoint {
 
 // Leaves that matched the whole path but not the method, collected across backtracking: a 405's
 // Allow must list every method that would succeed for this path, not only the first leaf's.
-MAX_MISMATCHED_LEAVES :: 16;
-
-Mismatched_Leaves :: struct {
-    nodes: [MAX_MISMATCHED_LEAVES] s32;
-    count: s32;
-}
+// Growable (no silent cap); allocated only when a mismatch occurs, from context.allocator.
+Mismatched_Leaves :: [..] s32;
 
 add_mismatched :: (m: *Mismatched_Leaves, node_idx: s32) {
-    if m.count >= MAX_MISMATCHED_LEAVES  return;   // Allow may then be incomplete; the 405 stands
-    m.nodes[m.count] = node_idx;
-    m.count += 1;
+    Basic.array_add(m, node_idx);
 }
 
 // The Allow value for a 405: the union of the mismatched leaves' methods in discovery order, with
 // HEAD appended whenever GET is present and HEAD is not. Built from context.allocator, which
 // during dispatch is the per-request Pool.
 allow_header_for :: (t: *Trie, mismatched: Mismatched_Leaves) -> string {
-    methods: [32] string;
-    method_count := 0;
-    for i: 0..mismatched.count-1 {
-        node := *t.nodes[mismatched.nodes[i]];
-        for * node.endpoints {
-            if it.method.count == 0  continue;   // an "any" endpoint would have matched; defensive
+    methods: [..] string;
+    methods.allocator = context.allocator;
+    defer Basic.array_free(methods);
+    for leaf: mismatched {
+        node := *t.nodes[leaf];
+        for * ep: node.endpoints {
+            if ep.method.count == 0  continue;   // an "any" endpoint would have matched; defensive
             seen := false;
-            for m: 0..method_count-1  if string_equals(methods[m], it.method) { seen = true; break; }
-            if seen || method_count >= methods.count  continue;
-            methods[method_count] = it.method;
-            method_count += 1;
+            for m: methods  if string_equals(m, ep.method) { seen = true; break; }
+            if !seen  Basic.array_add(*methods, ep.method);
         }
     }
+    method_count := methods.count;
     has_get, has_head := false, false;
     for m: 0..method_count-1 {
         if string_equals(methods[m], "GET")   has_get  = true;

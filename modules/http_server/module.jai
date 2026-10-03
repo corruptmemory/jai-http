@@ -28,7 +28,11 @@
     IDLE_TIMEOUT_MS     : s64 = 60000,    // kept-alive connection between requests
     HEADER_TIMEOUT_MS   : s64 = 10000,    // from a request's first byte until its headers are complete
     BODY_TIMEOUT_MS     : s64 = 30000,    // from a request's first byte until its body is complete
-    WRITE_TIMEOUT_MS    : s64 = 30000     // a pending response making no progress toward the peer
+    WRITE_TIMEOUT_MS    : s64 = 30000,    // a pending response making no progress toward the peer
+    // Lingering close: after a final response the server half-closes and discards input until the
+    // peer's EOF, for at most this long, so a close never turns into a reset that destroys the
+    // response. 0 closes right after one drain.
+    LINGER_TIMEOUT_MS   : s64 = 5000
 );
 
 #scope_module

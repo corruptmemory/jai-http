@@ -19,6 +19,7 @@ Worker :: struct {
     handler:      Handler;
     handler_data: *Handler_Data;
     request_pool: Pool_Module.Pool;  // Per-request allocator, reset after each dispatch
+    accept_paused: bool;             // accept4 ran out of fds/memory; the sweep retries
     date:         string;            // cached IMF-fixdate for this second (a view into date_buf); empty omits Date
     date_buf:     [29] u8;
     date_second:  s64 = -1;
@@ -154,7 +155,7 @@ refresh_date :: (w: *Worker) {
 // that has fully arrived has no deadline: the handler runs synchronously and request_start_ms is
 // cleared before dispatch. Sweeps run once a second from worker_run when any timeout is enabled.
 
-TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0;
+TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0 || LINGER_TIMEOUT_MS > 0;
 
 Timeout_State :: enum u8 #specified {
     NONE   :: 0;
@@ -162,9 +163,11 @@ Timeout_State :: enum u8 #specified {
     HEADER :: 2;   // request begun, headers incomplete
     BODY   :: 3;   // headers complete, body incomplete
     WRITE  :: 4;   // response tail pending
+    LINGER :: 5;   // lingering close: final response sent, discarding input until EOF
 }
 
 timeout_state :: (c: *Connection) -> Timeout_State {
+    if c.lingering                return .LINGER;
     if c.pending.count > 0        return .WRITE;
     if c.bytes_used == 0          return .IDLE;
     if c.parse_state == .BODY     return .BODY;
@@ -181,6 +184,7 @@ is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_S
         case .WRITE;  limit = WRITE_TIMEOUT_MS;  since = c.last_write_ms;   // write progress only; input does not count
         case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
         case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
+        case .LINGER; limit = LINGER_TIMEOUT_MS; since = c.last_activity_ms;   // set on entering linger
         case;         return false, state;
     }
     if limit <= 0  return false, state;
@@ -205,6 +209,13 @@ check_timeouts :: (w: *Worker, now: s64) -> s32 {
     return closed;
 }
 
+// The once-a-second work of worker_run: timeouts, and retrying accepts paused by fd or memory
+// exhaustion (an edge-triggered listen socket would not report the waiting backlog again).
+worker_sweep :: (w: *Worker, now: s64) {
+    #if TIMEOUTS_ENABLED  check_timeouts(w, now);
+    if w.accept_paused  accept_connections(w);
+}
+
 accept_connections :: (w: *Worker) {
     while true {
         addr: sockaddr_in;
@@ -213,12 +224,22 @@ accept_connections :: (w: *Worker) {
 
         if conn_fd < 0 {
             err := errno();
-            if err == EAGAIN || err == EWOULDBLOCK  break;      // backlog empty
+            if err == EAGAIN || err == EWOULDBLOCK { w.accept_paused = false; break; }   // backlog empty
             if err == EINTR  || err == ECONNABORTED  continue;  // retry; the aborted one is gone
-            // EMFILE, ENFILE, ENOBUFS, ENOMEM, ...: the rest of the backlog waits in the kernel. With
-            // an edge-triggered listen socket it is retried only when the next connection arrives.
+            if err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM {
+                // Out of descriptors or memory. The rest of the backlog waits in the kernel, and an
+                // edge-triggered listen socket reports it again only when another connection
+                // arrives: pause, and let the once-a-second sweep retry. Logged once per pause.
+                if !w.accept_paused  Basic.log_error("Worker %: accept4 failed (errno %); pausing accepts, retrying every second", w.id, err);
+                w.accept_paused = true;
+                break;
+            }
             Basic.log_error("Worker %: accept4 failed: errno %", w.id, err);
             break;
+        }
+        if w.accept_paused {
+            Basic.log("Worker %: accepting again", w.id);
+            w.accept_paused = false;
         }
 
         // Disable Nagle's algorithm — send response bytes immediately
@@ -246,6 +267,13 @@ accept_connections :: (w: *Worker) {
 }
 
 handle_client :: (w: *Worker, c: *Connection, events: u32) {
+    // A lingering close only discards input until the peer's EOF (or the LINGER timeout).
+    if c.lingering {
+        if (events & (EPOLLERR | EPOLLHUP)) != 0 { close_connection(w, c); return; }
+        if (events & (EPOLLIN | EPOLLRDHUP)) != 0 && !discard_input(c)  close_connection(w, c);
+        return;
+    }
+
     // 1. Output first. OUT also fires on registration and after every drain; with nothing
     //    queued it means nothing.
     if (events & EPOLLOUT) != 0 && c.pending.count > 0 {
@@ -396,17 +424,35 @@ refuse_and_close :: (w: *Worker, c: *Connection, status: u16) {
     linger_close(w, c);
 }
 
+// Read and drop the input that has arrived. Returns false once the peer has finished sending
+// (EOF) or the socket failed; true while more may come. Bounded per call: edge-triggered epoll
+// reports any further arrival again.
+discard_input :: (c: *Connection) -> bool {
+    discard: [4096] u8;
+    for 1..64 {
+        n := read(c.fd, discard.data, discard.count);
+        if n > 0  continue;
+        if n == 0  return false;
+        err := errno();
+        if err == EINTR  continue;
+        return err == EAGAIN || err == EWOULDBLOCK;
+    }
+    return true;
+}
+
 // Close after a final response without risking a reset. Closing with unread input makes TCP send
 // RST, and the kernel then discards response bytes it has not transmitted yet. Half-close so the
-// response is followed by a FIN, discard what has already arrived, then close. Bounded: a client
-// still streaming a large body can still see a reset; a full lingering close needs a timer state.
+// response is followed by a FIN, then keep discarding input until the peer's EOF; a peer that
+// never finishes is closed by the LINGER timeout. LINGER_TIMEOUT_MS = 0 closes after one drain.
 linger_close :: (w: *Worker, c: *Connection) {
     shutdown(c.fd, .WR);
-    discard: [4096] u8;
-    for 1..16 {
-        if read(c.fd, discard.data, discard.count) <= 0  break;
+    if !discard_input(c) { close_connection(w, c); return; }
+    #if LINGER_TIMEOUT_MS > 0 {
+        c.lingering        = true;
+        c.last_activity_ms = now_ms();   // the LINGER clock
+    } else {
+        close_connection(w, c);
     }
-    close_connection(w, c);
 }
 
 close_connection :: (w: *Worker, c: *Connection) {
@@ -471,8 +517,9 @@ worker_listen :: (w: *Worker, address: string, port: u16) -> bool {
 
 worker_run :: (w: *Worker) {
     last_sweep := now_ms();
-    wait_ms: s32 = ifx TIMEOUTS_ENABLED then cast(s32) 1000 else cast(s32) -1;
     while w.running {
+        wait_ms: s32 = -1;
+        if TIMEOUTS_ENABLED || w.accept_paused  wait_ms = 1000;
         nfds := epoll_process_events(*w.engine, timeout_ms = wait_ms);
         if nfds < 0 {
             err := errno();
@@ -497,12 +544,10 @@ worker_run :: (w: *Worker) {
         }
         Basic.reset_temporary_storage();
 
-        #if TIMEOUTS_ENABLED {
-            now := now_ms();
-            if now - last_sweep >= 1000 {
-                check_timeouts(w, now);
-                last_sweep = now;
-            }
+        now := now_ms();
+        if now - last_sweep >= 1000 {
+            worker_sweep(w, now);
+            last_sweep = now;
         }
     }
 }

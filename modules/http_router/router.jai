@@ -152,9 +152,13 @@ dispatch_in :: (router: *Router, req: *Request, resp: *Response, inherited: [] M
         mp := *router.mounts[i];
         if !mount_matches(req.path, mp.prefix)  continue;
         original_path := req.path;
+        // Strip the prefix but keep the boundary slash (a prefix ending in '/' contains it), so
+        // the sub-router, and any mount nested inside it, sees an absolute path.
+        cut := mp.prefix.count;
+        if cut > 0 && mp.prefix[cut - 1] == #char "/"  cut -= 1;
         remaining := req.path;
-        remaining.data  += mp.prefix.count;
-        remaining.count -= mp.prefix.count;
+        remaining.data  += cut;
+        remaining.count -= cut;
         if remaining.count == 0  req.path = "/";
         else                     req.path = remaining;
         dispatch_in(mp.router, req, resp, chain);

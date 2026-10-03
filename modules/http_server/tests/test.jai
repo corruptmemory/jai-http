@@ -1211,7 +1211,10 @@ test_handle_client_oversized_header_gets_431 :: () {
     defer array_free(got);
     drain_peer(peer, *got);
     assert(starts_with(as_string(got), "HTTP/1.1 431 "), "oversized header gets 431, got '%'", as_string(got));
-    assert(c.state == .FREE && test_handler_calls == 0, "refused and closed without a handler run");
+    assert(c.lingering && test_handler_calls == 0, "refused without a handler run, now lingering");
+    shutdown(peer, .WR);                    // the client finishes sending
+    handle_client(*w, c, EPOLLIN | EPOLLRDHUP);
+    assert(c.state == .FREE, "the linger ends at the peer's EOF");
     print("  PASS: test_handle_client_oversized_header_gets_431\n");
 }
 
@@ -1230,7 +1233,8 @@ test_handle_client_oversized_body_gets_413 :: () {
     defer array_free(got);
     drain_peer(peer, *got);
     assert(starts_with(as_string(got), "HTTP/1.1 413 "), "a body past the read buffer gets 413, got '%'", as_string(got));
-    assert(c.state == .FREE && test_handler_calls == 0, "refused and closed without a handler run");
+    assert((c.state == .FREE || c.lingering) && test_handler_calls == 0, "refused and closing (lingering) without a handler run");
+    if c.state == .ACTIVE  close_connection(*w, c);
     print("  PASS: test_handle_client_oversized_body_gets_413\n");
 }
 
@@ -1249,7 +1253,8 @@ test_handle_client_malformed_gets_400 :: () {
     defer array_free(got);
     drain_peer(peer, *got);
     assert(starts_with(as_string(got), "HTTP/1.1 400 "), "a malformed request line gets 400, got '%'", as_string(got));
-    assert(c.state == .FREE && test_handler_calls == 0, "refused and closed without a handler run");
+    assert((c.state == .FREE || c.lingering) && test_handler_calls == 0, "refused and closing (lingering) without a handler run");
+    if c.state == .ACTIVE  close_connection(*w, c);
     print("  PASS: test_handle_client_malformed_gets_400\n");
 }
 
@@ -1415,11 +1420,12 @@ test_check_timeouts_sends_408_for_a_slow_header :: () {
     c.request_start_ms = 0;   // pretend it started at the epoch
 
     closed := check_timeouts(*w, 10000);
-    assert(closed == 1 && c.state == .FREE, "slow header reaped at 10 s, got closed=%", closed);
+    assert(closed == 1 && (c.state == .FREE || c.lingering), "slow header reaped at 10 s, got closed=%", closed);
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
     assert(starts_with(as_string(got), "HTTP/1.1 408 "), "a header timeout gets 408, got '%'", as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
     print("  PASS: test_check_timeouts_sends_408_for_a_slow_header\n");
 }
 
@@ -2025,22 +2031,12 @@ test_bad_version_rejected :: () {
     print("  PASS: test_bad_version_rejected\n");
 }
 
-// -- Second review (codex, with the Jai reference) of the fix round: R22-R28 --
-
-review_failures: s32;
-
-review_check :: (ok: bool, name: string, fmt: string, args: ..Any) {
-    if ok { print("  PASS: %\n", name); return; }
-    review_failures += 1;
-    print("  FAIL: %: ", name);
-    print(fmt, ..args);
-    print("\n");
-}
+// -- Hardening from the second review (Codex with the Jai reference) of the fix round: R22-R28 --
 
 // R22. Field values keep raw CR, LF and NUL: `X-Test: a\nInjected: b` stores a bare LF that a
 // front end treating LF as a line end reads as a second field (desync / header injection).
 // RFC 9110 §5.5: field values contain no CR, LF or NUL; reject with 400.
-test_review_field_value_controls_rejected :: () {
+test_field_value_controls_rejected :: () {
     bad := string.["GET / HTTP/1.1\r\nHost: x\r\nX-Test: a\nInjected: b\r\n\r\n",
                    "GET / HTTP/1.1\r\nHost: x\r\nX-Test: a\rb\r\n\r\n",
                    "GET / HTTP/1.1\r\nHost: x\r\nX-Test: a\0b\r\n\r\n"];
@@ -2051,13 +2047,13 @@ test_review_field_value_controls_rejected :: () {
         c.bytes_used = it.count;
         results[it_index] = parse_request(*c);
     }
-    review_check(results[0] == .ERROR && results[1] == .ERROR && results[2] == .ERROR, "R22 field_value_controls_rejected",
-        "bare LF / CR / NUL in a field value must be errors; got % % %", results[0], results[1], results[2]);
+    assert(results[0] == .ERROR && results[1] == .ERROR && results[2] == .ERROR, "bare LF / CR / NUL in a field value must be errors; got % % %", results[0], results[1], results[2]);
+    print("  PASS: test_field_value_controls_rejected\n");
 }
 
 // R23. Host is counted but not validated: `Host: a b` reaches the handler. RFC 9112 §3.2: an
 // invalid Host field value gets 400 (RFC 3986 authority: no spaces; `,` is a legal sub-delim).
-test_review_host_syntax_validated :: () {
+test_host_syntax_validated :: () {
     c: Connection;
     s := "GET / HTTP/1.1\r\nHost: a b\r\n\r\n";
     memcpy(c.buf.data, s.data, s.count);
@@ -2068,27 +2064,27 @@ test_review_host_syntax_validated :: () {
     memcpy(c2.buf.data, s2.data, s2.count);
     c2.bytes_used = s2.count;
     r2 := parse_request(*c2);
-    review_check(r == .ERROR && r2 == .COMPLETE, "R23 host_syntax_validated",
-        "`Host: a b` must be rejected while `Host: a,b.example:8080` is legal; got % and %", r, r2);
+    assert(r == .ERROR && r2 == .COMPLETE, "`Host: a b` must be rejected while `Host: a,b.example:8080` is legal; got % and %", r, r2);
+    print("  PASS: test_host_syntax_validated\n");
 }
 
 // R24 (regression from the R2 fix). The 18-digit bound counted leading zeros, so a small
 // zero-padded Content-Length was refused with 413. RFC 9110 §8.6: 1*DIGIT, leading zeros allowed.
-test_review_zero_padded_content_length :: () {
+test_zero_padded_content_length :: () {
     c: Connection;
     s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0000000000000000005\r\n\r\nhello";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .COMPLETE && c.req.content_length == 5, "R24 zero_padded_content_length",
-        "a zero-padded small Content-Length must parse; got % (%) with content_length %", r, c.parse_error, c.req.content_length);
+    assert(r == .COMPLETE && c.req.content_length == 5, "a zero-padded small Content-Length must parse; got % (%) with content_length %", r, c.parse_error, c.req.content_length);
+    print("  PASS: test_zero_padded_content_length\n");
 }
 
 // R28 (R1 incomplete). linger_close discarded at most 64 KB and then closed: with more unread
 // input than that, or input arriving after the drain, the close still turns into a reset and the
 // kernel drops untransmitted response bytes. A lingering close keeps discarding until the peer's
 // EOF or a timeout.
-test_review_lingering_close_survives_more_input :: () {
+test_lingering_close_survives_more_input :: () {
     big_test_body = big_body(262144);
     defer free(big_test_body);
     w: Worker;
@@ -2139,10 +2135,38 @@ test_review_lingering_close_survives_more_input :: () {
     header_end := index_of(out, "\r\n\r\n");
     body_got := ifx header_end >= 0 then out.count - (header_end + 4) else 0;
     how := ifx ended == 1 then "EOF" else ifx ended == 2 then "a reset/error" else "nothing";
-    review_check(ended == 1 && body_got == big_test_body.count, "R28 lingering_close_survives_more_input",
-        "the whole response then EOF despite >64 KB of unread input and late input; got % of % body bytes, then % (errno %)",
+    assert(ended == 1 && body_got == big_test_body.count, "the whole response then EOF despite >64 KB of unread input and late input; got % of % body bytes, then % (errno %)",
         body_got, big_test_body.count, how, err);
+    print("  PASS: test_lingering_close_survives_more_input\n");
     if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R27 (R9 incomplete). After EMFILE the accept loop stops, and an edge-triggered listen socket
+// does not report the waiting backlog again until another connection arrives: queued clients hang
+// even once descriptors free up. Accepts pause, and the once-a-second sweep retries them.
+test_paused_accept_retried_by_sweep :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    lfd := socket(AF_INET, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, 0);
+    assert(lfd >= 0 && bind(lfd, "127.0.0.1", 0) == 0 && listen(lfd, 16) == 0, "setup: listen socket");
+    defer close(lfd);
+    addr: sockaddr_in;
+    len: socklen_t = size_of(sockaddr_in);
+    getsockname(lfd, cast(*sockaddr) *addr, *len);
+    client := socket(AF_INET, .SOCK_STREAM | .SOCK_CLOEXEC, 0);
+    defer close(client);
+    assert(connect(client, cast(*sockaddr) *addr, len) == 0, "setup: connect");   // now waiting in the backlog
+
+    w.listen_fd = lfd;
+    w.accept_paused = true;   // as an earlier EMFILE would have left it
+    free_before := w.pool.free_count;
+    worker_sweep(*w, now_ms());
+    accepted := free_before - w.pool.free_count;
+    assert(accepted == 1 && !w.accept_paused, "the sweep must retry a paused accept; accepted %, still paused %", accepted, w.accept_paused);
+    print("  PASS: test_paused_accept_retried_by_sweep\n");
+    for * w.pool.connections  if it.state == .ACTIVE  close_connection(*w, it);
+    w.listen_fd = -1;
 }
 
 main :: () {
@@ -2193,6 +2217,8 @@ main :: () {
     test_canned_replies_carry_date();
     test_canned_reply_survives_backpressure();
     test_accept_errors_are_logged();
+    test_paused_accept_retried_by_sweep();
+    test_lingering_close_survives_more_input();
 
     print("\nTimeouts:\n");
     test_timeout_state_classification();
@@ -2245,6 +2271,9 @@ main :: () {
     test_field_name_whitespace_rejected();
     test_leading_crlf_ignored();
     test_bad_version_rejected();
+    test_field_value_controls_rejected();
+    test_host_syntax_validated();
+    test_zero_padded_content_length();
 
     print("\nPipelining:\n");
     test_reset_for_next_request();
@@ -2282,13 +2311,6 @@ main :: () {
     test_parse_multipart_with_filename();
     test_parse_multipart_missing_header();
     test_multipart_value_missing();
-
-    print("\nSecond review (2026-10-03):\n");
-    test_review_field_value_controls_rejected();
-    test_review_host_syntax_validated();
-    test_review_zero_padded_content_length();
-    test_review_lingering_close_survives_more_input();
-    assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll tests passed.\n");
 }

@@ -103,6 +103,10 @@ parse_request :: (c: *Connection) -> Parse_Result {
         // Find second space (end of the request target, which must not be empty)
         sp2 := find_byte(c.buf.data, sp1 + 1, crlf, #char " ");
         if sp2 <= sp1 + 1  return parse_fail(c, .MALFORMED);
+        for i: sp1 + 1..sp2 - 1 {   // the target carries no control bytes (a bare CR or LF splits lines elsewhere)
+            ch := c.buf[i];
+            if ch < 0x21 || ch == 0x7F  return parse_fail(c, .MALFORMED);
+        }
 
         // Split URI into path and query string at '?'
         qmark := find_byte(c.buf.data, sp1 + 1, sp2, #char "?");
@@ -152,11 +156,12 @@ parse_request :: (c: *Connection) -> Parse_Result {
             // Dropping fields past the cap would silently lose framing headers (desync): refuse.
             if c.req.header_count >= MAX_HEADERS  return parse_fail(c, .TOO_MANY_HEADERS);
 
-            // RFC 9110 §5.5: optional whitespace around the field value is not part of it.
-            c.req.headers[c.req.header_count] = .{
-                name  = name,
-                value = trim_ows(make_view(c.buf.data, colon + 1, crlf)),
-            };
+            // RFC 9110 §5.5: optional whitespace around the field value is not part of it, and the
+            // value holds no CR, LF, NUL or other control byte. A bare LF kept here is a line break
+            // to a front end that accepts LF line ends: a second, smuggled field.
+            value := trim_ows(make_view(c.buf.data, colon + 1, crlf));
+            if !is_field_value(value)  return parse_fail(c, .MALFORMED);
+            c.req.headers[c.req.header_count] = .{ name = name, value = value };
             c.req.header_count += 1;
 
             c.parse_offset = crlf + 2;
@@ -398,6 +403,10 @@ write_or_queue :: (c: *Connection, data: string) -> Write_Result {
         return .ERROR;
     }
     if sent == data.count  return .SENT;
+    if data.count - sent > MAX_PENDING_BYTES {
+        Basic.log_error("fd %: unsent reply tail of % bytes exceeds MAX_PENDING_BYTES (%); closing", c.fd, data.count - sent, MAX_PENDING_BYTES);
+        return .ERROR;
+    }
     append_bytes(*c.pending, data.data + sent, data.count - sent);
     return .PENDING;
 }
@@ -540,10 +549,35 @@ check_http_version :: (v: string) -> Parse_Error {
 parse_content_length :: (s: string) -> (value: s64, valid: bool, too_large: bool) {
     if s.count == 0  return 0, false, false;
     for i: 0..s.count-1  if s[i] < #char "0" || s[i] > #char "9"  return 0, false, false;
-    if s.count > 18  return 0, true, true;
+    first := 0;   // leading zeros are legal and carry no magnitude
+    while first < s.count - 1 && s[first] == #char "0"  first += 1;
+    if s.count - first > 18  return 0, true, true;
     result: s64 = 0;
-    for i: 0..s.count-1  result = result * 10 + cast(s64) (s[i] - #char "0");
+    for i: first..s.count-1  result = result * 10 + cast(s64) (s[i] - #char "0");
     return result, true, false;
+}
+
+// RFC 9110 §5.5: field-value bytes are VCHAR, SP, HTAB or obs-text; no CR, LF, NUL or other CTL.
+is_field_value :: (s: string) -> bool {
+    for i: 0..s.count-1 {
+        ch := s[i];
+        if (ch < 0x20 && ch != #char "\t") || ch == 0x7F  return false;
+    }
+    return true;
+}
+
+// RFC 9112 §3.2 / RFC 3986 §3.2: Host = uri-host [ ":" port ]. Checked as a character set:
+// unreserved, pct-encoded, sub-delims, ':' and the brackets of an IP literal. Empty is legal.
+is_host_value :: (s: string) -> bool {
+    HOST_PUNCTUATION :: "-._~%!$&'()*+,;=:[]";
+    for i: 0..s.count-1 {
+        ch := s[i];
+        if (ch >= #char "a" && ch <= #char "z") || (ch >= #char "A" && ch <= #char "Z") || (ch >= #char "0" && ch <= #char "9")  continue;
+        is_punct := false;
+        for p: 0..HOST_PUNCTUATION.count-1  if ch == HOST_PUNCTUATION[p] { is_punct = true; break; }
+        if !is_punct  return false;
+    }
+    return true;
 }
 
 // Validate the complete header block and settle the request's framing and keep-alive. Framing is
@@ -552,6 +586,7 @@ finish_headers :: (c: *Connection) -> Parse_Error {
     req := *c.req;
     content_length: s64 = -1;
     host_count := 0;
+    host_valid := true;
     for i: 0..cast(s64) req.header_count - 1 {
         h := *req.headers[i];
         // Chunked request bodies are not decoded. Ignoring Transfer-Encoding would parse the body
@@ -565,14 +600,17 @@ finish_headers :: (c: *Connection) -> Parse_Error {
             if content_length >= 0 && value != content_length  return .MALFORMED;
             content_length = value;
         }
-        if string_equals_ci(h.name, "Host")  host_count += 1;
+        if string_equals_ci(h.name, "Host") {
+            host_count += 1;
+            if !is_host_value(h.value)  host_valid = false;
+        }
     }
     if content_length > 0 {
         if content_length > cast(s64) READ_BUFFER_SIZE - c.parse_offset  return .BODY_TOO_LARGE;   // won't fit
         req.content_length = content_length;
     }
-    // RFC 9112 §3.2: 400 for more than one Host, and for an HTTP/1.1 request without one.
-    if host_count > 1  return .MALFORMED;
+    // RFC 9112 §3.2: 400 for more than one Host, an invalid one, and an HTTP/1.1 request without one.
+    if host_count > 1 || !host_valid  return .MALFORMED;
     if host_count == 0 && req.http_version[7] != #char "0"  return .MALFORMED;
     determine_keep_alive(req);
     return .NONE;
