@@ -29,6 +29,7 @@ Connection :: struct {
 
     // Timeouts: monotonic milliseconds from now_ms() in server.jai
     last_activity_ms: s64;      // accept, or the last successful read / write progress
+    last_write_ms:    s64;      // start of a stalled write, or its last progress; the WRITE timeout's clock
     request_start_ms: s64;      // first byte of the request being parsed; 0 while idle or dispatching
 }
 
@@ -88,15 +89,14 @@ get_connection :: (pool: *Connection_Pool) -> *Connection {
     c.parse_offset = 0;
     c.parse_state = .REQUEST_LINE;
     c.parse_error = .NONE;
-    c.req.header_count = 0;
-    c.req.keep_alive = false;
-    c.req.content_length = 0;
+    reset_request(*c.req);
 
     release_pending(c);
     c.close_after_send = false;
     c.read_stalled     = false;
     c.peer_closed      = false;
     c.last_activity_ms = 0;
+    c.last_write_ms    = 0;
     c.request_start_ms = 0;
 
     return c;

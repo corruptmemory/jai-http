@@ -178,7 +178,7 @@ is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_S
     since: s64 = 0;
     if state == {
         case .IDLE;   limit = IDLE_TIMEOUT_MS;   since = c.last_activity_ms;
-        case .WRITE;  limit = WRITE_TIMEOUT_MS;  since = c.last_activity_ms;
+        case .WRITE;  limit = WRITE_TIMEOUT_MS;  since = c.last_write_ms;   // write progress only; input does not count
         case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
         case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
         case;         return false, state;
@@ -211,7 +211,15 @@ accept_connections :: (w: *Worker) {
         addrlen: u32 = size_of(sockaddr_in);
         conn_fd := accept4(w.listen_fd, cast(*sockaddr) *addr, xx *addrlen, .NONBLOCK | .CLOEXEC);
 
-        if conn_fd < 0 break;  // EAGAIN — no more pending
+        if conn_fd < 0 {
+            err := errno();
+            if err == EAGAIN || err == EWOULDBLOCK  break;      // backlog empty
+            if err == EINTR  || err == ECONNABORTED  continue;  // retry; the aborted one is gone
+            // EMFILE, ENFILE, ENOBUFS, ENOMEM, ...: the rest of the backlog waits in the kernel. With
+            // an edge-triggered listen socket it is retried only when the next connection arrives.
+            Basic.log_error("Worker %: accept4 failed: errno %", w.id, err);
+            break;
+        }
 
         // Disable Nagle's algorithm — send response bytes immediately
         nodelay: s32 = 1;
@@ -219,7 +227,7 @@ accept_connections :: (w: *Worker) {
 
         c := get_connection(*w.pool);
         if c == null {
-            Basic.log("fd %: connection pool exhausted; dropping", conn_fd);
+            Basic.log_error("Worker %: connection pool exhausted; dropping fd %", w.id, conn_fd);
             close(conn_fd);
             continue;
         }
@@ -241,9 +249,14 @@ handle_client :: (w: *Worker, c: *Connection, events: u32) {
     // 1. Output first. OUT also fires on registration and after every drain; with nothing
     //    queued it means nothing.
     if (events & EPOLLOUT) != 0 && c.pending.count > 0 {
+        offset_before := c.pending_offset;
         r := flush_pending(c);
         if r == .ERROR { close_connection(w, c); return; }
-        c.last_activity_ms = now_ms();
+        if r == .SENT || c.pending_offset > offset_before {   // progress (SENT resets the offset)
+            now := now_ms();
+            c.last_activity_ms = now;
+            c.last_write_ms    = now;
+        }
         if r == .SENT && !resume_after_drain(w, c)  return;
     }
 
@@ -266,7 +279,7 @@ handle_client :: (w: *Worker, c: *Connection, events: u32) {
 // the buffer was full (no new edge will announce them), and close once a peer that has finished
 // sending holds every answer. Returns false when the connection was closed.
 resume_after_drain :: (w: *Worker, c: *Connection) -> bool {
-    if c.close_after_send { close_connection(w, c); return false; }
+    if c.close_after_send { linger_close(w, c); return false; }
     // A partial next request is timed from the drain, not from when its bytes arrived: while
     // output was pending the server was the bottleneck (its read may even have been stalled).
     if c.request_start_ms != 0  c.request_start_ms = c.last_activity_ms;
@@ -291,8 +304,11 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
                 c.read_stalled = true;
                 return true;
             }
-            // A full buffer with no complete request: the header block alone exceeds READ_BUFFER_SIZE.
-            refuse_and_close(w, c, 431);
+            // A full buffer with no complete request: the request line (414) or the header block
+            // (431) alone exceeds READ_BUFFER_SIZE.
+            status: u16 = 431;
+            if c.parse_state == .REQUEST_LINE  status = 414;
+            refuse_and_close(w, c, status);
             return false;
         }
 
@@ -328,9 +344,7 @@ dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
         result := parse_request(c);
         if result == .INCOMPLETE  return true;
         if result == .ERROR {
-            status: u16 = 400;
-            if c.parse_error == .BODY_TOO_LARGE  status = 413;
-            refuse_and_close(w, c, status);
+            refuse_and_close(w, c, parse_error_status(c.parse_error));
             return false;
         }
 
@@ -352,7 +366,9 @@ dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
             wr = write_response(c, *c.req, *response, w.date);
         }
         Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
-        c.last_activity_ms = now_ms();
+        now := now_ms();
+        c.last_activity_ms = now;
+        c.last_write_ms    = now;   // a tail queued now starts the WRITE clock
 
         if wr == .ERROR { close_connection(w, c); return false; }
         keep_alive := c.req.keep_alive;
@@ -361,19 +377,30 @@ dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
             if !keep_alive  c.close_after_send = true;
             return true;    // dispatch resumes when EPOLLOUT drains the tail
         }
-        if !keep_alive { close_connection(w, c); return false; }
+        if !keep_alive { linger_close(w, c); return false; }
     }
     return true;
 }
 
-// Answer a request the server will not serve with a canned status, then close.
+// Answer a request the server will not serve with a canned status, then close. Under backpressure
+// the reply is queued and the close waits for EPOLLOUT to drain it.
 refuse_and_close :: (w: *Worker, c: *Connection, status: u16) {
     Basic.log("fd %: refusing request with %", c.fd, status);
-    send_canned(c.fd, status);
-    // Closing with unread bytes in the receive queue makes the kernel reset the connection, and
-    // the reset can destroy the reply before the client reads it. Half-close so the reply is
-    // followed by a FIN, then discard what has already arrived. Bounded: a client still streaming
-    // a large body can still see a reset; a full lingering close would need a timer state.
+    r := write_or_queue(c, canned_response(status, w.date));
+    if r == .ERROR { close_connection(w, c); return; }
+    if r == .PENDING {
+        c.close_after_send = true;
+        c.last_write_ms    = now_ms();
+        return;
+    }
+    linger_close(w, c);
+}
+
+// Close after a final response without risking a reset. Closing with unread input makes TCP send
+// RST, and the kernel then discards response bytes it has not transmitted yet. Half-close so the
+// response is followed by a FIN, discard what has already arrived, then close. Bounded: a client
+// still streaming a large body can still see a reset; a full lingering close needs a timer state.
+linger_close :: (w: *Worker, c: *Connection) {
     shutdown(c.fd, .WR);
     discard: [4096] u8;
     for 1..16 {

@@ -1037,15 +1037,8 @@ test_canned_responses :: () {
     assert(starts_with(canned_response(413), "HTTP/1.1 413 Payload Too Large\r\n"), "413");
     assert(starts_with(canned_response(431), "HTTP/1.1 431 Request Header Fields Too Large\r\n"), "431");
     assert(contains(canned_response(431), "Connection: close\r\n\r\n"), "canned replies close");
-
-    server, peer := make_socket_pair();
-    defer close(server);
-    defer close(peer);
-    send_canned(server, 413);
-    got: [..] u8;
-    defer array_free(got);
-    drain_peer(peer, *got);
-    assert(string_equals(as_string(got), canned_response(413)), "send_canned writes the reply verbatim");
+    assert(!contains(canned_response(400), "Date:"), "no date given, no Date header");
+    assert(contains(canned_response(400, "Sun, 06 Nov 1994 08:49:37 GMT"), "\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\n"), "Date when given");
     print("  PASS: test_canned_responses\n");
 }
 
@@ -1285,7 +1278,8 @@ test_parse_error_classification :: () {
     big := "POST / HTTP/1.1\r\nContent-Length: 100000\r\n\r\n";
     memcpy(c2.buf.data, big.data, big.count);
     c2.bytes_used = big.count;
-    assert(parse_request(*c2) == .ERROR && c2.parse_error == .BODY_TOO_LARGE, "Content-Length past the buffer is BODY_TOO_LARGE");
+    r2 := parse_request(*c2);
+    assert(r2 == .ERROR && c2.parse_error == .BODY_TOO_LARGE, "Content-Length past the buffer is BODY_TOO_LARGE; got % %", r2, c2.parse_error);
     print("  PASS: test_parse_error_classification\n");
 }
 
@@ -1368,7 +1362,8 @@ test_is_timed_out_uses_the_right_clock :: () {
 test_is_timed_out_write_then_idle :: () {
     c: Connection;
     c.pending.count = 1;          // synthetic tail
-    c.last_activity_ms = 1000;    // last write progress
+    c.last_activity_ms = 1000;
+    c.last_write_ms    = 1000;    // last write progress
     c.request_start_ms = 0;
     t, s := is_timed_out(*c, 1000 + 29999);
     assert(!t && s == .WRITE, "pending output short of 30 s is fine");
@@ -1752,7 +1747,7 @@ test_review_transfer_encoding_refused :: () {
 // rejected as malformed. RFC 9110 §5.5: OWS around a field value is not part of the value.
 test_review_header_value_ows_trimmed :: () {
     c: Connection;
-    s := "POST / HTTP/1.1\r\nContent-Length:\t5 \r\n\r\nhello";
+    s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length:\t5 \r\n\r\nhello";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
@@ -1863,7 +1858,7 @@ test_review_request_views_cleared_on_reuse :: () {
 
     // Client A on the only slot: a POST with a query and a secret body.
     a := get_connection(*pool);
-    first := "POST /login?user=alice HTTP/1.1\r\nContent-Length: 12\r\n\r\nsecret-token";
+    first := "POST /login?user=alice HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\nsecret-token";
     memcpy(a.buf.data, first.data, first.count);
     a.bytes_used = first.count;
     assert(parse_request(a) == .COMPLETE, "setup: client A's request parses");
@@ -1871,7 +1866,7 @@ test_review_request_views_cleared_on_reuse :: () {
 
     // Client B gets the same slot and sends a short bodiless GET.
     b := get_connection(*pool);
-    second := "GET / HTTP/1.1\r\n\r\n";
+    second := "GET / HTTP/1.1\r\nHost: y\r\n\r\n";
     memcpy(b.buf.data, second.data, second.count);
     b.bytes_used = second.count;
     assert(parse_request(b) == .COMPLETE, "setup: client B's request parses");
@@ -1951,7 +1946,7 @@ test_review_canned_reply_survives_backpressure :: () {
 // options; `close` wins.
 test_review_connection_option_list :: () {
     c: Connection;
-    s := "GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n";
+    s := "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
