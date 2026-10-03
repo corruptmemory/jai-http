@@ -13,7 +13,6 @@
     // cast-free, type-safe handler state. There is one Context type per program, so the type
     // of the `#add_context handler_data` field cannot vary per-import.
     Handler_Data        : Type = void,
-    CACHE_LINE_SIZE     : s32 = 64,
     READ_BUFFER_SIZE    : s32 = 4096,
     MAX_HEADERS         : s32 = 64,
     MAX_FORM_VALUES     : s32 = 64,
