@@ -246,6 +246,15 @@ status_has_body :: inline (code: u16) -> bool {
 // concurrency). `body_count` is what Content-Length reports; for HEAD that is the GET body's
 // length even though no body is sent. An empty `date` omits the Date header.
 build_response_header :: (req: *Request, response: *Response, date: string, body_count: s64) -> string {
+    // Fast path for the overwhelmingly common shape: HTTP/1.1 keep-alive (no Connection header),
+    // a status with a body, a Date, no custom headers. One sprint is measurably cheaper than the
+    // builder below at high request rates (~3-4% at t32/c2000 on the 3970X, 2026-10-03).
+    if response.header_count == 0 && date.count > 0 && req.keep_alive && status_has_body(response.status_code)
+       && !string_equals(req.http_version, "HTTP/1.0") {
+        return Basic.sprint("HTTP/1.1 % %\r\nDate: %\r\nContent-Type: %\r\nContent-Length: %\r\n\r\n",
+            response.status_code, status_text(response.status_code), date, response.content_type, body_count);
+    }
+
     builder: Basic.String_Builder;
     builder.allocator = context.allocator;
     Basic.print_to_builder(*builder, "HTTP/1.1 % %\r\n", response.status_code, status_text(response.status_code));

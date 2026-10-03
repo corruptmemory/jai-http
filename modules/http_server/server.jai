@@ -128,9 +128,13 @@ server_run :: (server: *Server) {
     }
 }
 
-// Monotonic milliseconds for the timeout stamps.
+// Monotonic milliseconds for the timeout stamps. CLOCK_MONOTONIC_COARSE is the kernel's tick
+// counter read through the vDSO: no TSC read and no S128 math (seconds_since_init does both), at
+// a few ms of resolution, ample for timeouts measured in seconds. Called on every request.
 now_ms :: inline () -> s64 {
-    return cast(s64) (Basic.seconds_since_init() * 1000.0);
+    ts: timespec;
+    clock_gettime(.MONOTONIC_COARSE, *ts);
+    return cast(s64) ts.tv_sec * 1000 + cast(s64) ts.tv_nsec / 1000000;
 }
 
 // Refresh the cached Date value when the wall-clock second has changed. Called once per epoll
