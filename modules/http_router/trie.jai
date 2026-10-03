@@ -132,9 +132,9 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
 
     values: [MAX_PARAMS] string;
     vcount: s32 = 0;
-    leaf_405: s32 = -1;   // first leaf reached whose methods did not match
+    mismatched: Mismatched_Leaves;   // every leaf reached whose methods did not match
 
-    leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *leaf_405);
+    leaf := trie_match_rec(t, 0, sp, segs, 0, method, *values, *vcount, *mismatched);
     if leaf != -1 {
         ep := find_endpoint(*t.nodes[leaf], method);
         if ep != null {
@@ -147,7 +147,7 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
             return ep.handler, .MATCHED, no_allow;
         }
     }
-    if leaf_405 != -1  return null_handler, .METHOD_NOT_ALLOWED, allow_header_for(*t.nodes[leaf_405]);
+    if mismatched.count > 0  return null_handler, .METHOD_NOT_ALLOWED, allow_header_for(t, mismatched);
     return null_handler, .NOT_FOUND, no_allow;
 }
 
@@ -301,22 +301,51 @@ find_endpoint :: (node: *Trie_Node, method: string) -> *Trie_Endpoint {
     return null;
 }
 
-// The Allow value for a 405 at this node: its registered methods in registration order, with
-// HEAD appended whenever GET is registered and HEAD is not. Built from context.allocator, which
+// Leaves that matched the whole path but not the method, collected across backtracking: a 405's
+// Allow must list every method that would succeed for this path, not only the first leaf's.
+MAX_MISMATCHED_LEAVES :: 16;
+
+Mismatched_Leaves :: struct {
+    nodes: [MAX_MISMATCHED_LEAVES] s32;
+    count: s32;
+}
+
+add_mismatched :: (m: *Mismatched_Leaves, node_idx: s32) {
+    if m.count >= MAX_MISMATCHED_LEAVES  return;   // Allow may then be incomplete; the 405 stands
+    m.nodes[m.count] = node_idx;
+    m.count += 1;
+}
+
+// The Allow value for a 405: the union of the mismatched leaves' methods in discovery order, with
+// HEAD appended whenever GET is present and HEAD is not. Built from context.allocator, which
 // during dispatch is the per-request Pool.
-allow_header_for :: (node: *Trie_Node) -> string {
+allow_header_for :: (t: *Trie, mismatched: Mismatched_Leaves) -> string {
+    methods: [32] string;
+    method_count := 0;
+    for i: 0..mismatched.count-1 {
+        node := *t.nodes[mismatched.nodes[i]];
+        for * node.endpoints {
+            if it.method.count == 0  continue;   // an "any" endpoint would have matched; defensive
+            seen := false;
+            for m: 0..method_count-1  if string_equals(methods[m], it.method) { seen = true; break; }
+            if seen || method_count >= methods.count  continue;
+            methods[method_count] = it.method;
+            method_count += 1;
+        }
+    }
+    has_get, has_head := false, false;
+    for m: 0..method_count-1 {
+        if string_equals(methods[m], "GET")   has_get  = true;
+        if string_equals(methods[m], "HEAD")  has_head = true;
+    }
     builder: Basic.String_Builder;
     builder.allocator = context.allocator;
-    has_get, has_head := false, false;
-    for * node.endpoints {
-        if it.method.count == 0  continue;   // an "any" endpoint would have matched; defensive
-        if string_equals(it.method, "GET")   has_get  = true;
-        if string_equals(it.method, "HEAD")  has_head = true;
-        if Basic.builder_string_length(*builder) > 0  Basic.append(*builder, ", ");
-        Basic.append(*builder, it.method);
+    for m: 0..method_count-1 {
+        if m > 0  Basic.append(*builder, ", ");
+        Basic.append(*builder, methods[m]);
     }
     if has_get && !has_head {
-        if Basic.builder_string_length(*builder) > 0  Basic.append(*builder, ", ");
+        if method_count > 0  Basic.append(*builder, ", ");
         Basic.append(*builder, "HEAD");
     }
     return Basic.builder_to_string(*builder,, allocator = context.allocator);
@@ -325,13 +354,13 @@ allow_header_for :: (node: *Trie_Node) -> string {
 // Precedence static -> param -> wildcard, with backtracking. Returns the matched leaf index, or -1.
 // `sp` is the stripped path (for wildcard raw-remainder capture); `segs[k..]` are the unconsumed segments.
 trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32, method: string,
-                   values: *[MAX_PARAMS] string, vcount: *s32, leaf_405: *s32) -> s32 {
+                   values: *[MAX_PARAMS] string, vcount: *s32, mismatched: *Mismatched_Leaves) -> s32 {
     node := *t.nodes[node_idx];
 
     if k == segs.count {
         if node.endpoints.count > 0 {
             if node_has_method(node, method)  return node_idx;
-            if leaf_405.* == -1  leaf_405.* = node_idx;
+            add_mismatched(mismatched, node_idx);
         }
         return -1;
     }
@@ -341,7 +370,7 @@ trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32,
     // 1. STATIC
     sidx := find_static_child(t, node_idx, seg);
     if sidx != -1 {
-        r := trie_match_rec(t, sidx, sp, segs, k + 1, method, values, vcount, leaf_405);
+        r := trie_match_rec(t, sidx, sp, segs, k + 1, method, values, vcount, mismatched);
         if r != -1  return r;
     }
 
@@ -349,7 +378,7 @@ trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32,
     if node.param_child != -1 && seg.count > 0 && vcount.* < MAX_PARAMS {
         values.*[vcount.*] = seg;
         vcount.* += 1;
-        r := trie_match_rec(t, node.param_child, sp, segs, k + 1, method, values, vcount, leaf_405);
+        r := trie_match_rec(t, node.param_child, sp, segs, k + 1, method, values, vcount, mismatched);
         if r != -1  return r;
         vcount.* -= 1;   // backtrack
     }
@@ -365,7 +394,7 @@ trie_match_rec :: (t: *Trie, node_idx: s32, sp: string, segs: [] string, k: s32,
             wnode := *t.nodes[node.wildcard_child];
             if wnode.endpoints.count > 0 {
                 if node_has_method(wnode, method)  return node.wildcard_child;
-                if leaf_405.* == -1  leaf_405.* = node.wildcard_child;
+                add_mismatched(mismatched, node.wildcard_child);
             }
             vcount.* -= 1;   // backtrack
         }

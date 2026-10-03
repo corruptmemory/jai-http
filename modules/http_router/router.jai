@@ -125,34 +125,51 @@ param :: (name: string) -> (value: string, found: bool) {
 // -- Dispatch (called by server event loop) --
 
 dispatch :: (router: *Router, req: *Request, resp: *Response) {
-    // Mounts first — if the path starts with a mount prefix, delegate to the sub-router.
+    no_middleware: [] Middleware;
+    dispatch_in(router, req, resp, no_middleware);
+}
+
+// Resolve req.path within `router`: its mounts first, recursively, then its own trie. `inherited`
+// is the middleware of the enclosing routers, outermost first; this router's own is appended, so
+// a handler behind nested mounts runs every enclosing router's middleware in order.
+dispatch_in :: (router: *Router, req: *Request, resp: *Response, inherited: [] Middleware) {
+    chain := inherited;
+    if router.mw_count > 0 {
+        if inherited.count == 0 {
+            chain.data  = router.middleware.data;
+            chain.count = cast(s64) router.mw_count;
+        } else {
+            // context.allocator: the per-request Pool during dispatch, reset after the response.
+            merged := Basic.NewArray(inherited.count + cast(s64) router.mw_count, Middleware, initialized = false);
+            for inherited  merged[it_index] = it;
+            for j: 0..cast(s64) router.mw_count - 1  merged[inherited.count + j] = router.middleware[j];
+            chain = merged;
+        }
+    }
+
+    // Mounts first — if the path is under a mount prefix, delegate to the sub-router.
     for i: 0..cast(s64) router.mount_count - 1 {
         mp := *router.mounts[i];
-        if starts_with(req.path, mp.prefix) {
-            original_path := req.path;
-            remaining := req.path;
-            remaining.data  += mp.prefix.count;
-            remaining.count -= mp.prefix.count;
-            if remaining.count == 0  req.path = "/";
-            else                     req.path = remaining;
-            dispatch_with_middleware(router, mp.router, req, resp);
-            req.path = original_path;
-            return;
-        }
+        if !mount_matches(req.path, mp.prefix)  continue;
+        original_path := req.path;
+        remaining := req.path;
+        remaining.data  += mp.prefix.count;
+        remaining.count -= mp.prefix.count;
+        if remaining.count == 0  req.path = "/";
+        else                     req.path = remaining;
+        dispatch_in(mp.router, req, resp, chain);
+        req.path = original_path;
+        return;
     }
 
     http_ctx: HTTP_Context;
     handler, status, allow := tree_match(*router.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
 
     if status == .MATCHED {
-        http_ctx.req     = req;
-        http_ctx.resp    = resp;
-        http_ctx.handler = handler;
-
-        mw_slice: [] Middleware;
-        mw_slice.data  = router.middleware.data;
-        mw_slice.count = cast(s64) router.mw_count;
-        http_ctx.middleware = mw_slice;
+        http_ctx.req        = req;
+        http_ctx.resp       = resp;
+        http_ctx.handler    = handler;
+        http_ctx.middleware = chain;
         http_ctx.mw_index   = 0;
 
         ctx := *context;
@@ -251,43 +268,13 @@ is_router_base :: (t: *Type_Info) -> bool {
     return false;
 }
 
-// Dispatch into a sub-router, running parent middleware first, then sub-router middleware.
-dispatch_with_middleware :: (parent: *Router, sub: *Router, req: *Request, resp: *Response) {
-    http_ctx: HTTP_Context;
-    handler, status, allow := tree_match(*sub.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
-
-    if status == .MATCHED {
-        http_ctx.req     = req;
-        http_ctx.resp    = resp;
-        http_ctx.handler = handler;
-
-        // Merge middleware: parent first, then sub-router. Temp storage for the merged slice.
-        total_mw := cast(s64) parent.mw_count + cast(s64) sub.mw_count;
-        if total_mw > 0 {
-            merged := Basic.NewArray(total_mw, Middleware, initialized = false,, allocator = Basic.temp);
-            for j: 0..cast(s64) parent.mw_count - 1  merged[j] = parent.middleware[j];
-            for j: 0..cast(s64) sub.mw_count - 1     merged[cast(s64) parent.mw_count + j] = sub.middleware[j];
-            http_ctx.middleware = merged;
-        }
-        http_ctx.mw_index = 0;
-
-        ctx := *context;
-        ctx.http = *http_ctx;
-        push_context ctx.* {
-            proceed(*http_ctx);
-        }
-        return;
-    }
-
-    if status == .METHOD_NOT_ALLOWED {
-        resp.status_code = 405;
-        resp.body = "Method Not Allowed";
-        set_header(resp, "Allow", allow);   // RFC 9110 §15.5.6: a 405 MUST carry Allow
-        return;
-    }
-
-    resp.status_code = 404;
-    resp.body = "Not Found";
+// A mount prefix covers whole path segments: /api matches /api and /api/x, never /apiary. A
+// prefix that ends in '/' already marks the boundary.
+mount_matches :: (path: string, prefix: string) -> bool {
+    if !starts_with(path, prefix)  return false;
+    if path.count == prefix.count  return true;
+    if prefix.count > 0 && prefix[prefix.count - 1] == #char "/"  return true;
+    return path[prefix.count] == #char "/";
 }
 
 starts_with :: inline (s: string, prefix: string) -> bool {
