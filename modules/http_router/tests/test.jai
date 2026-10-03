@@ -591,6 +591,87 @@ test_macro_route_equivalence :: () {
     print("  PASS: test_macro_route_equivalence\n");
 }
 
+// -- HEAD and Allow (Task 5) --
+
+head_probe_calls: s32;
+get_probe_calls:  s32;
+
+head_probe_handler :: (req: *Request, resp: *Response) { head_probe_calls += 1; resp.status_code = 200; }
+get_probe_handler  :: (req: *Request, resp: *Response) { get_probe_calls  += 1; resp.status_code = 200; resp.body = "get"; }
+
+response_header :: (resp: *Response, name: string) -> (value: string, found: bool) {
+    for i: 0..cast(s64) resp.header_count - 1 {
+        if string_equals(resp.headers[i].name, name)  return resp.headers[i].value, true;
+    }
+    empty: string;
+    return empty, false;
+}
+
+test_head_falls_back_to_get :: () {
+    router: Router;
+    get(*router, "/thing", get_probe_handler);
+    req := Request.{ method = "HEAD", path = "/thing" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 200 && get_probe_calls == 1, "HEAD must be served by the GET route; status %, calls %", resp.status_code, get_probe_calls);
+    assert(string_equals(resp.body, "get"), "the handler runs so Content-Length is right; the writer drops the body");
+    print("  PASS: test_head_falls_back_to_get\n");
+}
+
+test_explicit_head_route_wins :: () {
+    router: Router;
+    get(*router, "/thing", get_probe_handler);
+    head(*router, "/thing", head_probe_handler);
+    req := Request.{ method = "HEAD", path = "/thing" };
+    resp: Response;
+    get_probe_calls = 0;
+    head_probe_calls = 0;
+    dispatch(*router, *req, *resp);
+    assert(head_probe_calls == 1 && get_probe_calls == 0, "an explicit HEAD route beats the GET fallback; head %, get %", head_probe_calls, get_probe_calls);
+    print("  PASS: test_explicit_head_route_wins\n");
+}
+
+test_405_carries_allow :: () {
+    router: Router;
+    get(*router, "/thing", get_probe_handler);
+    post(*router, "/thing", get_probe_handler);
+    req := Request.{ method = "PUT", path = "/thing" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 405, "PUT on a GET/POST path is 405, got %", resp.status_code);
+    allow, found := response_header(*resp, "Allow");
+    assert(found, "405 must carry Allow");
+    assert(string_equals(allow, "GET, POST, HEAD"), "Allow lists registered methods plus HEAD for GET, got '%'", allow);
+    print("  PASS: test_405_carries_allow\n");
+}
+
+test_405_allow_without_get_has_no_head :: () {
+    router: Router;
+    post(*router, "/thing", get_probe_handler);
+    req := Request.{ method = "GET", path = "/thing" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    assert(resp.status_code == 405, "GET on a POST-only path is 405, got %", resp.status_code);
+    allow, found := response_header(*resp, "Allow");
+    assert(found && string_equals(allow, "POST"), "no GET means no implied HEAD, got '%'", allow);
+    print("  PASS: test_405_allow_without_get_has_no_head\n");
+}
+
+test_mount_405_carries_allow :: () {
+    api: Router;
+    get(*api, "/x", get_probe_handler);
+    root: Router;
+    mount(*root, "/api", *api);
+    req := Request.{ method = "DELETE", path = "/api/x" };
+    resp: Response;
+    dispatch(*root, *req, *resp);
+    assert(resp.status_code == 405, "mounted 405, got %", resp.status_code);
+    allow, found := response_header(*resp, "Allow");
+    assert(found && string_equals(allow, "GET, HEAD"), "mounted routers set Allow too, got '%'", allow);
+    print("  PASS: test_mount_405_carries_allow\n");
+}
+
 main :: () {
     print("Running http_router tests...\n\n");
 
@@ -644,6 +725,13 @@ main :: () {
     print("\nRoute macros:\n");
     test_macro_head();
     test_macro_route_equivalence();
+
+    print("\nHEAD and Allow:\n");
+    test_head_falls_back_to_get();
+    test_explicit_head_route_wins();
+    test_405_carries_allow();
+    test_405_allow_without_get_has_no_head();
+    test_mount_405_carries_allow();
 
     print("\nAll http_router tests passed.\n");
 }

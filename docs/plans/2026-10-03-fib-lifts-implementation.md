@@ -1375,7 +1375,7 @@ git commit -m "http_server: permanent EPOLLOUT, flush/read/hangup ordering, disp
 **Interfaces:**
 - Produces: `tree_match(...) -> (handler: Route_Handler, status: Match_Status, allow: string)` (third value is empty unless `status == .METHOD_NOT_ALLOWED`); `allow_header_for :: (node: *Trie_Node) -> string`. Existing two-value call sites keep compiling: Jai lets a caller take fewer return values.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the router test file:
 
@@ -1473,12 +1473,12 @@ Register in the router `main`:
     test_mount_405_carries_allow();
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: `router_tests` fails at `test_head_falls_back_to_get` ("HEAD must be served by the GET route; status 405").
 
-- [ ] **Step 3: HEAD fallback and `Allow` in `trie.jai`**
+- [x] **Step 3: HEAD fallback and `Allow` in `trie.jai`**
 
 Replace `node_has_method` and `find_endpoint`:
 
@@ -1572,7 +1572,7 @@ tree_match :: (t: *Trie, method: string, path: string, out_params: *[MAX_PARAMS]
 
 Fix the `-> (handler: Route_Handler, status: Match_Status)` mention and the `saw_leaf` names in the comments above `tree_match` and `trie_match_rec` to match.
 
-- [ ] **Step 4: Set `Allow` in `router.jai`**
+- [x] **Step 4: Set `Allow` in `router.jai`**
 
 In `dispatch`, change the match call and the 405 branch:
 
@@ -1590,12 +1590,12 @@ In `dispatch`, change the match call and the 405 branch:
 
 Make the identical two edits in `dispatch_with_middleware`.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: the five new router tests `PASS`; the existing `test_tm_404_405`, `test_dispatch_405` and `test_macro_head` still pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add modules/http_router/trie.jai modules/http_router/router.jai modules/http_router/tests/test.jai

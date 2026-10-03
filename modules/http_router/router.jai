@@ -142,7 +142,7 @@ dispatch :: (router: *Router, req: *Request, resp: *Response) {
     }
 
     http_ctx: HTTP_Context;
-    handler, status := tree_match(*router.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
+    handler, status, allow := tree_match(*router.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
 
     if status == .MATCHED {
         http_ctx.req     = req;
@@ -166,6 +166,7 @@ dispatch :: (router: *Router, req: *Request, resp: *Response) {
     if status == .METHOD_NOT_ALLOWED {
         resp.status_code = 405;
         resp.body = "Method Not Allowed";
+        set_header(resp, "Allow", allow);   // RFC 9110 §15.5.6: a 405 MUST carry Allow
         return;
     }
 
@@ -253,7 +254,7 @@ is_router_base :: (t: *Type_Info) -> bool {
 // Dispatch into a sub-router, running parent middleware first, then sub-router middleware.
 dispatch_with_middleware :: (parent: *Router, sub: *Router, req: *Request, resp: *Response) {
     http_ctx: HTTP_Context;
-    handler, status := tree_match(*sub.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
+    handler, status, allow := tree_match(*sub.tree, req.method, req.path, *http_ctx.params, *http_ctx.param_count);
 
     if status == .MATCHED {
         http_ctx.req     = req;
@@ -281,6 +282,7 @@ dispatch_with_middleware :: (parent: *Router, sub: *Router, req: *Request, resp:
     if status == .METHOD_NOT_ALLOWED {
         resp.status_code = 405;
         resp.body = "Method Not Allowed";
+        set_header(resp, "Allow", allow);   // RFC 9110 §15.5.6: a 405 MUST carry Allow
         return;
     }
 
