@@ -1536,6 +1536,477 @@ test_handle_client_header_clock_restarts_at_drain :: () {
     print("  PASS: test_handle_client_header_clock_restarts_at_drain\n");
 }
 
+// -- Review findings (2026-10-03 whole-PR review of fib-lifts) --
+//
+// Each test encodes behavior the code should have and did not at review time. They use
+// review_check instead of assert so one run reports every open finding; the group asserts once
+// at the end. A finding is fixed when its line prints PASS.
+
+review_failures: s32;
+
+review_check :: (ok: bool, name: string, fmt: string, args: ..Any) {
+    if ok { print("  PASS: %\n", name); return; }
+    review_failures += 1;
+    print("  FAIL: %: ", name);
+    print(fmt, ..args);
+    print("\n");
+}
+
+// Records .ERROR log calls, per the project's testing corollary (errors are an assertable side
+// channel even for procedures with no error return).
+Error_Recorder :: struct { errors: s32; }
+
+record_errors :: (message: string, data: *void, info: Log_Info) {
+    if info.common_flags & .ERROR {
+        rec := cast(*Error_Recorder) data;
+        rec.errors += 1;
+    }
+}
+
+// A connected TCP loopback pair; server side non-blocking as accept_connections makes it, client
+// non-blocking too. TCP, not AF_UNIX, because the R1 failure is TCP's: a close with unread input
+// sends RST, and the kernel discards response bytes it has not transmitted yet.
+make_tcp_pair :: (server_sndbuf: s32 = 0, client_rcvbuf: s32 = 0) -> (server: s32, client: s32) {
+    lfd := socket(AF_INET, .SOCK_STREAM | .SOCK_CLOEXEC, 0);
+    assert(lfd >= 0, "socket failed");
+    defer close(lfd);
+    assert(bind(lfd, "127.0.0.1", 0) == 0 && listen(lfd, 1) == 0, "bind/listen failed");
+    addr: sockaddr_in;
+    len: socklen_t = size_of(sockaddr_in);
+    assert(getsockname(lfd, cast(*sockaddr) *addr, *len) == 0, "getsockname failed");
+
+    client := socket(AF_INET, .SOCK_STREAM | .SOCK_CLOEXEC, 0);
+    assert(client >= 0, "socket failed");
+    if client_rcvbuf > 0 {
+        v := client_rcvbuf;
+        setsockopt(client, SOL_SOCKET, SO_RCVBUF, xx *v, size_of(type_of(v)));
+    }
+    assert(connect(client, cast(*sockaddr) *addr, len) == 0, "connect failed: %", errno());
+    fcntl(client, F_SETFL, O_NONBLOCK);
+    server := accept4(lfd, null, null, .NONBLOCK | .CLOEXEC);
+    assert(server >= 0, "accept4 failed: %", errno());
+    if server_sndbuf > 0 {
+        v := server_sndbuf;
+        setsockopt(server, SOL_SOCKET, SO_SNDBUF, xx *v, size_of(type_of(v)));
+    }
+    return server, client;
+}
+
+// Read what the client can see now. ended: 0 = still open (EAGAIN), 1 = EOF, 2 = error (err).
+client_read :: (fd: s32, into: *[..] u8) -> (got: s64, ended: s32, err: s32) {
+    chunk: [16384] u8;
+    total: s64 = 0;
+    while true {
+        n := read(fd, chunk.data, xx chunk.count);
+        if n > 0 { append_bytes(into, chunk.data, n); total += n; continue; }
+        if n == 0  return total, 1, 0;
+        e := errno();
+        if e == EINTR  continue;
+        if e == EAGAIN || e == EWOULDBLOCK  return total, 0, 0;
+        return total, 2, e;
+    }
+    return total, 0, 0;
+}
+
+// R1. Closing with unread input in the kernel receive queue makes TCP send RST, and the kernel
+// discards response bytes it has not transmitted yet (verified with plain sockets: a 200 KB reply
+// arrives as 128 KB, then ECONNRESET). refuse_and_close drains before closing; the close after a
+// `Connection: close` response (immediate, or after a pending tail drains) does not.
+test_review_close_with_unread_input_keeps_response :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, client := make_tcp_pair(server_sndbuf = 65536, client_rcvbuf = 4096);
+    defer close(client);
+    c := attach(*w, server);
+
+    // A `Connection: close` request followed by more input than one read takes in.
+    send_to_server(client, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    junk := big_body(8000);
+    defer free(junk);
+    send_to_server(client, junk);
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    n: s64;
+    ended, err: s32;
+    rounds := 0;
+    while c.state == .ACTIVE && rounds < 200000 {
+        n, ended, err = client_read(client, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+    }
+    // The server has closed: read the rest, blocking, bounded by a receive timeout.
+    fcntl(client, F_SETFL, 0);
+    tv: timeval;
+    tv.tv_sec = 2;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, xx *tv, size_of(timeval));
+    while ended == 0 {
+        n, ended, err = client_read(client, *got);
+        if n == 0 && ended == 0  break;   // timed out
+    }
+
+    out := as_string(got);
+    header_end := index_of(out, "\r\n\r\n");
+    body_got := ifx header_end >= 0 then out.count - (header_end + 4) else 0;
+    how := ifx ended == 1 then "EOF" else ifx ended == 2 then "a reset/error" else "nothing";
+    review_check(ended == 1 && body_got == big_test_body.count, "R1 close_with_unread_input_keeps_response",
+        "the whole response then EOF; got % of % body bytes, then % (errno %)", body_got, big_test_body.count, how, err);
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R2. Content-Length digits are accumulated with no overflow check. first.jai builds BOTH debug
+// and release with arithmetic_overflow_check = .FATAL, so a 20-digit Content-Length panics the
+// process: one request kills every worker. (With the check off it would wrap instead: 2^64 + 5
+// parses as 5, a desync.) Parsed in a forked child so the panic cannot take this suite down.
+test_review_content_length_overflow_rejected :: () {
+    pid := fork();
+    if pid == 0 {
+        c: Connection;
+        s := "POST / HTTP/1.1\r\nContent-Length: 18446744073709551621\r\n\r\nhello";
+        memcpy(c.buf.data, s.data, s.count);
+        c.bytes_used = s.count;
+        r := parse_request(*c);
+        _exit(10 + cast(s32) r);
+    }
+    status: s32;
+    waitpid(pid, *status, 0);
+    exited := (status & 0x7f) == 0;
+    code := (status >> 8) & 0xff;
+    what := ifx !exited then "died on a signal" else ifx code == 1 then "PANICKED (arithmetic overflow; a live server dies)"
+            else tprint("returned Parse_Result %", code - 10);
+    review_check(exited && code == 10 + cast(s32) Parse_Result.ERROR, "R2 content_length_overflow_rejected",
+        "a 20-digit Content-Length must parse as an error; the parse %", what);
+}
+
+// R3. Headers past MAX_HEADERS (64) are dropped silently, including Content-Length, so the body
+// is parsed as the next request (desync). RFC 9110 §15.5.32 / RFC 6585: refuse with 431.
+test_review_too_many_headers_refused :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    req: [..] u8;
+    defer array_free(req);
+    head := "POST / HTTP/1.1\r\n";
+    append_bytes(*req, head.data, head.count);
+    line := "X-H: v\r\n";
+    for 1..70  append_bytes(*req, line.data, line.count);
+    tail := "Content-Length: 5\r\n\r\nhello";
+    append_bytes(*req, tail.data, tail.count);
+    send_to_server(peer, as_string(req));
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    review_check(starts_with(as_string(got), "HTTP/1.1 431 ") && test_handler_calls == 0, "R3 too_many_headers_refused",
+        "more than MAX_HEADERS headers must be refused with 431, not served with headers dropped; handler ran %, got '%'",
+        test_handler_calls, as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R4. Two Content-Length headers with different values: get_header takes the first. RFC 9112
+// §6.3 item 5: an invalid Content-Length (differing values) is unrecoverable; respond 400.
+test_review_duplicate_content_length_rejected :: () {
+    c: Connection;
+    s := "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .ERROR, "R4 duplicate_content_length_rejected",
+        "differing Content-Length values must be an error; got % with content_length %", r, c.req.content_length);
+}
+
+// R5. Transfer-Encoding is ignored: a chunked body is not read as a body, so its first chunk line
+// is parsed as the next request (desync; with Content-Length also present it is the classic
+// CL.TE smuggling shape). Until chunked decoding exists, refuse: RFC 9112 §6.1 says 501 for a
+// transfer coding the server does not understand.
+test_review_transfer_encoding_refused :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    review_check(starts_with(as_string(got), "HTTP/1.1 501 ") && test_handler_calls == 0, "R5 transfer_encoding_refused",
+        "a chunked request must be refused (or decoded), never served bodiless with the chunks re-parsed; handler ran %, got '%'",
+        test_handler_calls, as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R6. Field values keep trailing whitespace (and leading tabs), so `Content-Length: 5 ` is
+// rejected as malformed. RFC 9110 §5.5: OWS around a field value is not part of the value.
+test_review_header_value_ows_trimmed :: () {
+    c: Connection;
+    s := "POST / HTTP/1.1\r\nContent-Length:\t5 \r\n\r\nhello";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .COMPLETE && c.req.content_length == 5, "R6 header_value_ows_trimmed",
+        "OWS around a field value must be ignored; got % with content_length % (parse_error %)", r, c.req.content_length, c.parse_error);
+}
+
+// R7. A request line longer than the read buffer is refused with 431 (header fields too large).
+// RFC 9112 §3: a request-target longer than the server will parse gets 414 URI Too Long.
+test_review_long_request_target_gets_414 :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    pad := big_body(5000);
+    defer free(pad);
+    send_to_server(peer, "GET /");
+    send_to_server(peer, pad);   // no CRLF: the request line alone overflows READ_BUFFER_SIZE
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    review_check(starts_with(as_string(got), "HTTP/1.1 414 "), "R7 long_request_target_gets_414",
+        "an overlong request line gets 414, got '%'", as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R8. Canned 400/408/413/431 replies carry no Date. RFC 9110 §6.6.1: an origin server with a
+// clock MUST send Date in 2xx, 3xx and 4xx responses.
+test_review_canned_replies_carry_date :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    refresh_date(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GARBAGE\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    review_check(starts_with(as_string(got), "HTTP/1.1 400 ") && contains(as_string(got), "\r\nDate: "), "R8 canned_replies_carry_date",
+        "a canned 4xx must carry Date, got '%'", as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R9. accept4 failures other than EAGAIN (EMFILE, ENFILE, ENOMEM, EINVAL, ...) end the accept
+// loop silently. Project standard: no silent failures; they go through log_error. (With an
+// edge-triggered listen socket, a silent EMFILE also strands the backlog until the next SYN.)
+test_review_accept_errors_are_logged :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+
+    rec: Error_Recorder;
+    ctx := context;
+    ctx.logger      = record_errors;
+    ctx.logger_data = *rec;
+
+    // Guard: an empty backlog (EAGAIN) is normal and must stay silent.
+    lfd := socket(AF_INET, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, 0);
+    assert(lfd >= 0, "socket failed");
+    defer close(lfd);
+    assert(bind(lfd, "127.0.0.1", 0) == 0 && listen(lfd, 16) == 0, "bind/listen failed");
+    w.listen_fd = lfd;
+    push_context ctx { accept_connections(*w); }
+    eagain_errors := rec.errors;
+
+    // A socket that is not listening: accept4 fails with EINVAL.
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    w.listen_fd = server;
+    push_context ctx { accept_connections(*w); }
+    w.listen_fd = -1;
+
+    review_check(eagain_errors == 0 && rec.errors > 0, "R9 accept_errors_are_logged",
+        "EAGAIN must stay silent (logged %) and a real accept4 failure must log_error (logged %)",
+        eagain_errors, rec.errors - eagain_errors);
+}
+
+// R10. A field name with whitespace before the colon is accepted as a different header, so
+// `Content-Length : 5` hides the body length (desync). RFC 9112 §5.1: reject with 400.
+test_review_field_name_whitespace_rejected :: () {
+    c: Connection;
+    s := "POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .ERROR, "R10 field_name_whitespace_rejected",
+        "whitespace between a field name and its colon must be an error; got % with content_length %", r, c.req.content_length);
+}
+
+// R11. req.body and req.query_string are never cleared, neither between requests on one
+// connection nor when a pool slot is reused, so a later bodiless request sees the old views into
+// the read buffer: on a recycled slot that is ANOTHER CLIENT'S bytes.
+test_review_request_views_cleared_on_reuse :: () {
+    pool: Connection_Pool;
+    init_pool(*pool, 1);
+    defer destroy_pool(*pool);
+
+    // Client A on the only slot: a POST with a query and a secret body.
+    a := get_connection(*pool);
+    first := "POST /login?user=alice HTTP/1.1\r\nContent-Length: 12\r\n\r\nsecret-token";
+    memcpy(a.buf.data, first.data, first.count);
+    a.bytes_used = first.count;
+    assert(parse_request(a) == .COMPLETE, "setup: client A's request parses");
+    free_connection(*pool, a);
+
+    // Client B gets the same slot and sends a short bodiless GET.
+    b := get_connection(*pool);
+    second := "GET / HTTP/1.1\r\n\r\n";
+    memcpy(b.buf.data, second.data, second.count);
+    b.bytes_used = second.count;
+    assert(parse_request(b) == .COMPLETE, "setup: client B's request parses");
+    review_check(b.req.body.count == 0 && b.req.query_string.count == 0, "R11 request_views_cleared_on_reuse",
+        "client B must not see client A's body/query; body='%' query='%'", b.req.body, b.req.query_string);
+}
+
+// R12. While a response is pending, every READ refreshes last_activity_ms, which is also the
+// WRITE timeout's clock. A client that never reads but sends a byte every 29 s keeps the slot and
+// its pending tail alive for hours. The WRITE deadline must count from write progress only.
+test_review_reads_do_not_extend_write_timeout :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response stalls");
+    stall_ms := c.last_activity_ms;   // the last write progress
+
+    // Let the coarse clock tick (every few ms) so the read below is distinguishable in time.
+    while now_ms() <= stall_ms + 5 {}
+    send_to_server(peer, "G");        // input only: no write progress at all
+    handle_client(*w, c, EPOLLIN);
+
+    timed_out, state := is_timed_out(c, stall_ms + 30000);
+    review_check(timed_out && state == .WRITE, "R12 reads_do_not_extend_write_timeout",
+        "30 s after the last write progress the WRITE timeout must fire despite later input; timed_out=% state=%", timed_out, state);
+    close_connection(*w, c);
+}
+
+// R13. send_canned makes one attempt and ignores EAGAIN and short writes, then the connection
+// closes: under backpressure (an earlier response filled the socket) the 400/408/413/431 never
+// reaches the client and nothing is logged. Deliver it (queue it) or report the failure.
+test_review_canned_reply_survives_backpressure :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    // Fill the server's send buffer, as a preceding SENT response can.
+    filler: [1024] u8;
+    while send(server, filler.data, filler.count, .NOSIGNAL) > 0 {}
+
+    rec: Error_Recorder;
+    ctx := context;
+    ctx.logger      = record_errors;
+    ctx.logger_data = *rec;
+    send_to_server(peer, "GARBAGE\r\n\r\n");
+    push_context ctx { handle_client(*w, c, EPOLLIN); }
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while rounds < 100000 {
+        drain_peer(peer, *got);
+        if c.state != .ACTIVE  break;
+        push_context ctx { handle_client(*w, c, EPOLLOUT); }
+        rounds += 1;
+    }
+    drain_peer(peer, *got);
+    delivered := contains(as_string(got), "HTTP/1.1 400 ");
+    review_check(delivered || rec.errors > 0, "R13 canned_reply_survives_backpressure",
+        "the 400 must reach the peer or its loss must be logged; delivered=% errors=%", delivered, rec.errors);
+    if c.state == .ACTIVE  close_connection(*w, c);
+}
+
+// R14. The Connection header is compared as one whole string and only the first field is read,
+// so `Connection: keep-alive, close` keeps the connection open. RFC 9110 §7.6.1: it is a list of
+// options; `close` wins.
+test_review_connection_option_list :: () {
+    c: Connection;
+    s := "GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .COMPLETE && !c.req.keep_alive, "R14 connection_option_list",
+        "`close` in a Connection option list must end the connection; keep_alive=%", c.req.keep_alive);
+}
+
+// R15. HTTP/1.1 requests without Host, or with two, reach the handler. RFC 9112 §3.2: a server
+// MUST respond 400 to an HTTP/1.1 request that lacks Host or has more than one.
+test_review_host_required_once :: () {
+    statuses: [2] string;
+    calls: [2] s32;
+    requests := string.["GET / HTTP/1.1\r\n\r\n", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"];
+    for requests {
+        w: Worker;
+        make_test_worker(*w, ok_handler);
+        defer destroy_test_worker(*w);
+        server, peer := make_socket_pair();
+        defer close(peer);
+        c := attach(*w, server);
+        send_to_server(peer, it);
+        handle_client(*w, c, EPOLLIN);
+        got: [..] u8;
+        defer array_free(got);
+        drain_peer(peer, *got);
+        out := as_string(got);
+        statuses[it_index] = ifx starts_with(out, "HTTP/1.1 400 ") then "400" else ifx starts_with(out, "HTTP/1.1 200 ") then "200" else "other";
+        calls[it_index] = test_handler_calls;
+        if c.state == .ACTIVE  close_connection(*w, c);
+    }
+    review_check(statuses[0] == "400" && statuses[1] == "400" && calls[0] == 0 && calls[1] == 0, "R15 host_required_once",
+        "missing Host and duplicate Host must both get 400 without a handler run; got % and % (handler runs % and %)",
+        statuses[0], statuses[1], calls[0], calls[1]);
+}
+
+// R16. 205 Reset Content is sent with its body. RFC 9110 §15.3.6: a server MUST NOT generate
+// content in a 205 response (frame it with Content-Length: 0 or close the connection).
+test_review_205_is_bodiless :: () {
+    server, peer := make_socket_pair();
+    defer close(server);
+    defer close(peer);
+    c := standalone_connection(server);
+    defer free(c);
+
+    req  := Request.{ method = "POST", http_version = "HTTP/1.1", keep_alive = true };
+    resp := Response.{ status_code = 205, body = "x" };
+    write_response(c, *req, *resp, "");
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    out := as_string(got);
+    review_check(starts_with(out, "HTTP/1.1 205 ") && out.count == index_of(out, "\r\n\r\n") + 4, "R16 205_is_bodiless",
+        "a 205 must carry no content, got '%'", out);
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -1655,6 +2126,25 @@ main :: () {
     test_parse_multipart_with_filename();
     test_parse_multipart_missing_header();
     test_multipart_value_missing();
+
+    print("\nReview findings (2026-10-03):\n");
+    test_review_close_with_unread_input_keeps_response();
+    test_review_content_length_overflow_rejected();
+    test_review_too_many_headers_refused();
+    test_review_duplicate_content_length_rejected();
+    test_review_transfer_encoding_refused();
+    test_review_header_value_ows_trimmed();
+    test_review_long_request_target_gets_414();
+    test_review_canned_replies_carry_date();
+    test_review_accept_errors_are_logged();
+    test_review_field_name_whitespace_rejected();
+    test_review_request_views_cleared_on_reuse();
+    test_review_reads_do_not_extend_write_timeout();
+    test_review_canned_reply_survives_backpressure();
+    test_review_connection_option_list();
+    test_review_host_required_once();
+    test_review_205_is_bodiless();
+    assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll tests passed.\n");
 }

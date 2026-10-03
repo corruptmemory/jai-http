@@ -672,6 +672,80 @@ test_mount_405_carries_allow :: () {
     print("  PASS: test_mount_405_carries_allow\n");
 }
 
+// -- Review findings (2026-10-03 whole-PR review of fib-lifts) --
+// review_check reports instead of asserting so one run lists every open finding; the group
+// asserts once at the end. A finding is fixed when its line prints PASS.
+
+review_failures: s32;
+
+review_check :: (ok: bool, name: string, fmt: string, args: ..Any) {
+    if ok { print("  PASS: %\n", name); return; }
+    review_failures += 1;
+    print("  FAIL: %: ", name);
+    print(fmt, ..args);
+    print("\n");
+}
+
+review_contains :: (haystack: string, needle: string) -> bool {
+    i := 0;
+    while i + needle.count <= haystack.count {
+        match := true;
+        for j: 0..needle.count - 1  if haystack[i + j] != needle[j] { match = false; break; }
+        if match  return true;
+        i += 1;
+    }
+    return false;
+}
+
+// R17. Allow is built from the FIRST leaf that matched the path but not the method. With
+// overlapping routes, backtracking reaches other leaves whose methods would succeed, and they are
+// left out: here POST /users/new is served by the :id route, yet Allow says only GET.
+// RFC 9110 §10.2.1: Allow lists the methods the target resource supports.
+test_review_allow_unions_overlapping_routes :: () {
+    router: Router;
+    get(*router, "/users/new", get_probe_handler);
+    post(*router, "/users/:id", get_probe_handler);
+    req := Request.{ method = "DELETE", path = "/users/new" };
+    resp: Response;
+    dispatch(*router, *req, *resp);
+    allow, found := response_header(*resp, "Allow");
+    review_check(resp.status_code == 405 && found && review_contains(allow, "GET") && review_contains(allow, "POST"),
+        "R17 allow_unions_overlapping_routes",
+        "Allow must include POST (served via /users/:id) as well as GET; status %, Allow '%'", resp.status_code, allow);
+}
+
+// R18. Mount prefixes are matched as raw string prefixes, not path segments: /apiary reaches the
+// sub-router mounted at /api as its route /ary.
+test_review_mount_prefix_is_segment_aligned :: () {
+    api: Router;
+    get(*api, "/ary", get_probe_handler);
+    root: Router;
+    mount(*root, "/api", *api);
+    req := Request.{ method = "GET", path = "/apiary" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*root, *req, *resp);
+    review_check(resp.status_code == 404 && get_probe_calls == 0, "R18 mount_prefix_is_segment_aligned",
+        "/apiary is not under the /api mount; status %, mounted handler ran %", resp.status_code, get_probe_calls);
+}
+
+// R19. A sub-router's own mounts are never consulted: dispatch_with_middleware matches only the
+// sub-router's trie, so /api/v1/users is a 404.
+test_review_nested_mounts_dispatch :: () {
+    v1: Router;
+    get(*v1, "/users", get_probe_handler);
+    api: Router;
+    mount(*api, "/v1", *v1);
+    root: Router;
+    mount(*root, "/api", *api);
+    req := Request.{ method = "GET", path = "/api/v1/users" };
+    resp: Response;
+    get_probe_calls = 0;
+    dispatch(*root, *req, *resp);
+    review_check(resp.status_code == 200 && get_probe_calls == 1, "R19 nested_mounts_dispatch",
+        "a route in a mount inside a mount must be reachable; status %, handler ran %", resp.status_code, get_probe_calls);
+}
+
 main :: () {
     print("Running http_router tests...\n\n");
 
@@ -732,6 +806,12 @@ main :: () {
     test_405_carries_allow();
     test_405_allow_without_get_has_no_head();
     test_mount_405_carries_allow();
+
+    print("\nReview findings (2026-10-03):\n");
+    test_review_allow_unions_overlapping_routes();
+    test_review_mount_prefix_is_segment_aligned();
+    test_review_nested_mounts_dispatch();
+    assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll http_router tests passed.\n");
 }
