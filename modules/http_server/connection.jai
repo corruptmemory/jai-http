@@ -95,9 +95,7 @@ get_connection :: (pool: *Connection_Pool) -> *Connection {
     c.instance ^= 1;
     c.bytes_used = 0;
     c.parse_offset = 0;
-    c.parse_state = .REQUEST_LINE;
-    c.parse_error = .NONE;
-    reset_request(*c.req);
+    reset_parse(c);
 
     release_pending(c);
     c.close_after_send = false;

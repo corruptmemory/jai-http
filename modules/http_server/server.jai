@@ -170,7 +170,7 @@ timeout_state :: (c: *Connection) -> Timeout_State {
     if c.lingering                return .LINGER;
     if c.pending.count > 0        return .WRITE;
     if c.bytes_used == 0          return .IDLE;
-    if c.parse_state == .BODY     return .BODY;
+    if c.parse_state == .BODY || c.parse_state == .CHUNKED  return .BODY;
     if c.parse_state == .COMPLETE return .NONE;   // never observed by the sweep; defensive
     return .HEADER;
 }
@@ -332,10 +332,11 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
                 c.read_stalled = true;
                 return true;
             }
-            // A full buffer with no complete request: the request line (414) or the header block
-            // (431) alone exceeds READ_BUFFER_SIZE.
+            // A full buffer with no complete request: the request line (414), the header block
+            // (431) or a chunked body (413) alone exceeds READ_BUFFER_SIZE.
             status: u16 = 431;
             if c.parse_state == .REQUEST_LINE  status = 414;
+            if c.parse_state == .CHUNKED       status = 413;
             refuse_and_close(w, c, status);
             return false;
         }

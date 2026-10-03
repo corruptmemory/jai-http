@@ -574,6 +574,192 @@ test_chunk_size_overflow_rejected :: () {
     print("  PASS: test_chunk_size_overflow_rejected\n");
 }
 
+Framing_Case :: struct { fields: string; want: Parse_Error; }
+
+// Spec §3.1: the first matching rule decides. Rules 1-4 are 400 (MALFORMED), rule 5 is 501.
+test_transfer_encoding_rules :: () {
+    cases := Framing_Case.[
+        .{"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", .MALFORMED},    // rule 2: TE with CL
+        .{"Transfer-Encoding: gzip\r\n", .MALFORMED},                            // rule 3: last coding is not chunked
+        .{"Transfer-Encoding: chunked, gzip\r\n", .MALFORMED},
+        .{"Transfer-Encoding: xchunked\r\n", .MALFORMED},
+        .{"Transfer-Encoding: chunked;x=1\r\n", .MALFORMED},
+        .{"Transfer-Encoding:\r\n", .MALFORMED},                                 // no codings at all
+        .{"Transfer-Encoding: chunked, chunked\r\n", .MALFORMED},                // rule 4: chunked twice
+        .{"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", .MALFORMED},
+        .{"Transfer-Encoding: gzip, chunked\r\n", .UNSUPPORTED_FRAMING},         // rule 5: unknown coding first
+        .{"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", .UNSUPPORTED_FRAMING},
+        .{"Transfer-Encoding: Chunked\r\n", .NONE},                              // rule 6: case-insensitive
+        .{"Transfer-Encoding: , chunked ,\r\n", .NONE},                          // empty members are skipped
+    ];
+    for tc: cases {
+        c := New(Connection);
+        defer free(c);
+        fill_request(c, tprint("POST / HTTP/1.1\r\nHost: x\r\n%\r\n0\r\n\r\n", tc.fields));
+        r := parse_request(c);
+        if tc.want == .NONE  assert(r == .COMPLETE && c.req.body.count == 0, "'%': expected an empty decoded body, got % (%)", tc.fields, r, c.parse_error);
+        else                 assert(r == .ERROR && c.parse_error == tc.want, "'%': expected %, got % (%)", tc.fields, tc.want, r, c.parse_error);
+    }
+    // Rule 1: any Transfer-Encoding on HTTP/1.0 is faulty framing.
+    c := New(Connection);
+    defer free(c);
+    fill_request(c, "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    r := parse_request(c);
+    assert(r == .ERROR && c.parse_error == .MALFORMED, "TE on HTTP/1.0 must be MALFORMED, got % (%)", r, c.parse_error);
+    print("  PASS: test_transfer_encoding_rules\n");
+}
+
+// Review focus 2. A trailer named Content-Length or Transfer-Encoding is discarded; it must not
+// reframe anything. The pipelined request behind it parses intact.
+test_chunked_trailers_cannot_reframe :: () {
+    c := New(Connection);
+    defer free(c);
+    fill_request(c, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    r := parse_request(c);
+    assert(r == .COMPLETE && string_equals(c.req.body, "hello") && c.req.header_count == 2, "first request: got % body '%' with % headers (%)", r, c.req.body, c.req.header_count, c.parse_error);
+    reset_for_next_request(c);
+    r = parse_request(c);
+    assert(r == .COMPLETE && string_equals(c.req.method, "GET") && string_equals(c.req.path, "/b") && c.req.body.count == 0, "the pipelined GET parses intact: got % % '%' (%)",
+        r, c.req.method, c.req.path, c.parse_error);
+    assert(c.parse_offset == c.bytes_used, "nothing is left over: offset % of %", c.parse_offset, c.bytes_used);
+    print("  PASS: test_chunked_trailers_cannot_reframe\n");
+}
+
+test_chunked_pipelined_with_get :: () {
+    w: Worker;
+    make_test_worker(*w, body_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(test_handler_calls == 2 && count_occurrences(as_string(got), "HTTP/1.1 200 OK\r\n") == 2, "both requests served; handler ran %, got '%'", test_handler_calls, as_string(got));
+    close_connection(*w, c);
+    print("  PASS: test_chunked_pipelined_with_get\n");
+}
+
+// Review focus 3.
+test_chunked_then_partial_next_request :: () {
+    w: Worker;
+    make_test_worker(*w, body_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /b HTTP/1.1\r\nHo");
+    handle_client(*w, c, EPOLLIN);
+    assert(test_handler_calls == 1 && string_equals(last_body(), "abc"), "the chunked request is served; handler ran %, body '%'", test_handler_calls, last_body());
+    assert(c.parse_state == .HEADERS, "the partial GET waits in the buffer, got %", c.parse_state);
+
+    send_to_server(peer, "st: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(test_handler_calls == 2 && last_body_len == 0, "the completed GET is served with no body; handler ran %, body '%'", test_handler_calls, last_body());
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(count_occurrences(as_string(got), "HTTP/1.1 200 OK\r\n") == 2, "two responses, got '%'", as_string(got));
+    close_connection(*w, c);
+    print("  PASS: test_chunked_then_partial_next_request\n");
+}
+
+// Review focus 4. The chunked request waits behind a stalled response and is decoded after the drain.
+test_chunked_behind_stalled_response :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, mixed_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET /big HTTP/1.1\r\nHost: x\r\n\r\nPOST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0 && test_handler_calls == 1, "setup: the first response stalls and the chunked request waits; handler ran %", test_handler_calls);
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while test_handler_calls < 2 || c.pending.count > 0 {
+        got.count = 0;
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(string_equals(last_body(), "hello"), "decoded after the drain, got '%'", last_body());
+    close_connection(*w, c);
+    print("  PASS: test_chunked_behind_stalled_response\n");
+}
+
+// Review focus 1. Exactly READ_BUFFER_SIZE (4096) is served; one byte more is 413.
+test_chunked_buffer_edge :: () {
+    head := "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // head + "<3 hex digits>\r\n" + data + "\r\n" + "0\r\n\r\n" = 4096
+    fits := 4096 - head.count - 3 - 2 - 2 - 5;
+    assert(hex(fits).count == 3 && hex(fits + 1).count == 3, "setup: the size line has 3 hex digits");
+    for extra: 0..1 {
+        w: Worker;
+        make_test_worker(*w, body_handler);
+        defer destroy_test_worker(*w);
+        server, peer := make_socket_pair();
+        defer close(peer);
+        c := attach(*w, server);
+
+        data := big_body(fits + extra);
+        defer free(data);
+        msg := concat(head, hex(fits + extra), "\r\n", data, "\r\n0\r\n\r\n");
+        defer free(msg);
+        assert(msg.count == 4096 + extra, "setup: message is % bytes", msg.count);
+        send_to_server(peer, msg);
+        handle_client(*w, c, EPOLLIN);
+
+        got: [..] u8;
+        defer array_free(got);
+        drain_peer(peer, *got);
+        if extra == 0 {
+            assert(starts_with(as_string(got), "HTTP/1.1 200 ") && last_body_len == fits, "a 4096-byte chunked request is served: got '%', body %", as_string(got), last_body_len);
+        } else {
+            assert(starts_with(as_string(got), "HTTP/1.1 413 ") && test_handler_calls == 0, "4097 bytes is 413: got '%'", as_string(got));
+        }
+        if c.state == .ACTIVE  close_connection(*w, c);
+    }
+    print("  PASS: test_chunked_buffer_edge\n");
+}
+
+test_chunked_trickle_gets_408 :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.parse_state == .CHUNKED && timeout_state(c) == .BODY, "setup: mid-chunk, timed as BODY; got % / %", c.parse_state, timeout_state(c));
+    c.request_start_ms = 0;   // pretend it started at the epoch
+
+    closed := check_timeouts(*w, 29999);
+    assert(closed == 0, "not yet");
+    closed = check_timeouts(*w, 30000);
+    assert(closed == 1 && (c.state == .FREE || c.lingering), "a trickled chunked body is reaped at 30 s, got closed=%", closed);
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(starts_with(as_string(got), "HTTP/1.1 408 "), "a body timeout gets 408, got '%'", as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
+    print("  PASS: test_chunked_trickle_gets_408\n");
+}
+
 test_reset_for_next_request :: () {
     c: Connection;
     // Simulate two pipelined requests
@@ -1200,6 +1386,54 @@ big_handler :: (req: *Request, resp: *Response) {
     test_handler_calls += 1;
     resp.status_code = 200;
     resp.body = big_test_body;
+}
+
+last_body_buf: [4096] u8;
+last_body_len: s64;
+
+// Counts the call and records the request body (copied: the view dies with the buffer shift).
+body_handler :: (req: *Request, resp: *Response) {
+    test_handler_calls += 1;
+    last_body_len = req.body.count;
+    memcpy(last_body_buf.data, req.body.data, req.body.count);
+    resp.status_code = 200;
+    resp.body = "ok";
+}
+
+last_body :: () -> string {
+    s: string;
+    s.data  = last_body_buf.data;
+    s.count = last_body_len;
+    return s;
+}
+
+// body_handler plus a large response for /big, so a test can stall the first of two requests.
+mixed_handler :: (req: *Request, resp: *Response) {
+    body_handler(req, resp);
+    if string_equals(req.path, "/big")  resp.body = big_test_body;
+}
+
+// Lower-case hex digits of n >= 0 (formatInt is soft-deprecated in beta 0.2.030).
+hex :: (n: s64) -> string {
+    DIGITS :: "0123456789abcdef";
+    if n == 0  return "0";
+    digits: [16] u8;
+    i := digits.count;
+    v := n;
+    while v > 0 { i -= 1; digits[i] = DIGITS[v % 16]; v /= 16; }
+    s := alloc_string(digits.count - i);
+    memcpy(s.data, digits.data + i, s.count);
+    return s;
+}
+
+// Concatenate `parts` (the String module's join is not imported here; see index_of).
+concat :: (parts: ..string) -> string {
+    total := 0;
+    for parts  total += it.count;
+    s := alloc_string(total);
+    at := 0;
+    for parts { memcpy(s.data + at, it.data, it.count); at += it.count; }
+    return s;
 }
 
 make_test_worker :: (w: *Worker, handler: Handler) {
@@ -1865,28 +2099,27 @@ test_duplicate_content_length_rejected :: () {
     print("  PASS: test_duplicate_content_length_rejected\n");
 }
 
-// R5. Transfer-Encoding is ignored: a chunked body is not read as a body, so its first chunk line
-// is parsed as the next request (desync; with Content-Length also present it is the classic
-// CL.TE smuggling shape). Until chunked decoding exists, refuse: RFC 9112 §6.1 says 501 for a
-// transfer coding the server does not understand.
-test_transfer_encoding_refused :: () {
+// R5, superseded. Transfer-Encoding used to be ignored, so a chunked body was parsed as further
+// requests (desync); PR #5 refused it with 501. Now the body is decoded and the handler sees it.
+test_chunked_request_decoded :: () {
     w: Worker;
-    make_test_worker(*w, ok_handler);
+    make_test_worker(*w, body_handler);
     defer destroy_test_worker(*w);
     server, peer := make_socket_pair();
     defer close(peer);
     c := attach(*w, server);
 
-    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     handle_client(*w, c, EPOLLIN);
 
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
-    assert(starts_with(as_string(got), "HTTP/1.1 501 ") && test_handler_calls == 0, "a chunked request must be refused (or decoded), never served bodiless with the chunks re-parsed; handler ran %, got '%'",
-        test_handler_calls, as_string(got));
-    print("  PASS: test_transfer_encoding_refused\n");
-    if c.state == .ACTIVE  close_connection(*w, c);
+    assert(starts_with(as_string(got), "HTTP/1.1 200 ") && test_handler_calls == 1, "a chunked request is served once; handler ran %, got '%'", test_handler_calls, as_string(got));
+    assert(string_equals(last_body(), "hello world"), "the handler sees the decoded body, got '%'", last_body());
+    assert(c.state == .ACTIVE && !c.lingering, "the connection stays open after a chunked request");
+    close_connection(*w, c);
+    print("  PASS: test_chunked_request_decoded\n");
 }
 
 // R6. Field values keep trailing whitespace (and leading tabs), so `Content-Length: 5 ` is
@@ -2353,7 +2586,6 @@ main :: () {
     test_handle_client_header_clock_restarts_at_drain();
     test_close_with_unread_input_keeps_response();
     test_too_many_headers_refused();
-    test_transfer_encoding_refused();
     test_host_required_once();
     test_long_request_target_gets_414();
     test_canned_replies_carry_date();
@@ -2421,6 +2653,14 @@ main :: () {
     test_chunked_grammar_refused();
     test_chunk_size_limits();
     test_chunk_size_overflow_rejected();
+    test_transfer_encoding_rules();
+    test_chunked_request_decoded();
+    test_chunked_trailers_cannot_reframe();
+    test_chunked_pipelined_with_get();
+    test_chunked_then_partial_next_request();
+    test_chunked_behind_stalled_response();
+    test_chunked_buffer_edge();
+    test_chunked_trickle_gets_408();
 
     print("\nPipelining:\n");
     test_reset_for_next_request();

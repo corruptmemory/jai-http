@@ -55,7 +55,7 @@ Parse_Error :: enum u8 #specified {
     MALFORMED             :: 1;   // 400
     BODY_TOO_LARGE        :: 2;   // 413
     TOO_MANY_HEADERS      :: 3;   // 431: more header fields than MAX_HEADERS
-    UNSUPPORTED_FRAMING   :: 4;   // 501: Transfer-Encoding (chunked request bodies are not decoded)
+    UNSUPPORTED_FRAMING   :: 4;   // 501: a transfer coding other than chunked (RFC 9112 §6.1)
     VERSION_NOT_SUPPORTED :: 5;   // 505: a well-formed HTTP-version whose major version is not 1
 }
 
@@ -144,14 +144,16 @@ parse_request :: (c: *Connection) -> Parse_Result {
             if crlf == c.parse_offset {
                 // Empty line — end of headers
                 c.parse_offset = crlf + 2;
-                header_error := finish_headers(c);
+                header_error, next := finish_headers(c);
                 if header_error != .NONE  return parse_fail(c, header_error);
-                if c.req.content_length > 0 {
-                    c.parse_state = .BODY;
-                    break;  // Fall through to BODY check below
+                c.parse_state = next;
+                if next == .COMPLETE  return .COMPLETE;
+                if next == .CHUNKED {
+                    c.chunk_phase = .SIZE;
+                    c.body_start  = c.parse_offset;
+                    c.body_end    = c.parse_offset;
                 }
-                c.parse_state = .COMPLETE;
-                return .COMPLETE;
+                break;  // BODY or CHUNKED: continue below
             }
 
             // Find colon separator. RFC 9112 §5.1: the field name is a token with no whitespace
@@ -176,6 +178,8 @@ parse_request :: (c: *Connection) -> Parse_Result {
             c.parse_offset = crlf + 2;
         }
     }
+
+    if c.parse_state == .CHUNKED  return parse_chunked(c);
 
     // Wait for request body bytes
     if c.parse_state == .BODY {
@@ -261,6 +265,18 @@ reset_request :: (req: *Request) {
     req.content_length = 0;
 }
 
+// Return the parser to the start of a request. get_connection and reset_for_next_request both
+// call this, so the per-request fields they clear cannot drift apart (the R11 lesson).
+reset_parse :: (c: *Connection) {
+    c.parse_state     = .REQUEST_LINE;
+    c.parse_error     = .NONE;
+    c.chunk_phase     = .SIZE;
+    c.chunk_remaining = 0;
+    c.body_start      = 0;
+    c.body_end        = 0;
+    reset_request(*c.req);
+}
+
 // Prepare connection for the next request (keep-alive pipelining).
 // Shifts any remaining bytes to the start of the buffer.
 reset_for_next_request :: (c: *Connection) {
@@ -268,9 +284,7 @@ reset_for_next_request :: (c: *Connection) {
     if remaining > 0  move_down(c.buf.data, 0, c.parse_offset, remaining);
     c.bytes_used = remaining;
     c.parse_offset = 0;
-    c.parse_state = .REQUEST_LINE;
-    c.parse_error = .NONE;
-    reset_request(*c.req);
+    reset_parse(c);
     c.request_start_ms = ifx remaining > 0 then now_ms() else 0;   // a pipelined next request is timed from now
 }
 
@@ -579,6 +593,18 @@ trim_ows :: (s: string) -> string {
     return r;
 }
 
+// Pop the next comma-separated member off `rest`, OWS-trimmed (RFC 9110 §5.6.1). Empty members
+// come back as empty strings; `rest` is empty once the list is exhausted.
+next_list_member :: (rest: *string) -> string {
+    comma := find_byte(rest.data, 0, rest.count, #char ",");
+    end   := ifx comma < 0 then rest.count else comma;
+    member := trim_ows(make_view(rest.data, 0, end));
+    skip  := ifx comma < 0 then rest.count else comma + 1;
+    rest.data  += skip;
+    rest.count -= skip;
+    return member;
+}
+
 // RFC 9110 §5.6.2: tchar = ALPHA / DIGIT / one of the punctuation below.
 is_tchar :: inline (ch: u8) -> bool {
     TCHAR_PUNCTUATION :: "!#$%&'*+-.^_`|~";
@@ -725,24 +751,49 @@ is_host_value :: (s: string) -> bool {
     return true;
 }
 
+// How a request carrying Transfer-Encoding is framed (spec §3.1; RFC 9112 §6.1, §6.3). NONE means
+// exactly `chunked`. Codings are collected from every Transfer-Encoding field in order; empty list
+// members are skipped, and only the bare token `chunked` (any case) counts as chunked.
+transfer_coding_error :: (req: *Request, has_content_length: bool) -> Parse_Error {
+    if req.http_version[7] == #char "0"  return .MALFORMED;   // rule 1: on HTTP/1.0 the framing is faulty
+    if has_content_length                return .MALFORMED;   // rule 2: TE with CL, the smuggling shape
+    codings, chunked_count := 0, 0;
+    last_is_chunked := false;
+    for i: 0..cast(s64) req.header_count - 1 {
+        if !string_equals_ci(req.headers[i].name, "Transfer-Encoding")  continue;
+        rest := req.headers[i].value;
+        while rest.count > 0 {
+            coding := next_list_member(*rest);
+            if coding.count == 0  continue;
+            codings += 1;
+            last_is_chunked = string_equals_ci(coding, "chunked");
+            if last_is_chunked  chunked_count += 1;
+        }
+    }
+    if !last_is_chunked   return .MALFORMED;             // rule 3 (no codings at all, too)
+    if chunked_count > 1  return .MALFORMED;             // rule 4: chunked applied twice
+    if codings > 1        return .UNSUPPORTED_FRAMING;   // rule 5: a coding before chunked we cannot undo
+    return .NONE;                                        // rule 6
+}
+
 // Validate the complete header block and settle the request's framing and keep-alive. Framing is
-// checked first, since it decides where the next request starts; then Host.
-finish_headers :: (c: *Connection) -> Parse_Error {
+// checked first, since it decides where the next request starts; then Host. `next` is the state
+// the body is read in: COMPLETE (no body), BODY (Content-Length) or CHUNKED.
+finish_headers :: (c: *Connection) -> (error: Parse_Error, next: Parse_State) {
     req := *c.req;
     content_length: s64 = -1;
     host_count := 0;
     host_valid := true;
+    has_transfer_encoding := false;
     for i: 0..cast(s64) req.header_count - 1 {
         h := *req.headers[i];
-        // Chunked request bodies are not decoded. Ignoring Transfer-Encoding would parse the body
-        // as further requests (desync); RFC 9112 §6.1 answers an unsupported coding with 501.
-        if string_equals_ci(h.name, "Transfer-Encoding")  return .UNSUPPORTED_FRAMING;
+        if string_equals_ci(h.name, "Transfer-Encoding")  has_transfer_encoding = true;
         if string_equals_ci(h.name, "Content-Length") {
             value, valid, too_large := parse_content_length(h.value);
-            if !valid      return .MALFORMED;
-            if too_large   return .BODY_TOO_LARGE;
+            if !valid      return .MALFORMED, .ERROR;
+            if too_large   return .BODY_TOO_LARGE, .ERROR;
             // RFC 9112 §6.3: differing Content-Length values make the framing unrecoverable.
-            if content_length >= 0 && value != content_length  return .MALFORMED;
+            if content_length >= 0 && value != content_length  return .MALFORMED, .ERROR;
             content_length = value;
         }
         if string_equals_ci(h.name, "Host") {
@@ -750,15 +801,21 @@ finish_headers :: (c: *Connection) -> Parse_Error {
             if !is_host_value(h.value)  host_valid = false;
         }
     }
-    if content_length > 0 {
-        if content_length > cast(s64) READ_BUFFER_SIZE - c.parse_offset  return .BODY_TOO_LARGE;   // won't fit
+    next := Parse_State.COMPLETE;
+    if has_transfer_encoding {
+        te_error := transfer_coding_error(req, content_length >= 0);
+        if te_error != .NONE  return te_error, .ERROR;
+        next = .CHUNKED;
+    } else if content_length > 0 {
+        if content_length > cast(s64) READ_BUFFER_SIZE - c.parse_offset  return .BODY_TOO_LARGE, .ERROR;   // won't fit
         req.content_length = content_length;
+        next = .BODY;
     }
     // RFC 9112 §3.2: 400 for more than one Host, an invalid one, and an HTTP/1.1 request without one.
-    if host_count > 1 || !host_valid  return .MALFORMED;
-    if host_count == 0 && req.http_version[7] != #char "0"  return .MALFORMED;
+    if host_count > 1 || !host_valid  return .MALFORMED, .ERROR;
+    if host_count == 0 && req.http_version[7] != #char "0"  return .MALFORMED, .ERROR;
     determine_keep_alive(req);
-    return .NONE;
+    return .NONE, next;
 }
 
 // HTTP/1.1 (and any later 1.x) defaults to keep-alive, HTTP/1.0 to close. Every Connection field is
@@ -768,14 +825,10 @@ determine_keep_alive :: (req: *Request) {
     for i: 0..cast(s64) req.header_count - 1 {
         if !string_equals_ci(req.headers[i].name, "Connection")  continue;
         rest := req.headers[i].value;
-        while true {
-            comma := find_byte(rest.data, 0, rest.count, #char ",");
-            option := trim_ows(make_view(rest.data, 0, ifx comma < 0 then rest.count else comma));
+        while rest.count > 0 {
+            option := next_list_member(*rest);
             if string_equals_ci(option, "close")       saw_close = true;
             if string_equals_ci(option, "keep-alive")  saw_keep_alive = true;
-            if comma < 0  break;
-            rest.data  += comma + 1;
-            rest.count -= comma + 1;
         }
     }
     req.keep_alive = req.http_version[7] != #char "0";
