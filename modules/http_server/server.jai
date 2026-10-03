@@ -19,7 +19,9 @@ Worker :: struct {
     handler:      Handler;
     handler_data: *Handler_Data;
     request_pool: Pool_Module.Pool;  // Per-request allocator, reset after each dispatch
-    date:         string;            // Date header value for responses; empty omits the header
+    date:         string;            // cached IMF-fixdate for this second (a view into date_buf); empty omits Date
+    date_buf:     [29] u8;
+    date_second:  s64 = -1;
     thread:       Thread;
 }
 
@@ -129,6 +131,74 @@ server_run :: (server: *Server) {
 // Monotonic milliseconds for the timeout stamps.
 now_ms :: inline () -> s64 {
     return cast(s64) (Basic.seconds_since_init() * 1000.0);
+}
+
+// Refresh the cached Date value when the wall-clock second has changed. Called once per epoll
+// batch; a batch lasts microseconds, so a response is never more than a batch stale.
+refresh_date :: (w: *Worker) {
+    now := Basic.current_time_consensus();
+    sec, ok := Basic.to_seconds(now);
+    if !ok  return;                  // keep the previous value; not worth a per-batch error
+    if sec == w.date_second  return;
+    w.date_second = sec;
+    w.date = format_http_date(Basic.to_calendar(now, .UTC), *w.date_buf);
+}
+
+// -- Timeouts --
+//
+// A connection is bounded by one timeout at a time, chosen by what it is waiting for. A request
+// that has fully arrived has no deadline: the handler runs synchronously and request_start_ms is
+// cleared before dispatch. Sweeps run once a second from worker_run when any timeout is enabled.
+
+TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0;
+
+Timeout_State :: enum u8 #specified {
+    NONE   :: 0;
+    IDLE   :: 1;   // between requests
+    HEADER :: 2;   // request begun, headers incomplete
+    BODY   :: 3;   // headers complete, body incomplete
+    WRITE  :: 4;   // response tail pending
+}
+
+timeout_state :: (c: *Connection) -> Timeout_State {
+    if c.pending.count > 0        return .WRITE;
+    if c.bytes_used == 0          return .IDLE;
+    if c.parse_state == .BODY     return .BODY;
+    if c.parse_state == .COMPLETE return .NONE;   // never observed by the sweep; defensive
+    return .HEADER;
+}
+
+is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_State) {
+    state := timeout_state(c);
+    limit: s64 = 0;
+    since: s64 = 0;
+    if state == {
+        case .IDLE;   limit = IDLE_TIMEOUT_MS;   since = c.last_activity_ms;
+        case .WRITE;  limit = WRITE_TIMEOUT_MS;  since = c.last_activity_ms;
+        case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
+        case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
+        case;         return false, state;
+    }
+    if limit <= 0  return false, state;
+    return now - since >= limit, state;
+}
+
+// Close every active connection whose timeout has passed. Returns how many were closed. A slow
+// request gets a 408 through refuse_and_close: the client may still be sending, so the reply
+// needs the same drain-before-close to survive.
+check_timeouts :: (w: *Worker, now: s64) -> s32 {
+    closed: s32 = 0;
+    for * w.pool.connections {
+        c := it;
+        if c.state != .ACTIVE || c == w.listen_conn  continue;
+        timed_out, state := is_timed_out(c, now);
+        if !timed_out  continue;
+        Basic.log("fd %: % timeout; closing", c.fd, state);
+        if state == .HEADER || state == .BODY  refuse_and_close(w, c, 408);
+        else                                   close_connection(w, c);
+        closed += 1;
+    }
+    return closed;
 }
 
 accept_connections :: (w: *Worker) {
@@ -366,14 +436,17 @@ worker_listen :: (w: *Worker, address: string, port: u16) -> bool {
 }
 
 worker_run :: (w: *Worker) {
+    last_sweep := now_ms();
+    wait_ms: s32 = ifx TIMEOUTS_ENABLED then cast(s32) 1000 else cast(s32) -1;
     while w.running {
-        nfds := epoll_process_events(*w.engine, timeout_ms = -1);
+        nfds := epoll_process_events(*w.engine, timeout_ms = wait_ms);
         if nfds < 0 {
             err := errno();
             if err == EINTR continue;
             Basic.log_error("Worker %: epoll_wait failed: %", w.id, err);
             continue;
         }
+        refresh_date(w);
 
         for i: 0..nfds-1 {
             ev := *w.engine.events[i];
@@ -389,6 +462,14 @@ worker_run :: (w: *Worker) {
             }
         }
         Basic.reset_temporary_storage();
+
+        #if TIMEOUTS_ENABLED {
+            now := now_ms();
+            if now - last_sweep >= 1000 {
+                check_timeouts(w, now);
+                last_sweep = now;
+            }
+        }
     }
 }
 

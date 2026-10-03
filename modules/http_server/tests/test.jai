@@ -1322,6 +1322,188 @@ test_handle_client_half_close_serves_pipelined :: () {
     print("  PASS: test_handle_client_half_close_serves_pipelined\n");
 }
 
+// -- Timeouts (Task 6). Defaults asserted as literals: idle 60000, header 10000, body 30000, write 30000. --
+
+test_timeout_state_classification :: () {
+    c: Connection;
+    assert(timeout_state(*c) == .IDLE, "empty buffer, nothing pending: IDLE");
+    c.bytes_used = 5;
+    c.parse_state = .REQUEST_LINE;
+    assert(timeout_state(*c) == .HEADER, "bytes in the buffer before the headers end: HEADER");
+    c.parse_state = .HEADERS;
+    assert(timeout_state(*c) == .HEADER, "mid-headers: HEADER");
+    c.parse_state = .BODY;
+    assert(timeout_state(*c) == .BODY, "headers done, body incomplete: BODY");
+    c.pending.count = 1;   // synthetic: a queued tail outranks everything
+    assert(timeout_state(*c) == .WRITE, "pending output: WRITE");
+    c.pending.count = 0;
+    print("  PASS: test_timeout_state_classification\n");
+}
+
+test_is_timed_out_uses_the_right_clock :: () {
+    c: Connection;
+    c.last_activity_ms = 1000;
+    t, s := is_timed_out(*c, 1000 + 59999);
+    assert(!t && s == .IDLE, "idle one ms short of 60 s is fine");
+    t, s = is_timed_out(*c, 1000 + 60000);
+    assert(t && s == .IDLE, "idle at 60 s times out");
+
+    c.bytes_used = 3;
+    c.parse_state = .REQUEST_LINE;
+    c.request_start_ms = 5000;
+    c.last_activity_ms = 14990;   // recent activity does not rescue a slow header
+    t, s = is_timed_out(*c, 5000 + 9999);
+    assert(!t && s == .HEADER, "header one ms short of 10 s is fine");
+    t, s = is_timed_out(*c, 5000 + 10000);
+    assert(t && s == .HEADER, "header at 10 s times out, measured from the request start");
+
+    c.parse_state = .BODY;
+    t, s = is_timed_out(*c, 5000 + 29999);
+    assert(!t && s == .BODY, "body one ms short of 30 s is fine");
+    t, s = is_timed_out(*c, 5000 + 30000);
+    assert(t && s == .BODY, "body at 30 s times out");
+    print("  PASS: test_is_timed_out_uses_the_right_clock\n");
+}
+
+test_is_timed_out_write_then_idle :: () {
+    c: Connection;
+    c.pending.count = 1;          // synthetic tail
+    c.last_activity_ms = 1000;    // last write progress
+    c.request_start_ms = 0;
+    t, s := is_timed_out(*c, 1000 + 29999);
+    assert(!t && s == .WRITE, "pending output short of 30 s is fine");
+    t, s = is_timed_out(*c, 1000 + 30000);
+    assert(t && s == .WRITE, "a stalled write times out at 30 s");
+
+    // The tail drains at t=20000: idle is measured from that progress, not from the request.
+    c.pending.count = 0;
+    c.last_activity_ms = 20000;
+    t, s = is_timed_out(*c, 20000 + 59999);
+    assert(!t && s == .IDLE, "idle after a drain counts from the drain");
+    t, s = is_timed_out(*c, 20000 + 60000);
+    assert(t && s == .IDLE, "then times out at 60 s");
+    print("  PASS: test_is_timed_out_write_then_idle\n");
+}
+
+test_check_timeouts_closes_idle_silently :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+    c.last_activity_ms = 0;
+
+    closed := check_timeouts(*w, 59999);
+    assert(closed == 0 && c.state == .ACTIVE, "not yet");
+    closed = check_timeouts(*w, 60000);
+    assert(closed == 1 && c.state == .FREE, "idle connection reaped, got closed=% state=%", closed, c.state);
+
+    got: [..] u8;
+    defer array_free(got);
+    n := drain_peer(peer, *got);
+    assert(n == 0, "an idle timeout sends nothing, got '%'", as_string(got));
+    print("  PASS: test_check_timeouts_closes_idle_silently\n");
+}
+
+test_check_timeouts_sends_408_for_a_slow_header :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n");   // no terminator: headers incomplete
+    handle_client(*w, c, EPOLLIN);
+    assert(c.state == .ACTIVE && c.bytes_used > 0 && c.request_start_ms > 0, "setup: request in progress");
+    c.request_start_ms = 0;   // pretend it started at the epoch
+
+    closed := check_timeouts(*w, 10000);
+    assert(closed == 1 && c.state == .FREE, "slow header reaped at 10 s, got closed=%", closed);
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(starts_with(as_string(got), "HTTP/1.1 408 "), "a header timeout gets 408, got '%'", as_string(got));
+    print("  PASS: test_check_timeouts_sends_408_for_a_slow_header\n");
+}
+
+test_check_timeouts_skips_free_slots_and_listener :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    w.listen_conn = get_connection(*w.pool);   // sentinel, never timed
+    w.listen_conn.last_activity_ms = 0;
+    closed := check_timeouts(*w, 1000000);
+    assert(closed == 0, "free slots and the listen sentinel are never reaped, got %", closed);
+    free_connection(*w.pool, w.listen_conn);
+    w.listen_conn = null;
+    print("  PASS: test_check_timeouts_skips_free_slots_and_listener\n");
+}
+
+// -- Date header and buffer shift (Task 7) --
+
+test_format_http_date :: () {
+    ct: Calendar_Time;
+    ct.year = 1994;
+    ct.month_starting_at_0 = 10;        // November
+    ct.day_of_month_starting_at_0 = 5;  // the 6th
+    ct.day_of_week_starting_at_0 = 0;   // Sunday
+    ct.hour = 8;
+    ct.minute = 49;
+    ct.second = 37;
+    buf: [29] u8;
+    s := format_http_date(ct, *buf);
+    assert(string_equals(s, "Sun, 06 Nov 1994 08:49:37 GMT"), "RFC 9110 IMF-fixdate, got '%'", s);
+
+    ct.year = 2026; ct.month_starting_at_0 = 0; ct.day_of_month_starting_at_0 = 0;
+    ct.day_of_week_starting_at_0 = 4; ct.hour = 0; ct.minute = 0; ct.second = 0;
+    s = format_http_date(ct, *buf);
+    assert(string_equals(s, "Thu, 01 Jan 2026 00:00:00 GMT"), "zero padding, got '%'", s);
+    print("  PASS: test_format_http_date\n");
+}
+
+test_refresh_date_caches_per_second :: () {
+    w: Worker;
+    refresh_date(*w);
+    assert(w.date.count == 29, "IMF-fixdate is 29 bytes, got % ('%')", w.date.count, w.date);
+    assert(w.date[25] == #char " " && w.date[26] == #char "G" && w.date[28] == #char "T", "ends with GMT, got '%'", w.date);
+    first_second := w.date_second;
+    first_ptr    := w.date.data;
+    refresh_date(*w);
+    assert(w.date.data == first_ptr, "the cache is a view into the worker's own buffer");
+    assert(w.date_second == first_second || w.date_second == first_second + 1, "at most one tick between two calls");
+    print("  PASS: test_refresh_date_caches_per_second\n");
+}
+
+test_reset_shift_overlapping_and_disjoint :: () {
+    // Overlapping: 100 leftover bytes starting at offset 10 (destination overlaps source).
+    c: Connection;
+    for i: 0..199  c.buf[i] = cast(u8) i;
+    c.bytes_used = 110;
+    c.parse_offset = 10;
+    reset_for_next_request(*c);
+    assert(c.bytes_used == 100 && c.parse_offset == 0, "100 bytes remain at the front");
+    for i: 0..99  assert(c.buf[i] == cast(u8) (i + 10), "overlapping shift preserved byte %", i);
+
+    // Disjoint: 5 leftover bytes starting at offset 100.
+    c2: Connection;
+    for i: 0..199  c2.buf[i] = cast(u8) i;
+    c2.bytes_used = 105;
+    c2.parse_offset = 100;
+    reset_for_next_request(*c2);
+    assert(c2.bytes_used == 5, "5 bytes remain");
+    for i: 0..4  assert(c2.buf[i] == cast(u8) (i + 100), "disjoint shift preserved byte %", i);
+    assert(c2.request_start_ms > 0, "leftover bytes start the next request's clock");
+
+    c3: Connection;
+    c3.bytes_used = 50;
+    c3.parse_offset = 50;
+    reset_for_next_request(*c3);
+    assert(c3.bytes_used == 0 && c3.request_start_ms == 0, "nothing left: idle");
+    print("  PASS: test_reset_shift_overlapping_and_disjoint\n");
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -1360,6 +1542,19 @@ main :: () {
     test_handle_client_oversized_body_gets_413();
     test_handle_client_malformed_gets_400();
     test_handle_client_half_close_serves_pipelined();
+
+    print("\nTimeouts:\n");
+    test_timeout_state_classification();
+    test_is_timed_out_uses_the_right_clock();
+    test_is_timed_out_write_then_idle();
+    test_check_timeouts_closes_idle_silently();
+    test_check_timeouts_sends_408_for_a_slow_header();
+    test_check_timeouts_skips_free_slots_and_listener();
+
+    print("\nDate header and buffer shift:\n");
+    test_format_http_date();
+    test_refresh_date_caches_per_second();
+    test_reset_shift_overlapping_and_disjoint();
 
     print("\nEvent engine:\n");
     test_encode_decode_connection_ptr();

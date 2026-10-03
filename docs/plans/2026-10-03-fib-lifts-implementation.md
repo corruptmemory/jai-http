@@ -1614,7 +1614,7 @@ git commit -m "http_router: GET routes answer HEAD, 405 carries Allow"
 - Consumes: `Connection.last_activity_ms`, `request_start_ms`, `pending`, parameters from Task 2; `send_canned`, `close_connection`.
 - Produces: `Timeout_State :: enum u8 #specified { NONE :: 0; IDLE :: 1; HEADER :: 2; BODY :: 3; WRITE :: 4; }`, `timeout_state :: (c: *Connection) -> Timeout_State`, `is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_State)`, `check_timeouts :: (w: *Worker, now: s64) -> s32` (connections closed).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```jai
 // -- Timeouts (Task 6). Defaults asserted as literals: idle 60000, header 10000, body 30000, write 30000. --
@@ -1749,12 +1749,12 @@ Register in `main`:
     test_check_timeouts_skips_free_slots_and_listener();
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: compile error, `Undeclared identifier 'timeout_state'`.
 
-- [ ] **Step 3: Implement in `server.jai`** (above `#scope_file`, after `now_ms`)
+- [x] **Step 3: Implement in `server.jai`** (above `#scope_file`, after `now_ms`)
 
 ```jai
 // -- Timeouts --
@@ -1854,12 +1854,12 @@ worker_run :: (w: *Worker) {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: the six timeout tests `PASS`; all suites green.
 
-- [ ] **Step 5: Manual check that an idle keep-alive is reaped**
+- [x] **Step 5: Manual check that an idle keep-alive is reaped**
 
 The default idle timeout is 60 s. Verify it once end to end with bash's `/dev/tcp`, no extra tools needed:
 
@@ -1870,7 +1870,7 @@ kill %1
 ```
 Expected: the first request answers; after 61 s the server log shows `fd N: IDLE timeout; closing` and the second request gets nothing.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add modules/http_server/server.jai modules/http_server/tests/test.jai
@@ -1889,7 +1889,7 @@ git commit -m "http_server: idle/header/body/write timeouts swept once per secon
 **Interfaces:**
 - Produces: `format_http_date :: (ct: Basic.Calendar_Time, out: *[29] u8) -> string`; `refresh_date :: (w: *Worker)`; `Worker.date_buf: [29] u8`, `Worker.date_second: s64`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```jai
 // -- Date header and buffer shift (Task 7) --
@@ -1965,12 +1965,12 @@ Register in `main`:
     test_reset_shift_overlapping_and_disjoint();
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: compile error, `Undeclared identifier 'format_http_date'`.
 
-- [ ] **Step 3: `format_http_date` in `http.jai`** (public section)
+- [x] **Step 3: `format_http_date` in `http.jai`** (public section)
 
 ```jai
 HTTP_DAY_NAMES   :: string.["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -2036,7 +2036,7 @@ reset_for_next_request :: (c: *Connection) {
 }
 ```
 
-- [ ] **Step 4: The worker cache in `server.jai`**
+- [x] **Step 4: The worker cache in `server.jai`**
 
 Add to `Worker` (replacing the `date: string;` line from Task 4):
 
@@ -2063,12 +2063,12 @@ refresh_date :: (w: *Worker) {
 
 In `worker_run`, call `refresh_date(w);` right after the `nfds < 0` check, before the event loop.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: the three new tests `PASS`; `test_reset_for_next_request` still passes; all suites green.
 
-- [ ] **Step 6: Smoke the header**
+- [x] **Step 6: Smoke the header**
 
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - hello_world && ./build_debug/hello_world & sleep 1
@@ -2077,7 +2077,7 @@ kill %1
 ```
 Expected: one `Date: <weekday>, DD Mon YYYY HH:MM:SS GMT` line matching the current UTC time.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add modules/http_server/http.jai modules/http_server/server.jai modules/http_server/tests/test.jai

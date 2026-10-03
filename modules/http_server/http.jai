@@ -173,18 +173,59 @@ parse_request :: (c: *Connection) -> Parse_Result {
 reset_for_next_request :: (c: *Connection) {
     remaining := c.bytes_used - c.parse_offset;
     if remaining > 0 && c.parse_offset > 0 {
-        // Copy forward (safe: destination < source)
-        for i: 0..remaining-1 {
-            c.buf[i] = c.buf[c.parse_offset + i];
+        if c.parse_offset >= remaining {
+            // Source and destination do not overlap: a plain memcpy is correct (Jai's memcpy is
+            // the LLVM intrinsic, undefined on overlap, and Basic has no memmove).
+            memcpy(c.buf.data, c.buf.data + c.parse_offset, remaining);
+        } else {
+            // Overlapping, destination below source: a forward byte copy is safe.
+            for i: 0..remaining-1 {
+                c.buf[i] = c.buf[c.parse_offset + i];
+            }
         }
     }
     c.bytes_used = remaining;
     c.parse_offset = 0;
     c.parse_state = .REQUEST_LINE;
+    c.parse_error = .NONE;
     c.req.header_count = 0;
     c.req.keep_alive = false;
     c.req.content_length = 0;
     c.request_start_ms = ifx remaining > 0 then now_ms() else 0;   // a pipelined next request is timed from now
+}
+
+HTTP_DAY_NAMES   :: string.["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+HTTP_MONTH_NAMES :: string.["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// RFC 9110 §5.6.7 IMF-fixdate, e.g. "Sun, 06 Nov 1994 08:49:37 GMT": always 29 bytes, written
+// into `out`; the returned string is a view into it.
+format_http_date :: (ct: Basic.Calendar_Time, out: *[29] u8) -> string {
+    two_digits :: (p: *u8, v: s64) {
+        p[0] = cast(u8) (#char "0" + v / 10);
+        p[1] = cast(u8) (#char "0" + v % 10);
+    }
+    b := cast(*u8) out;
+    memcpy(b, HTTP_DAY_NAMES[cast(s64) ct.day_of_week_starting_at_0].data, 3);
+    b[3] = #char ",";
+    b[4] = #char " ";
+    two_digits(b + 5, cast(s64) ct.day_of_month_starting_at_0 + 1);
+    b[7] = #char " ";
+    memcpy(b + 8, HTTP_MONTH_NAMES[cast(s64) ct.month_starting_at_0].data, 3);
+    b[11] = #char " ";
+    year := cast(s64) ct.year;
+    two_digits(b + 12, year / 100);
+    two_digits(b + 14, year % 100);
+    b[16] = #char " ";
+    two_digits(b + 17, cast(s64) ct.hour);
+    b[19] = #char ":";
+    two_digits(b + 20, cast(s64) ct.minute);
+    b[22] = #char ":";
+    two_digits(b + 23, cast(s64) ct.second);
+    memcpy(b + 25, " GMT".data, 4);
+    s: string;
+    s.data  = b;
+    s.count = 29;
+    return s;
 }
 
 Write_Result :: enum u8 #specified {
