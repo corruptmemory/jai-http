@@ -18,6 +18,13 @@ Connection :: struct {
     parse_error:  Parse_Error;      // Why parse_request returned .ERROR
     req:          Request;
 
+    // Chunked body decoding (parse_chunked). The decoded body is buf[body_start .. body_end);
+    // body_end trails parse_offset, because decoding only ever removes framing bytes.
+    chunk_phase:     Chunk_Phase;
+    chunk_remaining: s64;          // bytes of the current chunk's data not yet consumed
+    body_start:      s64;
+    body_end:        s64;
+
     // Send path, slow path only. `pending` holds response bytes the kernel did not take. Its
     // allocator is pinned to the heap in init_pool: the request Pool and temporary storage are
     // both reset underneath a stalled response, so neither may back this buffer.

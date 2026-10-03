@@ -29,9 +29,18 @@ Handler :: #type (request: *Request, response: *Response);
 Parse_State :: enum u8 #specified {
     REQUEST_LINE :: 0;
     HEADERS      :: 1;
-    BODY         :: 2;
+    BODY         :: 2;   // Content-Length body
     COMPLETE     :: 3;
     ERROR        :: 4;
+    CHUNKED      :: 5;   // chunked body, decoded in place by parse_chunked
+}
+
+// Where parse_chunked is within a chunked body (RFC 9112 §7.1).
+Chunk_Phase :: enum u8 #specified {
+    SIZE      :: 0;   // expecting a chunk-size line, with optional extensions
+    DATA      :: 1;   // moving chunk data down to body_end
+    DATA_CRLF :: 2;   // expecting the CRLF that ends a chunk's data
+    TRAILERS  :: 3;   // after the last chunk: trailer field lines until an empty line
 }
 
 Parse_Result :: enum u8 #specified {
@@ -184,6 +193,61 @@ parse_request :: (c: *Connection) -> Parse_Result {
     return parse_fail(c, .MALFORMED);
 }
 
+// Decode a chunked body in place (RFC 9112 §7.1). Chunk data is moved down to body_end and the
+// framing is skipped, so on COMPLETE the body is the contiguous view buf[body_start .. body_end)
+// and parse_offset sits just past the message. Resumable: each call continues from chunk_phase.
+// Expects the state finish_headers leaves: parse_state CHUNKED, phase SIZE, body_start = body_end
+// = parse_offset.
+parse_chunked :: (c: *Connection) -> Parse_Result {
+    while true {
+        if c.chunk_phase == {
+          case .SIZE;
+            crlf := find_crlf(c.buf.data, c.parse_offset, c.bytes_used);
+            if crlf < 0  return .INCOMPLETE;
+            size, size_error := parse_chunk_size_line(make_view(c.buf.data, c.parse_offset, crlf));
+            if size_error != .NONE  return parse_fail(c, size_error);
+            c.parse_offset = crlf + 2;
+            if size == 0 { c.chunk_phase = .TRAILERS; continue; }
+            // The data and its CRLF must fit in what is left of the read buffer.
+            if size > cast(s64) READ_BUFFER_SIZE - c.parse_offset - 2  return parse_fail(c, .BODY_TOO_LARGE);
+            c.chunk_remaining = size;
+            c.chunk_phase = .DATA;
+
+          case .DATA;
+            available := c.bytes_used - c.parse_offset;
+            n := ifx available < c.chunk_remaining then available else c.chunk_remaining;
+            move_down(c.buf.data, c.body_end, c.parse_offset, n);
+            c.body_end        += n;
+            c.parse_offset    += n;
+            c.chunk_remaining -= n;
+            if c.chunk_remaining > 0  return .INCOMPLETE;
+            c.chunk_phase = .DATA_CRLF;
+
+          case .DATA_CRLF;
+            if c.bytes_used - c.parse_offset < 2  return .INCOMPLETE;
+            if c.buf[c.parse_offset] != #char "\r" || c.buf[c.parse_offset + 1] != #char "\n"  return parse_fail(c, .MALFORMED);
+            c.parse_offset += 2;
+            c.chunk_phase = .SIZE;
+
+          case .TRAILERS;
+            crlf := find_crlf(c.buf.data, c.parse_offset, c.bytes_used);
+            if crlf < 0  return .INCOMPLETE;
+            if crlf == c.parse_offset {
+                c.parse_offset       = crlf + 2;
+                c.req.body           = make_view(c.buf.data, c.body_start, c.body_end);
+                c.req.content_length = c.body_end - c.body_start;
+                c.parse_state        = .COMPLETE;
+                return .COMPLETE;
+            }
+            // Validated like a header field, then discarded: a trailer never enters req.headers,
+            // where a framing field could change how the message is read.
+            if !is_field_line(make_view(c.buf.data, c.parse_offset, crlf))  return parse_fail(c, .MALFORMED);
+            c.parse_offset = crlf + 2;
+        }
+    }
+    return .INCOMPLETE;   // unreachable; `while true` alone does not satisfy the return-path check
+}
+
 // Clear every per-request field. The views point into the connection's read buffer, so a stale one
 // would show the next request, or the next client on a recycled slot, bytes it never sent.
 reset_request :: (req: *Request) {
@@ -201,18 +265,7 @@ reset_request :: (req: *Request) {
 // Shifts any remaining bytes to the start of the buffer.
 reset_for_next_request :: (c: *Connection) {
     remaining := c.bytes_used - c.parse_offset;
-    if remaining > 0 && c.parse_offset > 0 {
-        if c.parse_offset >= remaining {
-            // Source and destination do not overlap: a plain memcpy is correct (Jai's memcpy is
-            // the LLVM intrinsic, undefined on overlap, and Basic has no memmove).
-            memcpy(c.buf.data, c.buf.data + c.parse_offset, remaining);
-        } else {
-            // Overlapping, destination below source: a forward byte copy is safe.
-            for i: 0..remaining-1 {
-                c.buf[i] = c.buf[c.parse_offset + i];
-            }
-        }
-    }
+    if remaining > 0  move_down(c.buf.data, 0, c.parse_offset, remaining);
     c.bytes_used = remaining;
     c.parse_offset = 0;
     c.parse_state = .REQUEST_LINE;
@@ -501,6 +554,15 @@ make_view :: inline (data: *u8, start: s64, end: s64) -> string {
     return result;
 }
 
+// Copy `count` bytes from buf+src down to buf+dst (dst <= src). Jai's memcpy is the LLVM
+// intrinsic, undefined on overlap, and Basic has no memmove: memcpy only when the regions are
+// disjoint, otherwise a forward byte copy, which is safe while the destination is below the source.
+move_down :: (buf: *u8, dst: s64, src: s64, count: s64) {
+    if count <= 0 || dst == src  return;
+    if src - dst >= count  memcpy(buf + dst, buf + src, count);
+    else                   for i: 0..count-1  buf[dst + i] = buf[src + i];
+}
+
 parse_fail :: inline (c: *Connection, e: Parse_Error) -> Parse_Result {
     c.parse_error = e;
     return .ERROR;
@@ -517,17 +579,18 @@ trim_ows :: (s: string) -> string {
     return r;
 }
 
-// RFC 9110 §5.6.2: token = 1*tchar, tchar = ALPHA / DIGIT / one of the punctuation below.
-is_token :: (s: string) -> bool {
+// RFC 9110 §5.6.2: tchar = ALPHA / DIGIT / one of the punctuation below.
+is_tchar :: inline (ch: u8) -> bool {
     TCHAR_PUNCTUATION :: "!#$%&'*+-.^_`|~";
+    if (ch >= #char "a" && ch <= #char "z") || (ch >= #char "A" && ch <= #char "Z") || (ch >= #char "0" && ch <= #char "9")  return true;
+    for p: 0..TCHAR_PUNCTUATION.count-1  if ch == TCHAR_PUNCTUATION[p]  return true;
+    return false;
+}
+
+// RFC 9110 §5.6.2: token = 1*tchar.
+is_token :: (s: string) -> bool {
     if s.count == 0  return false;
-    for i: 0..s.count-1 {
-        ch := s[i];
-        if (ch >= #char "a" && ch <= #char "z") || (ch >= #char "A" && ch <= #char "Z") || (ch >= #char "0" && ch <= #char "9")  continue;
-        is_punct := false;
-        for p: 0..TCHAR_PUNCTUATION.count-1  if ch == TCHAR_PUNCTUATION[p] { is_punct = true; break; }
-        if !is_punct  return false;
-    }
+    for i: 0..s.count-1  if !is_tchar(s[i])  return false;
     return true;
 }
 
@@ -564,6 +627,88 @@ is_field_value :: (s: string) -> bool {
         if (ch < 0x20 && ch != #char "\t") || ch == 0x7F  return false;
     }
     return true;
+}
+
+hex_value :: inline (ch: u8) -> s64 {
+    if ch >= #char "0" && ch <= #char "9"  return cast(s64) (ch - #char "0");
+    if ch >= #char "a" && ch <= #char "f"  return cast(s64) (ch - #char "a") + 10;
+    if ch >= #char "A" && ch <= #char "F"  return cast(s64) (ch - #char "A") + 10;
+    return -1;
+}
+
+// From the opening DQUOTE at s[start], the index just past the closing one, or -1. RFC 9110 §5.6.4:
+// qdtext = HTAB / SP / 0x21 / 0x23-0x5B / 0x5D-0x7E / obs-text; quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ).
+skip_quoted_string :: (s: string, start: s64) -> s64 {
+    i := start + 1;
+    while i < s.count {
+        ch := s[i];
+        if ch == #char "\""  return i + 1;
+        if ch == #char "\\" {
+            if i + 1 >= s.count  return -1;
+            q := s[i + 1];
+            if !(q == #char "\t" || (q >= 0x20 && q != 0x7F))  return -1;
+            i += 2;
+            continue;
+        }
+        if !(ch == #char "\t" || (ch >= 0x20 && ch != 0x7F))  return -1;
+        i += 1;
+    }
+    return -1;
+}
+
+// chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), chunk-ext-val =
+// token / quoted-string (RFC 9112 §7.1.1). Empty is valid. Whitespace is only allowed where the
+// grammar has BWS, so trailing whitespace with no ';' after it fails.
+is_chunk_ext :: (s: string) -> bool {
+    i := 0;
+    while i < s.count {
+        while i < s.count && is_ows(s[i])  i += 1;
+        if i == s.count || s[i] != #char ";"  return false;
+        i += 1;
+        while i < s.count && is_ows(s[i])  i += 1;
+        name_start := i;
+        while i < s.count && is_tchar(s[i])  i += 1;
+        if i == name_start  return false;
+        j := i;
+        while j < s.count && is_ows(s[j])  j += 1;
+        if j < s.count && s[j] == #char "=" {
+            i = j + 1;
+            while i < s.count && is_ows(s[i])  i += 1;
+            if i < s.count && s[i] == #char "\"" {
+                i = skip_quoted_string(s, i);
+                if i < 0  return false;
+            } else {
+                value_start := i;
+                while i < s.count && is_tchar(s[i])  i += 1;
+                if i == value_start  return false;
+            }
+        }
+    }
+    return true;
+}
+
+// chunk-size [ chunk-ext ], from a chunk-size line without its CRLF (RFC 9112 §7.1). More than 15
+// significant hex digits is too large without being computed: 16^15 < 2^63, and arithmetic
+// overflow is FATAL in every build.
+parse_chunk_size_line :: (line: string) -> (size: s64, error: Parse_Error) {
+    digits := 0;
+    while digits < line.count && hex_value(line[digits]) >= 0  digits += 1;
+    if digits == 0  return 0, .MALFORMED;
+    if !is_chunk_ext(make_view(line.data, digits, line.count))  return 0, .MALFORMED;
+    first := 0;   // leading zeros are legal and carry no magnitude
+    while first < digits - 1 && line[first] == #char "0"  first += 1;
+    if digits - first > 15  return 0, .BODY_TOO_LARGE;
+    value: s64 = 0;
+    for i: first..digits-1  value = value * 16 + hex_value(line[i]);
+    return value, .NONE;
+}
+
+// A field line without its CRLF: a token name, ':' with no whitespace before it, and a field value
+// without control bytes (RFC 9112 §5.1, RFC 9110 §5.5). obs-fold starts with SP or HTAB and fails.
+is_field_line :: (line: string) -> bool {
+    colon := find_byte(line.data, 0, line.count, #char ":");
+    if colon < 0  return false;
+    return is_token(make_view(line.data, 0, colon)) && is_field_value(trim_ows(make_view(line.data, colon + 1, line.count)));
 }
 
 // RFC 9112 §3.2 / RFC 3986 §3.2: Host = uri-host [ ":" port ]. Checked as a character set:

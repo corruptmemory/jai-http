@@ -432,6 +432,148 @@ test_parse_body_zero_length :: () {
 
 // -- Pipelining tests --
 
+// -- Chunked bodies --
+
+CHUNK_PREFIX :: "[the request head]";   // stands in for the header bytes in front of the body
+
+// Set c up as finish_headers leaves a chunked request (the body starts right after CHUNK_PREFIX),
+// then feed `raw` to parse_chunked, whole (step 0) or `step` bytes per call. Returns the first
+// result other than INCOMPLETE, or INCOMPLETE once everything is fed.
+decode_chunked_body :: (c: *Connection, raw: string, step: s64 = 0) -> Parse_Result {
+    memcpy(c.buf.data, CHUNK_PREFIX.data, CHUNK_PREFIX.count);
+    c.bytes_used   = CHUNK_PREFIX.count;
+    c.parse_offset = CHUNK_PREFIX.count;
+    c.parse_state  = .CHUNKED;
+    c.chunk_phase  = .SIZE;
+    c.body_start   = CHUNK_PREFIX.count;
+    c.body_end     = CHUNK_PREFIX.count;
+    if step <= 0  step = raw.count;
+    fed := 0;
+    r := Parse_Result.INCOMPLETE;
+    while fed < raw.count {
+        n := ifx raw.count - fed < step then raw.count - fed else step;
+        memcpy(c.buf.data + c.bytes_used, raw.data + fed, n);
+        c.bytes_used += n;
+        fed += n;
+        r = parse_chunked(c);
+        if r != .INCOMPLETE  return r;
+    }
+    return r;
+}
+
+expect_decoded :: (raw: string, want: string, step: s64) {
+    c := New(Connection);
+    defer free(c);
+    r := decode_chunked_body(c, raw, step);
+    assert(r == .COMPLETE, "'%' (step %): expected COMPLETE, got % (%)", raw, step, r, c.parse_error);
+    assert(string_equals(c.req.body, want), "'%' (step %): body '%', want '%'", raw, step, c.req.body, want);
+    assert(c.req.content_length == want.count, "'%' (step %): content_length %, want %", raw, step, c.req.content_length, want.count);
+    assert(c.parse_offset == CHUNK_PREFIX.count + raw.count, "'%' (step %): the whole message and no more is consumed: offset % of %", raw, step, c.parse_offset, CHUNK_PREFIX.count + raw.count);
+    assert(c.req.header_count == 0, "'%': trailers never enter req.headers", raw);
+    head: string;
+    head.data  = c.buf.data;
+    head.count = CHUNK_PREFIX.count;
+    assert(string_equals(head, CHUNK_PREFIX), "'%': decoding wrote below body_start: '%'", raw, head);
+}
+
+expect_refused :: (raw: string, want: Parse_Error, step: s64) {
+    c := New(Connection);
+    defer free(c);
+    r := decode_chunked_body(c, raw, step);
+    assert(r == .ERROR && c.parse_error == want, "'%' (step %): expected ERROR %, got % (%)", raw, step, want, r, c.parse_error);
+}
+
+// `s` with every '~' replaced by the control byte 0x01 (there is no portable escape for it).
+with_ctl :: (s: string) -> string {
+    r := copy_string(s);
+    for i: 0..r.count-1  if r[i] == #char "~"  r[i] = 0x01;
+    return r;
+}
+
+Chunked_Case :: struct { raw: string; want: string; }
+
+test_chunked_decodes_in_place :: () {
+    cases := Chunked_Case.[
+        .{"5\r\nhello\r\n0\r\n\r\n", "hello"},
+        .{"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world"},
+        .{"0005\r\nhello\r\n000\r\n\r\n", "hello"},                           // leading zeros, last-chunk "000"
+        .{"a\r\n0123456789\r\nA\r\nabcdefghij\r\n0\r\n\r\n", "0123456789abcdefghij"},   // lower and upper hex
+        .{"5;name=value\r\nhello\r\n0;x\r\n\r\n", "hello"},                   // token extensions, ignored
+        .{"5 ; q=\"a \\\"b\\\" c\"\r\nhello\r\n0\r\n\r\n", "hello"},          // BWS, quoted-string with quoted-pairs
+        .{"5\r\nhello\r\n0\r\nExpires: never\r\nX-Sum:\tabc \r\n\r\n", "hello"},   // trailers, discarded
+        .{"0\r\n\r\n", ""},                                                   // empty body
+    ];
+    for tc: cases {
+        expect_decoded(tc.raw, tc.want, 0);
+        expect_decoded(tc.raw, tc.want, 1);   // one byte per call: resumable at every split point
+    }
+    print("  PASS: test_chunked_decodes_in_place\n");
+}
+
+Chunk_Refusal :: struct { raw: string; want: Parse_Error; }
+
+test_chunked_grammar_refused :: () {
+    cases := Chunk_Refusal.[
+        .{"0x5\r\nhello\r\n0\r\n\r\n", .MALFORMED},            // no 0x prefix
+        .{"+5\r\nhello\r\n0\r\n\r\n", .MALFORMED},             // no sign
+        .{"-5\r\nhello\r\n0\r\n\r\n", .MALFORMED},
+        .{" 5\r\nhello\r\n0\r\n\r\n", .MALFORMED},             // no leading whitespace
+        .{"5 \r\nhello\r\n0\r\n\r\n", .MALFORMED},             // trailing whitespace without ';'
+        .{"5\nhello\r\n0\r\n\r\n", .MALFORMED},                // bare LF ends no line
+        .{"5\r\nhello\n0\r\n\r\n", .MALFORMED},                // LF-only after the data
+        .{"5\r\nhelloX\r\n0\r\n\r\n", .MALFORMED},             // data longer than its size
+        .{"5\r\nhell\r\n0\r\n\r\n", .MALFORMED},               // data shorter than its size
+        .{"5;a@b\r\nhello\r\n0\r\n\r\n", .MALFORMED},          // '@' is not a token byte
+        .{"5;\r\nhello\r\n0\r\n\r\n", .MALFORMED},             // an extension needs a name
+        .{"5;a=\"open\r\nhello\r\n0\r\n\r\n", .MALFORMED},     // unterminated quoted-string
+        .{"5;a= \r\nhello\r\n0\r\n\r\n", .MALFORMED},          // '=' needs a value
+        .{"5\r\nhello\r\n0\r\nBad Name: x\r\n\r\n", .MALFORMED},   // trailer name with a space
+        .{"5\r\nhello\r\n0\r\nX-A: 1\r\n folded\r\n\r\n", .MALFORMED},   // obs-fold trailer
+        .{"5\r\nhello\r\n0\r\nNoColon\r\n\r\n", .MALFORMED},
+    ];
+    for tc: cases {
+        expect_refused(tc.raw, tc.want, 0);
+        expect_refused(tc.raw, tc.want, 1);
+    }
+    ctl := with_ctl("5\r\nhello\r\n0\r\nX-A: a~b\r\n\r\n");   // a control byte in a trailer value
+    defer free(ctl);
+    expect_refused(ctl, .MALFORMED, 0);
+    print("  PASS: test_chunked_grammar_refused\n");
+}
+
+test_chunk_size_limits :: () {
+    // A size larger than the rest of the read buffer is refused as soon as its line is complete.
+    expect_refused("1000\r\n", .BODY_TOO_LARGE, 0);                // 4096 bytes cannot fit after the head
+    expect_refused("FFFFFFFFFFFFFFF\r\n", .BODY_TOO_LARGE, 0);     // 15 digits: computed (no overflow), too large
+    // Leading zeros carry no magnitude: 19 digits, one significant.
+    c := New(Connection);
+    defer free(c);
+    r := decode_chunked_body(c, "0000000000000000001\r\n");
+    assert(r == .INCOMPLETE && c.chunk_phase == .DATA && c.chunk_remaining == 1, "leading zeros are not significant digits; got % in % with % remaining (%)",
+        r, c.chunk_phase, c.chunk_remaining, c.parse_error);
+    print("  PASS: test_chunk_size_limits\n");
+}
+
+// 16 hex digits is the first width that can overflow s64; overflow is FATAL in every build, so a
+// broken digit guard would kill the process. Parsed in a forked child, as R2 does.
+test_chunk_size_overflow_rejected :: () {
+    pid := fork();
+    if pid == 0 {
+        c := New(Connection);
+        r := decode_chunked_body(c, "FFFFFFFFFFFFFFFF\r\n");
+        _exit(100 + 10 * cast(s32) r + cast(s32) c.parse_error);   // result and cause in one code
+    }
+    status: s32;
+    waitpid(pid, *status, 0);
+    exited := (status & 0x7f) == 0;
+    code := (status >> 8) & 0xff;
+    what := ifx !exited then "died on a signal" else ifx code == 1 then "PANICKED (arithmetic overflow; a live server dies)"
+            else tprint("returned exit code % (100 + 10 * Parse_Result + Parse_Error)", code);
+    assert(exited && code == 100 + 10 * cast(s32) Parse_Result.ERROR + cast(s32) Parse_Error.BODY_TOO_LARGE,
+        "a 16-hex-digit chunk size must be BODY_TOO_LARGE; the parse %", what);
+    print("  PASS: test_chunk_size_overflow_rejected\n");
+}
+
 test_reset_for_next_request :: () {
     c: Connection;
     // Simulate two pipelined requests
@@ -2274,6 +2416,11 @@ main :: () {
     test_field_value_controls_rejected();
     test_host_syntax_validated();
     test_zero_padded_content_length();
+    print("\nChunked bodies:\n");
+    test_chunked_decodes_in_place();
+    test_chunked_grammar_refused();
+    test_chunk_size_limits();
+    test_chunk_size_overflow_rejected();
 
     print("\nPipelining:\n");
     test_reset_for_next_request();
