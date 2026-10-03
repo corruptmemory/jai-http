@@ -1052,6 +1052,7 @@ test_pending_defaults_and_release :: () {
     defer destroy_pool(*pool);
 
     c := get_connection(*pool);
+    assert(c.pool == *pool, "init_pool points every connection at its pool");
     assert(c.pending.count == 0 && c.pending_offset == 0, "fresh connection has no pending output");
     assert(c.pending.allocator.proc != null, "pending allocator must be pinned at init_pool");
     assert(!c.close_after_send && !c.read_stalled, "send-path flags start clear");
@@ -1067,6 +1068,7 @@ test_pending_defaults_and_release :: () {
     free_connection(*pool, c);
     assert(c.pending.count == 0 && c.pending.data == null, "free_connection must release pending");
     assert(c.pending.allocator.proc != null, "release keeps the pinned allocator");
+    assert(pool.pending_total == 0, "a tail appended without a reservation is never charged, so nothing is refunded");
 
     print("  PASS: test_pending_defaults_and_release\n");
 }
@@ -1154,10 +1156,16 @@ count_byte :: (s: string, b: u8) -> s64 {
     return n;
 }
 
-// A Connection outside any pool with its pending allocator pinned, for writer-level tests.
+// Accounting home for standalone connections: the writer charges every queued tail to the
+// connection's pool and release_pending refunds it. A shared zero-slot pool, not a real one:
+// tests free() standalone connections individually.
+standalone_pool: Connection_Pool;
+
+// A Connection outside any worker with its pending allocator pinned, for writer-level tests.
 standalone_connection :: (fd: s32) -> *Connection {
     c := New(Connection);
     c.pending.allocator = context.allocator;
+    c.pool = *standalone_pool;
     c.fd = fd;
     return c;
 }
@@ -1248,9 +1256,11 @@ test_write_response_cap_exceeded :: () {
     req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
     resp := Response.{ status_code = 200, body = body };
 
+    before := standalone_pool.refused_over_connection;
     r := write_response(c, *req, *resp, "");
     assert(r == .ERROR, "a tail past MAX_PENDING_BYTES must be an ERROR, got %", r);
     assert(c.pending.count == 0, "nothing may be queued on ERROR, got %", c.pending.count);
+    assert(standalone_pool.refused_over_connection == before + 1, "the refusal is counted for the sweep's report");
     print("  PASS: test_write_response_cap_exceeded\n");
 }
 
@@ -2369,6 +2379,103 @@ test_check_timeouts_closes_a_slow_drain :: () {
     print("  PASS: test_check_timeouts_closes_a_slow_drain\n");
 }
 
+test_tail_refusal :: () {
+    assert(tail_refusal(100, 0, 1000, 5000) == .NONE, "small tail, empty worker");
+    assert(tail_refusal(1000, 0, 1000, 5000) == .NONE, "exactly the connection cap fits");
+    assert(tail_refusal(1001, 0, 1000, 5000) == .OVER_CONNECTION_CAP, "one byte over the connection cap");
+    assert(tail_refusal(1000, 4000, 1000, 5000) == .NONE, "exactly the worker budget fits");
+    assert(tail_refusal(1000, 4001, 1000, 5000) == .OVER_WORKER_BUDGET, "one byte over the worker budget");
+    assert(tail_refusal(2000, 4500, 1000, 5000) == .OVER_CONNECTION_CAP, "the connection cap is checked first");
+    assert(tail_refusal(1, 0, 0, 5000) == .OVER_CONNECTION_CAP, "a cap of 0 queues nothing");
+    print("  PASS: test_tail_refusal\n");
+}
+
+// The test that matters most: a refund missed on any path would leak budget until the worker
+// refused every large response, a slow-motion outage. Review focus 5 (charge half) is step 3.
+test_pending_budget_accounting_balances :: () {
+    assert(standalone_pool.pending_total == 0, "the writer tests left % bytes charged", standalone_pool.pending_total);
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    s1, p1 := make_socket_pair(server_sndbuf = 4096);
+    defer close(p1);
+    s2, p2 := make_socket_pair(server_sndbuf = 4096);
+    defer close(p2);
+    c1 := attach(*w, s1);
+    c2 := attach(*w, s2);
+
+    send_to_server(p1, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    send_to_server(p2, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c1, EPOLLIN);
+    handle_client(*w, c2, EPOLLIN);
+    assert(c1.pending.count > 0 && c2.pending.count > 0, "setup: both responses stall");
+    assert(c1.pending_charge == c1.pending.allocated && c2.pending_charge == c2.pending.allocated, "each tail is charged its reservation");
+    assert(w.pool.pending_total == c1.pending_charge + c2.pending_charge, "the pool total is the sum of its tails: % vs % + %",
+        w.pool.pending_total, c1.pending_charge, c2.pending_charge);
+
+    // 1. A drained tail is refunded.
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while c1.pending.count > 0 {
+        got.count = 0;
+        drain_peer(p1, *got);
+        handle_client(*w, c1, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(c1.pending_charge == 0 && w.pool.pending_total == c2.pending_charge, "a drained tail is refunded, total now %", w.pool.pending_total);
+
+    // 2. A connection closed with its tail queued is refunded.
+    close_connection(*w, c2);
+    assert(w.pool.pending_total == 0, "a closed connection's tail is refunded, total now %", w.pool.pending_total);
+
+    // 3. A canned reply queued behind a full socket is charged and refunded the same way.
+    filler: [1024] u8;
+    while send(s1, filler.data, filler.count, .NOSIGNAL) > 0 {}
+    send_to_server(p1, "GARBAGE\r\n\r\n");
+    handle_client(*w, c1, EPOLLIN);
+    assert(c1.pending.count > 0 && c1.pending_charge > 0 && w.pool.pending_total == c1.pending_charge, "a queued canned reply is charged: total % vs charge %",
+        w.pool.pending_total, c1.pending_charge);
+    close_connection(*w, c1);
+    assert(w.pool.pending_total == 0, "and refunded, total now %", w.pool.pending_total);
+    print("  PASS: test_pending_budget_accounting_balances\n");
+}
+
+// Defaults asserted as literals: MAX_PENDING_PER_WORKER 67108864.
+test_pending_budget_refuses_and_reports :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+    w.pool.pending_total = 67108864 - 1000;   // synthetic: the worker budget is all but spent
+
+    rec: Error_Recorder;
+    ctx := context;
+    ctx.logger      = record_errors;
+    ctx.logger_data = *rec;
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    push_context ctx { handle_client(*w, c, EPOLLIN); }
+    assert(c.state == .FREE, "a tail over the worker budget closes its connection");
+    assert(w.pool.refused_over_budget == 1 && w.pool.refused_over_connection == 0, "counted as a budget refusal: % / %", w.pool.refused_over_budget, w.pool.refused_over_connection);
+    assert(w.pool.pending_total == 67108864 - 1000, "a refused tail charges nothing");
+    assert(rec.errors == 0, "the refusal itself logs nothing; the sweep reports it (got %)", rec.errors);
+
+    push_context ctx { worker_sweep(*w, now_ms()); }
+    assert(rec.errors == 1, "one summary line per sweep, got %", rec.errors);
+    assert(w.pool.refused_over_budget == 0, "the sweep resets the counts");
+    push_context ctx { worker_sweep(*w, now_ms()); }
+    assert(rec.errors == 1, "nothing to report, nothing logged (got %)", rec.errors);
+    w.pool.pending_total = 0;
+    print("  PASS: test_pending_budget_refuses_and_reports\n");
+}
+
 // R13. send_canned makes one attempt and ignores EAGAIN and short writes, then the connection
 // closes: under backpressure (an earlier response filled the socket) the 400/408/413/431 never
 // reaches the client and nothing is logged. Deliver it (queue it) or report the failure.
@@ -2694,6 +2801,10 @@ main :: () {
     test_rate_floor_catches_a_steady_trickle();
     test_canned_tail_gets_a_drain_deadline();
     test_check_timeouts_closes_a_slow_drain();
+    print("\nPending budget:\n");
+    test_tail_refusal();
+    test_pending_budget_accounting_balances();
+    test_pending_budget_refuses_and_reports();
 
     print("\nDate header and buffer shift:\n");
     test_format_http_date();

@@ -153,7 +153,7 @@ refresh_date :: (w: *Worker) {
 //
 // A connection is bounded by one timeout at a time, chosen by what it is waiting for. A request
 // that has fully arrived has no deadline: the handler runs synchronously and request_start_ms is
-// cleared before dispatch. Sweeps run once a second from worker_run when any timeout is enabled.
+// cleared before dispatch. Sweeps run once a second from worker_run.
 
 TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0 || LINGER_TIMEOUT_MS > 0 || MIN_SEND_RATE > 0;
 
@@ -240,11 +240,24 @@ check_timeouts :: (w: *Worker, now: s64) -> s32 {
     return closed;
 }
 
-// The once-a-second work of worker_run: timeouts, and retrying accepts paused by fd or memory
-// exhaustion (an edge-triggered listen socket would not report the waiting backlog again).
+// The once-a-second work of worker_run: timeouts, retrying accepts paused by fd or memory
+// exhaustion (an edge-triggered listen socket would not report the waiting backlog again), and the
+// tail-refusal report.
 worker_sweep :: (w: *Worker, now: s64) {
     #if TIMEOUTS_ENABLED  check_timeouts(w, now);
     if w.accept_paused  accept_connections(w);
+    report_refused_tails(w);
+}
+
+// Tail refusals are a failure to serve, but a client can trigger one per request: one log_error
+// line per worker per second with the counts, not one per refusal.
+report_refused_tails :: (w: *Worker) {
+    p := *w.pool;
+    if p.refused_over_connection == 0 && p.refused_over_budget == 0  return;
+    Basic.log_error("Worker %: closed % connection(s) whose response tail exceeded MAX_PENDING_BYTES (%) and % that would have exceeded MAX_PENDING_PER_WORKER (%) in the last second",
+        w.id, p.refused_over_connection, MAX_PENDING_BYTES, p.refused_over_budget, MAX_PENDING_PER_WORKER);
+    p.refused_over_connection = 0;
+    p.refused_over_budget     = 0;
 }
 
 accept_connections :: (w: *Worker) {
@@ -549,9 +562,9 @@ worker_listen :: (w: *Worker, address: string, port: u16) -> bool {
 worker_run :: (w: *Worker) {
     last_sweep := now_ms();
     while w.running {
-        wait_ms: s32 = -1;
-        if TIMEOUTS_ENABLED || w.accept_paused  wait_ms = 1000;
-        nfds := epoll_process_events(*w.engine, timeout_ms = wait_ms);
+        // Wake at least once a second, whatever is enabled, so the sweep always runs: a refusal
+        // count must never be stranded. A 1 Hz wakeup per worker costs nothing measurable.
+        nfds := epoll_process_events(*w.engine, timeout_ms = 1000);
         if nfds < 0 {
             err := errno();
             if err == EINTR continue;

@@ -30,6 +30,8 @@ Connection :: struct {
     // both reset underneath a stalled response, so neither may back this buffer.
     pending:          [..] u8;
     pending_offset:   s64;      // bytes of `pending` already handed to the kernel
+    pending_charge:   s64;      // bytes of this tail charged to pool.pending_total (reserve_tail)
+    pool:             *Connection_Pool;   // the owning pool, one per worker; set in init_pool
     close_after_send: bool;     // close once `pending` drains
     read_stalled:     bool;     // read buffer filled while output was pending; re-read after drain
     peer_closed:      bool;     // the peer finished sending (EOF / RDHUP); close once every answer drains
@@ -48,6 +50,9 @@ Connection_Pool :: struct {
     free_count:   s64;
     total:        s64;
     data_to_free: *void;
+    pending_total:           s64;   // bytes reserved by every queued tail in this pool
+    refused_over_connection: s64;   // tail refusals since the last sweep, by reason
+    refused_over_budget:     s64;
 }
 
 init_pool :: (pool: *Connection_Pool, count: s64) {
@@ -67,6 +72,7 @@ init_pool :: (pool: *Connection_Pool, count: s64) {
         // Pin the slow-path buffer to whatever allocator is current at init (the heap). Dispatch
         // runs under the per-request Pool, which must never back bytes that outlive a request.
         c.pending.allocator = context.allocator;
+        c.pool = pool;
         pool.free_list = c;
         i -= 1;
     }
@@ -122,13 +128,46 @@ free_connection :: (pool: *Connection_Pool, c: *Connection) {
     pool.free_count += 1;
 }
 
-// Free the queued tail and reset the cursor. array_reset frees through the array's own (pinned)
-// allocator and keeps it set. Guarded on data: Basic.free calls the allocator proc
-// unconditionally, so an empty array on a slot that was never pinned must not reach it. Idempotent.
+// Free the queued tail, refund its charge to the worker budget, and reset the cursor. array_reset
+// frees through the array's own (pinned) allocator and keeps it set. Guarded on data: Basic.free
+// calls the allocator proc unconditionally, so an empty array on a slot that was never pinned must
+// not reach it. This is the one place every tail ends (drain, close, slot reuse, pool
+// destruction), so the refund cannot be missed. Idempotent.
 release_pending :: (c: *Connection) {
     if c.pending.data  Basic.array_reset(*c.pending);
-    c.pending_offset = 0;
+    c.pending_offset    = 0;
     c.write_deadline_ms = 0;   // a deadline never outlives its tail
+    if c.pending_charge > 0 {
+        c.pool.pending_total -= c.pending_charge;
+        c.pending_charge = 0;
+    }
+}
+
+Tail_Refusal :: enum u8 #specified {
+    NONE                :: 0;
+    OVER_CONNECTION_CAP :: 1;   // the tail alone exceeds MAX_PENDING_BYTES
+    OVER_WORKER_BUDGET  :: 2;   // the worker's queued tails would exceed MAX_PENDING_PER_WORKER
+}
+
+// Whether a tail of `unsent` bytes may queue, given the worker's queued total and both caps.
+// Takes the caps as arguments so tests can drive any value.
+tail_refusal :: (unsent: s64, worker_total: s64, connection_cap: s64, worker_budget: s64) -> Tail_Refusal {
+    if unsent > connection_cap                return .OVER_CONNECTION_CAP;
+    if worker_total + unsent > worker_budget  return .OVER_WORKER_BUDGET;
+    return .NONE;
+}
+
+// Reserve room in c.pending for a tail of `unsent` bytes and charge it to the worker budget. On a
+// refusal nothing is reserved and the refusal is counted on the pool; worker_sweep reports the
+// counts once a second (a client can trigger a refusal on every request). Requires an empty queue.
+reserve_tail :: (c: *Connection, unsent: s64) -> Tail_Refusal {
+    refusal := tail_refusal(unsent, c.pool.pending_total, MAX_PENDING_BYTES, MAX_PENDING_PER_WORKER);
+    if refusal == .OVER_CONNECTION_CAP { c.pool.refused_over_connection += 1; return refusal; }
+    if refusal == .OVER_WORKER_BUDGET  { c.pool.refused_over_budget     += 1; return refusal; }
+    Basic.array_reserve(*c.pending, unsent);
+    c.pending_charge = c.pending.allocated;
+    c.pool.pending_total += c.pending_charge;
+    return .NONE;
 }
 
 // Append raw bytes to a resizable byte array using the array's own allocator. Grows by doubling:

@@ -410,12 +410,9 @@ write_response :: (c: *Connection, req: *Request, response: *Response, date: str
 
     // Slow path: the socket is full. Header and body live in per-request memory, so the unsent
     // tail is copied into c.pending now, before the worker resets the Pool.
-    unsent := total - sent;
-    if unsent > MAX_PENDING_BYTES {
-        // A failure to serve: the client receives a body shorter than its Content-Length.
-        Basic.log_error("fd %: unsent response tail of % bytes exceeds MAX_PENDING_BYTES (%); closing", c.fd, unsent, MAX_PENDING_BYTES);
-        return .ERROR;
-    }
+    // A refusal is a failure to serve (the client receives a body shorter than its Content-Length).
+    // reserve_tail counts it; worker_sweep reports it.
+    if reserve_tail(c, total - sent) != .NONE  return .ERROR;
     header_sent := ifx sent < header.count then sent else header.count;
     body_sent   := sent - header_sent;
     append_bytes(*c.pending, header.data + header_sent, header.count - header_sent);
@@ -470,10 +467,7 @@ write_or_queue :: (c: *Connection, data: string) -> Write_Result {
         return .ERROR;
     }
     if sent == data.count  return .SENT;
-    if data.count - sent > MAX_PENDING_BYTES {
-        Basic.log_error("fd %: unsent reply tail of % bytes exceeds MAX_PENDING_BYTES (%); closing", c.fd, data.count - sent, MAX_PENDING_BYTES);
-        return .ERROR;
-    }
+    if reserve_tail(c, data.count - sent) != .NONE  return .ERROR;
     append_bytes(*c.pending, data.data + sent, data.count - sent);
     return .PENDING;
 }

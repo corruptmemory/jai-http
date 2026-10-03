@@ -23,6 +23,11 @@
     // the timeouts, 0 does not disable it: 0 means no tail may be queued, so every stalled
     // response closes its connection.
     MAX_PENDING_BYTES   : s64 = 1048576,
+    // Cap on the response tail bytes all of one worker's connections may queue together. A tail
+    // that would push the worker past it closes its connection, as MAX_PENDING_BYTES does. Without
+    // it every pool slot could hold MAX_PENDING_BYTES (16 workers x 1024 slots x 1 MB = 16 GB). Like
+    // MAX_PENDING_BYTES, 0 is literal: no tail may be queued.
+    MAX_PENDING_PER_WORKER : s64 = 67108864,
     // Timeouts in milliseconds; 0 disables each. See docs/plans/2026-10-03-fib-lifts-design.md §5.
     IDLE_TIMEOUT_MS     : s64 = 60000,    // kept-alive connection between requests
     HEADER_TIMEOUT_MS   : s64 = 10000,    // from a request's first byte until its headers are complete
