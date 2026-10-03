@@ -267,6 +267,9 @@ handle_client :: (w: *Worker, c: *Connection, events: u32) {
 // sending holds every answer. Returns false when the connection was closed.
 resume_after_drain :: (w: *Worker, c: *Connection) -> bool {
     if c.close_after_send { close_connection(w, c); return false; }
+    // A partial next request is timed from the drain, not from when its bytes arrived: while
+    // output was pending the server was the bottleneck (its read may even have been stalled).
+    if c.request_start_ms != 0  c.request_start_ms = c.last_activity_ms;
     if !dispatch_buffered(w, c)  return false;
     if c.read_stalled && c.pending.count == 0 {
         c.read_stalled = false;

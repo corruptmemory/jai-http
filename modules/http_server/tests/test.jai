@@ -1504,6 +1504,38 @@ test_reset_shift_overlapping_and_disjoint :: () {
     print("  PASS: test_reset_shift_overlapping_and_disjoint\n");
 }
 
+test_handle_client_header_clock_restarts_at_drain :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    // A complete request whose response stalls, then the start of a second one.
+    send_to_server(peer, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHo");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0 && c.request_start_ms > 0, "setup: stalled response, partial second request");
+    c.request_start_ms = 1;   // pretend the partial request arrived long ago
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while c.pending.count > 0 {
+        got.count = 0;
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(c.state == .ACTIVE && test_handler_calls == 1, "the partial request is still waiting");
+    assert(c.request_start_ms == c.last_activity_ms, "its header clock restarts at the drain, got % vs %", c.request_start_ms, c.last_activity_ms);
+    close_connection(*w, c);
+    print("  PASS: test_handle_client_header_clock_restarts_at_drain\n");
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -1542,6 +1574,7 @@ main :: () {
     test_handle_client_oversized_body_gets_413();
     test_handle_client_malformed_gets_400();
     test_handle_client_half_close_serves_pipelined();
+    test_handle_client_header_clock_restarts_at_drain();
 
     print("\nTimeouts:\n");
     test_timeout_state_classification();
