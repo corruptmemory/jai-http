@@ -38,18 +38,18 @@ Inputs the spec implies but that are easy to leave untested. Each line is pinned
 
 ## File Structure
 
-| File | Responsibility after this plan |
-|------|--------------------------------|
-| `modules/http_server/module.jai` | module parameters (five new) |
-| `modules/http_server/connection.jai` | `Connection` state, pool, `release_pending`, `append_bytes` |
-| `modules/http_server/http.jai` | types, parser, writer (`write_response`, `flush_pending`), canned replies, `format_http_date`, buffer shift |
-| `modules/http_server/server.jai` | worker loop, accept, `handle_client` and its helpers, timeouts, date cache |
-| `modules/http_server/tests/test.jai` | server suite + socket helpers |
-| `modules/http_router/trie.jai` | HEAD fallback, `Allow` builder, `tree_match` third return |
-| `modules/http_router/router.jai` | `Allow` on 405 |
-| `modules/http_router/tests/test.jai` | router suite |
-| `examples/large_body.jai` | new: 1 MB body for the manual slow-client check |
-| `CLAUDE.md` | status, parameters, patterns |
+| File                                 | Responsibility after this plan                                                                              |
+|--------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `modules/http_server/module.jai`     | module parameters (five new)                                                                                |
+| `modules/http_server/connection.jai` | `Connection` state, pool, `release_pending`, `append_bytes`                                                 |
+| `modules/http_server/http.jai`       | types, parser, writer (`write_response`, `flush_pending`), canned replies, `format_http_date`, buffer shift |
+| `modules/http_server/server.jai`     | worker loop, accept, `handle_client` and its helpers, timeouts, date cache                                  |
+| `modules/http_server/tests/test.jai` | server suite + socket helpers                                                                               |
+| `modules/http_router/trie.jai`       | HEAD fallback, `Allow` builder, `tree_match` third return                                                   |
+| `modules/http_router/router.jai`     | `Allow` on 405                                                                                              |
+| `modules/http_router/tests/test.jai` | router suite                                                                                                |
+| `examples/large_body.jai`            | new: 1 MB body for the manual slow-client check                                                             |
+| `CLAUDE.md`                          | status, parameters, patterns                                                                                |
 
 ---
 
@@ -57,7 +57,7 @@ Inputs the spec implies but that are easy to leave untested. Each line is pinned
 
 **Files:** none modified.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 The `fib-lifts` branch already exists on the remote with the design, this plan and the CLAUDE.md note committed (2026-10-03). Check it out rather than creating it:
 
@@ -65,7 +65,7 @@ The `fib-lifts` branch already exists on the remote with the design, this plan a
 cd ~/projects/jai-http && git fetch origin && git checkout fib-lifts && git pull --ff-only
 ```
 
-- [ ] **Step 2: Confirm everything is green before touching anything**
+- [x] **Step 2: Confirm everything is green before touching anything**
 
 Run: `~/jai/jai/bin/jai-linux first.jai - run-tests`
 Expected: every suite prints `All tests passed.` (50 http_server + 31 router + 19 datetime + 15 channel + 15 CSV + JSON harness).
@@ -73,7 +73,7 @@ Expected: every suite prints `All tests passed.` (50 http_server + 31 router + 1
 Run: `~/jai/jai/bin/jai-linux first.jai -`
 Expected: `build_debug/{hello_world,hello_world_raw,app_state,multipath}` all build.
 
-- [ ] **Step 3: Record the wrk baseline (release build)**
+- [x] **Step 3: Record the wrk baseline (release build)**
 
 ```bash
 ~/jai/jai/bin/jai-linux first.jai - hello_world -release
@@ -85,7 +85,7 @@ kill %1
 
 Paste the five `Requests/sec` lines into the **Appendix: wrk baseline** section at the bottom of this file with the date. Task 8 compares against them.
 
-- [ ] **Step 4: Commit the baseline numbers**
+- [x] **Step 4: Commit the baseline numbers**
 
 ```bash
 git add docs/plans/2026-10-03-fib-lifts-implementation.md
@@ -2222,7 +2222,17 @@ EOF
 
 ## Appendix: wrk baseline (Task 1, before any change)
 
-_(fill in: date, machine, governor, mitigations; five `Requests/sec` lines)_
+2026-10-03, Threadripper 3970X (64 logical), governor `performance`, mitigations ON (kernel default), Jai beta 0.2.030, release `hello_world`, `wrk -d10s`. Zero socket errors and zero non-2xx at every point.
+
+| wrk         | Requests/sec | Avg latency |
+|-------------|-------------:|------------:|
+| t1 / c10    |      131,893 |     46.96us |
+| t4 / c100   |      384,035 |    150.30us |
+| t8 / c500   |      695,974 |    415.26us |
+| t16 / c1000 |    1,360,956 |    620.61us |
+| t32 / c2000 |    1,342,797 |      1.44ms |
+
+Matches the 2026-06-22 mitigations-ON ceiling (~1.3M at t16/t32).
 
 ## Appendix: wrk after (Task 8)
 
