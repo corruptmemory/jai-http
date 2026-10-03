@@ -305,14 +305,14 @@ Zero socket errors / non-2xx / crashes across the whole grid (2000 concurrent co
 
 Within noise, confirmed by a same-session control against a fresh master build. t1/c10 is bimodal on this box (core placement: master measured 97K, 98K and 146K back to back), so single t1 runs mean little. Before the perf fixes the branch trailed master by 2.7-4.0% at t4/t32: `now_ms` went through `seconds_since_init` (TSC read plus S128 math) two or three times per request, and every header went through a `String_Builder`. Real-TCP slow-client check: on master a 4 MB body was silently truncated at 3.4 MB and the client hung; on the branch it arrives complete, and an 8 MB body is refused and logged (`MAX_PENDING_BYTES`). Full numbers: the appendices of `docs/plans/2026-10-03-fib-lifts-implementation.md`.
 
-**Chunked + slow clients (2026-10-03, Threadripper 3970X 64T, governor `performance`, mitigations ON, beta 0.2.030):** master (with PR #5) against the branch, same session, back to back.
+**Chunked + slow clients (2026-10-03, Threadripper 3970X 64T, governor `performance`, mitigations ON, beta 0.2.030):** master (with PR #5) against the branch at `4b8cbd0` (after the final-review fixes), same session, alternating master, branch, master, branch; two runs per point.
 
-| wrk         |    master |    branch | delta |
-|-------------|----------:|----------:|------:|
-| t1 / c10    |   119,862 |   113,036 | -5.7% |
-| t4 / c100   |   359,893 |   383,461 | +6.5% |
-| t8 / c500   |   702,636 |   700,748 | -0.3% |
-| t16 / c1000 | 1,363,381 | 1,388,513 | +1.8% |
-| t32 / c2000 | 1,293,530 | 1,309,505 | +1.2% |
+| wrk         | master avg | branch avg |  delta | master runs           | branch runs           |
+|-------------|-----------:|-----------:|-------:|-----------------------|-----------------------|
+| t1 / c10    |    107,338 |    134,385 | +25.2% | 93,661 / 121,016      | 141,688 / 127,081     |
+| t4 / c100   |    367,711 |    369,024 |  +0.4% | 377,366 / 358,055     | 357,235 / 380,813     |
+| t8 / c500   |    703,995 |    702,378 |  -0.2% | 705,381 / 702,609     | 701,499 / 703,257     |
+| t16 / c1000 |  1,365,016 |  1,378,930 |  +1.0% | 1,355,090 / 1,374,942 | 1,366,695 / 1,391,165 |
+| t32 / c2000 |  1,297,826 |  1,306,020 |  +0.6% | 1,302,911 / 1,292,742 | 1,304,431 / 1,307,609 |
 
-Within noise (t1/c10 is bimodal on this box); zero socket errors. The hot path gained one branch in `finish_headers`. A first attempt measured 1.5K req/s at t1/c10 for both builds: a stray scratch server still held port 9090 through SO_REUSEPORT and took a share of wrk's connections. Check `ss -ltnp | grep 9090` before benchmarking.
+Within noise at t4-t32 (±1%); the t1/c10 +25% is not a gain: master alone measured 93.7K and 121K back to back (core placement makes that point bimodal on this box). Zero socket errors in all 20 runs; latency identical (about 150 µs at t4, 1.49 ms at t32). In line with every mitigations-ON baseline since 2026-06-22 (~1.37M at t16, ~1.3M at t32): no regression across the trie, fib-lifts and this branch. The hot path gained one branch in `finish_headers`; the review fixes touch only the sweep and the queued-tail path. A first attempt (before the fixes) measured 1.5K req/s at t1/c10 for both builds: a stray scratch server still held port 9090 through SO_REUSEPORT and took a share of wrk's connections. Check `ss -ltnp | grep 9090` before benchmarking.

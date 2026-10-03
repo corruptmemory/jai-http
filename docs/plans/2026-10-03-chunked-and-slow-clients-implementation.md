@@ -1863,3 +1863,17 @@ Write `$SCRATCH/pr-body.md` first, with these sections: **Summary** (one line pe
 | t32 / c2000 | 1,293,530 | 1,309,505 | +1.2% |
 
 Zero socket errors and no non-2xx responses at every point. The first attempt was invalid: a scratch server from the Step 2 probes still held port 9090 through SO_REUSEPORT.
+
+## Appendix: wrk A/B after the final-review fixes (`4b8cbd0`, same session)
+
+Alternating master, branch, master, branch; two runs per point; zero socket errors in all 20 runs.
+
+| wrk         | master avg | branch avg |  delta | master runs           | branch runs           |
+|-------------|-----------:|-----------:|-------:|-----------------------|-----------------------|
+| t1 / c10    |    107,338 |    134,385 | +25.2% | 93,661 / 121,016      | 141,688 / 127,081     |
+| t4 / c100   |    367,711 |    369,024 |  +0.4% | 377,366 / 358,055     | 357,235 / 380,813     |
+| t8 / c500   |    703,995 |    702,378 |  -0.2% | 705,381 / 702,609     | 701,499 / 703,257     |
+| t16 / c1000 |  1,365,016 |  1,378,930 |  +1.0% | 1,355,090 / 1,374,942 | 1,366,695 / 1,391,165 |
+| t32 / c2000 |  1,297,826 |  1,306,020 |  +0.6% | 1,302,911 / 1,292,742 | 1,304,431 / 1,307,609 |
+
+Within noise at t4-t32 (±1%); t1/c10 is bimodal on this box (master alone: 93.7K, then 121K).
