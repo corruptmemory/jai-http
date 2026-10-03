@@ -164,12 +164,18 @@ Timeout_State :: enum u8 #specified {
     BODY   :: 3;   // headers complete, body incomplete
     WRITE  :: 4;   // response tail pending
     LINGER :: 5;   // lingering close: final response sent, discarding input until EOF
+    NEW    :: 6;   // accepted, no byte received yet: the first request's HEADER clock, from accept
 }
 
 timeout_state :: (c: *Connection) -> Timeout_State {
     if c.lingering                return .LINGER;
     if c.pending.count > 0        return .WRITE;
-    if c.bytes_used == 0          return .IDLE;
+    if c.bytes_used == 0 {
+        // accept_connections stamps request_start_ms; the read path only sets it when it is zero
+        // and reset_for_next_request clears it, so this combination means nothing has arrived yet.
+        if c.request_start_ms != 0  return .NEW;
+        return .IDLE;
+    }
     if c.parse_state == .BODY || c.parse_state == .CHUNKED  return .BODY;
     if c.parse_state == .COMPLETE return .NONE;   // never observed by the sweep; defensive
     return .HEADER;
@@ -209,6 +215,7 @@ is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_S
     since: s64 = 0;
     if state == {
         case .IDLE;   limit = IDLE_TIMEOUT_MS;   since = c.last_activity_ms;
+        case .NEW;    limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;   // from accept
         case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
         case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
         case .LINGER; limit = LINGER_TIMEOUT_MS; since = c.last_activity_ms;   // set on entering linger
@@ -298,6 +305,7 @@ accept_connections :: (w: *Worker) {
         }
         c.fd = conn_fd;
         c.last_activity_ms = now_ms();
+        c.request_start_ms = c.last_activity_ms;   // NEW: the first request is timed from accept, as nginx does
 
         // Write interest is armed once for the connection's whole life. Edge-triggered OUT only
         // fires on the full-to-writable transition, so it costs nothing while there is room, and

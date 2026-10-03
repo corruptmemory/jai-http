@@ -2379,6 +2379,62 @@ test_check_timeouts_closes_a_slow_drain :: () {
     print("  PASS: test_check_timeouts_closes_a_slow_drain\n");
 }
 
+// Defaults asserted as literals: HEADER_TIMEOUT_MS 10000.
+test_new_connection_state :: () {
+    c: Connection;
+    c.request_start_ms = 5000;   // as accept_connections leaves a fresh connection
+    assert(timeout_state(*c) == .NEW, "accepted, nothing received: NEW, got %", timeout_state(*c));
+    t, s := is_timed_out(*c, 5000 + 9999);
+    assert(!t && s == .NEW, "one ms short of 10 s is fine");
+    t, s = is_timed_out(*c, 5000 + 10000);
+    assert(t && s == .NEW, "a silent new connection times out HEADER_TIMEOUT_MS after accept");
+    c.bytes_used  = 3;
+    c.parse_state = .REQUEST_LINE;
+    t, s = is_timed_out(*c, 5000 + 10000);
+    assert(t && s == .HEADER, "once bytes arrive it is a HEADER wait, still timed from accept");
+    print("  PASS: test_new_connection_state\n");
+}
+
+test_new_connection_closed_silently :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    lfd := socket(AF_INET, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, 0);
+    assert(lfd >= 0 && bind(lfd, "127.0.0.1", 0) == 0 && listen(lfd, 16) == 0, "setup: listen socket");
+    defer close(lfd);
+    addr: sockaddr_in;
+    len: socklen_t = size_of(sockaddr_in);
+    getsockname(lfd, cast(*sockaddr) *addr, *len);
+    client := socket(AF_INET, .SOCK_STREAM | .SOCK_CLOEXEC, 0);
+    defer close(client);
+    assert(connect(client, cast(*sockaddr) *addr, len) == 0, "setup: connect");
+    fcntl(client, F_SETFL, O_NONBLOCK);
+
+    w.listen_fd = lfd;
+    accept_connections(*w);
+    w.listen_fd = -1;
+    c: *Connection;
+    for * w.pool.connections  if it.state == .ACTIVE  c = it;
+    assert(c != null && c.request_start_ms > 0 && timeout_state(c) == .NEW, "an accepted connection that sent nothing is NEW, timed from accept");
+    accepted_at := c.request_start_ms;
+
+    closed := check_timeouts(*w, accepted_at + 9999);
+    assert(closed == 0 && c.state == .ACTIVE, "not yet");
+    closed = check_timeouts(*w, accepted_at + 10000);
+    assert(closed == 1 && c.state == .FREE, "closed HEADER_TIMEOUT_MS after accept; closed=% state=%", closed, c.state);
+
+    got: [..] u8;
+    defer array_free(got);
+    n: s64;
+    ended, err: s32;
+    for 1..1000000 {   // the FIN is already on its way; no sleeping
+        n, ended, err = client_read(client, *got);
+        if ended != 0  break;
+    }
+    assert(ended == 1 && got.count == 0, "closed without a reply: EOF and no bytes; ended %, got '%'", ended, as_string(got));
+    print("  PASS: test_new_connection_closed_silently\n");
+}
+
 test_tail_refusal :: () {
     assert(tail_refusal(100, 0, 1000, 5000) == .NONE, "small tail, empty worker");
     assert(tail_refusal(1000, 0, 1000, 5000) == .NONE, "exactly the connection cap fits");
@@ -2801,6 +2857,8 @@ main :: () {
     test_rate_floor_catches_a_steady_trickle();
     test_canned_tail_gets_a_drain_deadline();
     test_check_timeouts_closes_a_slow_drain();
+    test_new_connection_state();
+    test_new_connection_closed_silently();
     print("\nPending budget:\n");
     test_tail_refusal();
     test_pending_budget_accounting_balances();
