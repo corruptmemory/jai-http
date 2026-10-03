@@ -38,6 +38,7 @@ Connection :: struct {
     // Timeouts: monotonic milliseconds from now_ms() in server.jai
     last_activity_ms: s64;      // accept, or the last successful read / write progress
     last_write_ms:    s64;      // start of a stalled write, or its last progress; the WRITE timeout's clock
+    write_deadline_ms: s64;     // the queued tail must have drained by then (MIN_SEND_RATE); 0: none
     request_start_ms: s64;      // first byte of the request being parsed; 0 while idle or dispatching
 }
 
@@ -104,6 +105,7 @@ get_connection :: (pool: *Connection_Pool) -> *Connection {
     c.lingering        = false;
     c.last_activity_ms = 0;
     c.last_write_ms    = 0;
+    c.write_deadline_ms = 0;
     c.request_start_ms = 0;
 
     return c;
@@ -126,6 +128,7 @@ free_connection :: (pool: *Connection_Pool, c: *Connection) {
 release_pending :: (c: *Connection) {
     if c.pending.data  Basic.array_reset(*c.pending);
     c.pending_offset = 0;
+    c.write_deadline_ms = 0;   // a deadline never outlives its tail
 }
 
 // Append raw bytes to a resizable byte array using the array's own allocator. Grows by doubling:

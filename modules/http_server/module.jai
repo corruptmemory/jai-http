@@ -28,6 +28,11 @@
     HEADER_TIMEOUT_MS   : s64 = 10000,    // from a request's first byte until its headers are complete
     BODY_TIMEOUT_MS     : s64 = 30000,    // from a request's first byte until its body is complete
     WRITE_TIMEOUT_MS    : s64 = 30000,    // a pending response making no progress toward the peer
+    // Minimum average rate, in bytes per second, at which a queued response tail must drain once
+    // the WRITE_TIMEOUT_MS grace has passed: a tail of N bytes must be gone within
+    // WRITE_TIMEOUT_MS + N / MIN_SEND_RATE. The WRITE timeout alone only catches a stall; this
+    // bounds how long a reader that trickles may hold its tail. 0: no floor.
+    MIN_SEND_RATE       : s64 = 16384,
     // Lingering close: after a final response the server half-closes and discards input until the
     // peer's EOF, for at most this long, so a close never turns into a reset that destroys the
     // response. 0 closes right after one drain.

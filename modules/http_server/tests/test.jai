@@ -2282,6 +2282,93 @@ test_reads_do_not_extend_write_timeout :: () {
     close_connection(*w, c);
 }
 
+test_drain_deadline :: () {
+    assert(drain_deadline(1000, 16384, 30000, 16384) == 32000, "16 KB at 16 KB/s: one second after the grace");
+    assert(drain_deadline(1000, 1048576, 30000, 16384) == 95000, "1 MB at 16 KB/s: 64 s after the grace");
+    assert(drain_deadline(1000, 0, 30000, 16384) == 31000, "an empty tail: just the grace");
+    assert(drain_deadline(1000, 100, 0, 1000) == 1100, "no grace: size over rate alone");
+    assert(drain_deadline(1000, 1048576, 30000, 0) == 0, "rate 0: no floor, no deadline");
+    print("  PASS: test_drain_deadline\n");
+}
+
+// Defaults asserted as literals: MIN_SEND_RATE 16384, WRITE_TIMEOUT_MS 30000.
+test_start_write_clock_sets_the_deadline :: () {
+    c: Connection;
+    c.pending.count = 32768;   // synthetic tail
+    start_write_clock(*c, 5000);
+    assert(c.last_write_ms == 5000, "the WRITE clock starts now, got %", c.last_write_ms);
+    assert(c.write_deadline_ms == 5000 + 30000 + 2000, "32 KB at 16 KB/s after a 30 s grace, got %", c.write_deadline_ms);
+    c.pending.count = 0;
+    print("  PASS: test_start_write_clock_sets_the_deadline\n");
+}
+
+test_rate_floor_catches_a_steady_trickle :: () {
+    c: Connection;
+    c.pending.count     = 1;       // synthetic tail; the deadline is set directly
+    c.write_deadline_ms = 94000;
+    c.last_write_ms     = 93000;   // progress a second ago: not a stall
+    t, s := is_timed_out(*c, 93999);
+    assert(!t && s == .WRITE, "before its deadline a progressing tail is fine");
+    c.last_write_ms = 93500;
+    t, s = is_timed_out(*c, 94000);
+    assert(t && s == .WRITE, "a tail that keeps trickling still times out at its deadline");
+    c.write_deadline_ms = 0;       // no floor: only a stall counts
+    c.last_write_ms     = 199000;
+    t, s = is_timed_out(*c, 200000);
+    assert(!t, "without a deadline, steady progress never times out");
+    c.pending.count = 0;
+    print("  PASS: test_rate_floor_catches_a_steady_trickle\n");
+}
+
+// Review focus 5 (deadline half). A 400 queued behind a full socket is a tail like any other.
+test_canned_tail_gets_a_drain_deadline :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    filler: [1024] u8;
+    while send(server, filler.data, filler.count, .NOSIGNAL) > 0 {}   // the socket is full
+    send_to_server(peer, "GARBAGE\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0 && c.close_after_send, "setup: the 400 is queued behind the full socket");
+    want := c.last_write_ms + 30000 + c.pending.count * 1000 / 16384;
+    assert(c.write_deadline_ms == want, "a queued canned reply gets a drain deadline: % vs %", c.write_deadline_ms, want);
+    close_connection(*w, c);
+    print("  PASS: test_canned_tail_gets_a_drain_deadline\n");
+}
+
+test_check_timeouts_closes_a_slow_drain :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response stalls");
+    want := c.last_write_ms + 30000 + c.pending.count * 1000 / 16384;
+    assert(c.write_deadline_ms == want, "the dispatch path starts the drain clock: % vs %", c.write_deadline_ms, want);
+
+    rec: Error_Recorder;
+    ctx := context;
+    ctx.logger      = record_errors;
+    ctx.logger_data = *rec;
+    now := c.write_deadline_ms;
+    c.last_write_ms = now - 1000;   // progress a second ago: not a stall
+    closed: s32;
+    push_context ctx { closed = check_timeouts(*w, now); }
+    assert(closed == 1 && c.state == .FREE, "a tail past its drain deadline is closed; closed=% state=%", closed, c.state);
+    assert(rec.errors == 0, "a slow client is the client's doing: info, not an error (got % errors)", rec.errors);
+    print("  PASS: test_check_timeouts_closes_a_slow_drain\n");
+}
+
 // R13. send_canned makes one attempt and ignores EAGAIN and short writes, then the connection
 // closes: under backpressure (an earlier response filled the socket) the 400/408/413/431 never
 // reaches the client and nothing is logged. Deliver it (queue it) or report the failure.
@@ -2602,6 +2689,11 @@ main :: () {
     test_check_timeouts_sends_408_for_a_slow_header();
     test_check_timeouts_skips_free_slots_and_listener();
     test_reads_do_not_extend_write_timeout();
+    test_drain_deadline();
+    test_start_write_clock_sets_the_deadline();
+    test_rate_floor_catches_a_steady_trickle();
+    test_canned_tail_gets_a_drain_deadline();
+    test_check_timeouts_closes_a_slow_drain();
 
     print("\nDate header and buffer shift:\n");
     test_format_http_date();

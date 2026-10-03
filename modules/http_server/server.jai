@@ -155,7 +155,7 @@ refresh_date :: (w: *Worker) {
 // that has fully arrived has no deadline: the handler runs synchronously and request_start_ms is
 // cleared before dispatch. Sweeps run once a second from worker_run when any timeout is enabled.
 
-TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0 || LINGER_TIMEOUT_MS > 0;
+TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0 || LINGER_TIMEOUT_MS > 0 || MIN_SEND_RATE > 0;
 
 Timeout_State :: enum u8 #specified {
     NONE   :: 0;
@@ -175,13 +175,40 @@ timeout_state :: (c: *Connection) -> Timeout_State {
     return .HEADER;
 }
 
+// drain_deadline multiplies a tail's size by 1000, and arithmetic overflow is FATAL in every build.
+#assert MAX_PENDING_BYTES <= 9000000000000 "MAX_PENDING_BYTES is too large for drain_deadline's arithmetic";
+
+// When a tail of `bytes` queued at `now` must have drained to honor a minimum average rate after a
+// grace period: now + grace_ms + bytes / rate (rate in bytes per second). 0 when rate <= 0: no
+// floor. Takes its limits as arguments so tests can drive any value.
+drain_deadline :: (now: s64, bytes: s64, grace_ms: s64, rate: s64) -> s64 {
+    if rate <= 0  return 0;
+    return now + grace_ms + bytes * 1000 / rate;
+}
+
+// A response tail was just queued: start the clocks the WRITE timeout and the rate floor read.
+start_write_clock :: (c: *Connection, now: s64) {
+    c.last_write_ms     = now;
+    c.write_deadline_ms = drain_deadline(now, c.pending.count, WRITE_TIMEOUT_MS, MIN_SEND_RATE);
+}
+
+// The queued tail has missed its drain deadline, however steadily it has been moving.
+write_too_slow :: inline (c: *Connection, now: s64) -> bool {
+    return c.write_deadline_ms > 0 && now >= c.write_deadline_ms;
+}
+
 is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_State) {
     state := timeout_state(c);
+    if state == .WRITE {
+        // Two limits on a queued tail: a stall (no progress for WRITE_TIMEOUT_MS; input does not
+        // count) and the rate floor (not drained by its deadline, however steadily it trickles).
+        stalled := WRITE_TIMEOUT_MS > 0 && now - c.last_write_ms >= WRITE_TIMEOUT_MS;
+        return stalled || write_too_slow(c, now), state;
+    }
     limit: s64 = 0;
     since: s64 = 0;
     if state == {
         case .IDLE;   limit = IDLE_TIMEOUT_MS;   since = c.last_activity_ms;
-        case .WRITE;  limit = WRITE_TIMEOUT_MS;  since = c.last_write_ms;   // write progress only; input does not count
         case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
         case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
         case .LINGER; limit = LINGER_TIMEOUT_MS; since = c.last_activity_ms;   // set on entering linger
@@ -192,8 +219,8 @@ is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_S
 }
 
 // Close every active connection whose timeout has passed. Returns how many were closed. A slow
-// request gets a 408 through refuse_and_close: the client may still be sending, so the reply
-// needs the same drain-before-close to survive.
+// request gets a 408 through refuse_and_close (which logs it): the client may still be sending, so
+// the reply needs the same drain-before-close to survive. Every other timeout closes silently.
 check_timeouts :: (w: *Worker, now: s64) -> s32 {
     closed: s32 = 0;
     for * w.pool.connections {
@@ -201,9 +228,13 @@ check_timeouts :: (w: *Worker, now: s64) -> s32 {
         if c.state != .ACTIVE || c == w.listen_conn  continue;
         timed_out, state := is_timed_out(c, now);
         if !timed_out  continue;
-        Basic.log("fd %: % timeout; closing", c.fd, state);
-        if state == .HEADER || state == .BODY  refuse_and_close(w, c, 408);
-        else                                   close_connection(w, c);
+        if state == .HEADER || state == .BODY {
+            refuse_and_close(w, c, 408);
+        } else {
+            detail := ifx state == .WRITE && write_too_slow(c, now) then " (drained slower than MIN_SEND_RATE)" else "";
+            Basic.log("fd %: % timeout%; closing", c.fd, state, detail);
+            close_connection(w, c);
+        }
         closed += 1;
     }
     return closed;
@@ -397,9 +428,8 @@ dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
         Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
         now := now_ms();
         c.last_activity_ms = now;
-        c.last_write_ms    = now;   // a tail queued now starts the WRITE clock
-
         if wr == .ERROR { close_connection(w, c); return false; }
+        if wr == .PENDING  start_write_clock(c, now);   // the WRITE and drain-rate clocks
         keep_alive := c.req.keep_alive;
         reset_for_next_request(c);
         if wr == .PENDING {
@@ -419,7 +449,7 @@ refuse_and_close :: (w: *Worker, c: *Connection, status: u16) {
     if r == .ERROR { close_connection(w, c); return; }
     if r == .PENDING {
         c.close_after_send = true;
-        c.last_write_ms    = now_ms();
+        start_write_clock(c, now_ms());
         return;
     }
     linger_close(w, c);
