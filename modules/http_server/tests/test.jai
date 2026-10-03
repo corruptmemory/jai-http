@@ -2007,6 +2007,31 @@ test_review_205_is_bodiless :: () {
         "a 205 must carry no content, got '%'", out);
 }
 
+// R20. An empty line before the request line is a 400. RFC 9112 §2.2: a server SHOULD ignore
+// at least one empty line (CRLF) received prior to the request-line.
+test_review_leading_crlf_ignored :: () {
+    c: Connection;
+    s := "\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .COMPLETE && string_equals(c.req.path, "/a"), "R20 leading_crlf_ignored",
+        "a CRLF before the request line must be skipped; got % (path '%')", r, c.req.path);
+}
+
+// R21. Any string is accepted as the HTTP version, so `GET /a JUNK/9` is served (as an
+// HTTP/1.0-style close). RFC 9112 §2.3: HTTP-version is "HTTP/" DIGIT "." DIGIT; reject anything
+// else with 400 (505 is for a well-formed but unsupported major version).
+test_review_bad_version_rejected :: () {
+    c: Connection;
+    s := "GET /a JUNK/9\r\nHost: x\r\n\r\n";
+    memcpy(c.buf.data, s.data, s.count);
+    c.bytes_used = s.count;
+    r := parse_request(*c);
+    review_check(r == .ERROR, "R21 bad_version_rejected",
+        "a malformed HTTP-version must be an error; got % (version '%')", r, c.req.http_version);
+}
+
 main :: () {
     print("Running tests...\n\n");
 
@@ -2144,6 +2169,8 @@ main :: () {
     test_review_connection_option_list();
     test_review_host_required_once();
     test_review_205_is_bodiless();
+    test_review_leading_crlf_ignored();
+    test_review_bad_version_rejected();
     assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll tests passed.\n");
