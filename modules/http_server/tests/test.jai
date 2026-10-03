@@ -1531,21 +1531,10 @@ test_handle_client_header_clock_restarts_at_drain :: () {
     print("  PASS: test_handle_client_header_clock_restarts_at_drain\n");
 }
 
-// -- Review findings (2026-10-03 whole-PR review of fib-lifts) --
+// -- Hardening from the PR #5 review (2026-10-03) --
 //
-// Each test encodes behavior the code should have and did not at review time. They use
-// review_check instead of assert so one run reports every open finding; the group asserts once
-// at the end. A finding is fixed when its line prints PASS.
-
-review_failures: s32;
-
-review_check :: (ok: bool, name: string, fmt: string, args: ..Any) {
-    if ok { print("  PASS: %\n", name); return; }
-    review_failures += 1;
-    print("  FAIL: %: ", name);
-    print(fmt, ..args);
-    print("\n");
-}
+// Each test pins a finding from the whole-PR review; the R-number matches the review report on
+// PR #5. They are registered in their topic groups in main.
 
 // Records .ERROR log calls, per the project's testing corollary (errors are an assertable side
 // channel even for procedures with no error return).
@@ -1607,7 +1596,7 @@ client_read :: (fd: s32, into: *[..] u8) -> (got: s64, ended: s32, err: s32) {
 // discards response bytes it has not transmitted yet (verified with plain sockets: a 200 KB reply
 // arrives as 128 KB, then ECONNRESET). refuse_and_close drains before closing; the close after a
 // `Connection: close` response (immediate, or after a pending tail drains) does not.
-test_review_close_with_unread_input_keeps_response :: () {
+test_close_with_unread_input_keeps_response :: () {
     big_test_body = big_body(262144);
     defer free(big_test_body);
     w: Worker;
@@ -1648,8 +1637,8 @@ test_review_close_with_unread_input_keeps_response :: () {
     header_end := index_of(out, "\r\n\r\n");
     body_got := ifx header_end >= 0 then out.count - (header_end + 4) else 0;
     how := ifx ended == 1 then "EOF" else ifx ended == 2 then "a reset/error" else "nothing";
-    review_check(ended == 1 && body_got == big_test_body.count, "R1 close_with_unread_input_keeps_response",
-        "the whole response then EOF; got % of % body bytes, then % (errno %)", body_got, big_test_body.count, how, err);
+    assert(ended == 1 && body_got == big_test_body.count, "the whole response then EOF; got % of % body bytes, then % (errno %)", body_got, big_test_body.count, how, err);
+    print("  PASS: test_close_with_unread_input_keeps_response\n");
     if c.state == .ACTIVE  close_connection(*w, c);
 }
 
@@ -1657,7 +1646,7 @@ test_review_close_with_unread_input_keeps_response :: () {
 // and release with arithmetic_overflow_check = .FATAL, so a 20-digit Content-Length panics the
 // process: one request kills every worker. (With the check off it would wrap instead: 2^64 + 5
 // parses as 5, a desync.) Parsed in a forked child so the panic cannot take this suite down.
-test_review_content_length_overflow_rejected :: () {
+test_content_length_overflow_rejected :: () {
     pid := fork();
     if pid == 0 {
         c: Connection;
@@ -1673,13 +1662,13 @@ test_review_content_length_overflow_rejected :: () {
     code := (status >> 8) & 0xff;
     what := ifx !exited then "died on a signal" else ifx code == 1 then "PANICKED (arithmetic overflow; a live server dies)"
             else tprint("returned Parse_Result %", code - 10);
-    review_check(exited && code == 10 + cast(s32) Parse_Result.ERROR, "R2 content_length_overflow_rejected",
-        "a 20-digit Content-Length must parse as an error; the parse %", what);
+    assert(exited && code == 10 + cast(s32) Parse_Result.ERROR, "a 20-digit Content-Length must parse as an error; the parse %", what);
+    print("  PASS: test_content_length_overflow_rejected\n");
 }
 
 // R3. Headers past MAX_HEADERS (64) are dropped silently, including Content-Length, so the body
 // is parsed as the next request (desync). RFC 9110 §15.5.32 / RFC 6585: refuse with 431.
-test_review_too_many_headers_refused :: () {
+test_too_many_headers_refused :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -1701,29 +1690,29 @@ test_review_too_many_headers_refused :: () {
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
-    review_check(starts_with(as_string(got), "HTTP/1.1 431 ") && test_handler_calls == 0, "R3 too_many_headers_refused",
-        "more than MAX_HEADERS headers must be refused with 431, not served with headers dropped; handler ran %, got '%'",
+    assert(starts_with(as_string(got), "HTTP/1.1 431 ") && test_handler_calls == 0, "more than MAX_HEADERS headers must be refused with 431, not served with headers dropped; handler ran %, got '%'",
         test_handler_calls, as_string(got));
+    print("  PASS: test_too_many_headers_refused\n");
     if c.state == .ACTIVE  close_connection(*w, c);
 }
 
 // R4. Two Content-Length headers with different values: get_header takes the first. RFC 9112
 // §6.3 item 5: an invalid Content-Length (differing values) is unrecoverable; respond 400.
-test_review_duplicate_content_length_rejected :: () {
+test_duplicate_content_length_rejected :: () {
     c: Connection;
     s := "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .ERROR, "R4 duplicate_content_length_rejected",
-        "differing Content-Length values must be an error; got % with content_length %", r, c.req.content_length);
+    assert(r == .ERROR, "differing Content-Length values must be an error; got % with content_length %", r, c.req.content_length);
+    print("  PASS: test_duplicate_content_length_rejected\n");
 }
 
 // R5. Transfer-Encoding is ignored: a chunked body is not read as a body, so its first chunk line
 // is parsed as the next request (desync; with Content-Length also present it is the classic
 // CL.TE smuggling shape). Until chunked decoding exists, refuse: RFC 9112 §6.1 says 501 for a
 // transfer coding the server does not understand.
-test_review_transfer_encoding_refused :: () {
+test_transfer_encoding_refused :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -1737,27 +1726,27 @@ test_review_transfer_encoding_refused :: () {
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
-    review_check(starts_with(as_string(got), "HTTP/1.1 501 ") && test_handler_calls == 0, "R5 transfer_encoding_refused",
-        "a chunked request must be refused (or decoded), never served bodiless with the chunks re-parsed; handler ran %, got '%'",
+    assert(starts_with(as_string(got), "HTTP/1.1 501 ") && test_handler_calls == 0, "a chunked request must be refused (or decoded), never served bodiless with the chunks re-parsed; handler ran %, got '%'",
         test_handler_calls, as_string(got));
+    print("  PASS: test_transfer_encoding_refused\n");
     if c.state == .ACTIVE  close_connection(*w, c);
 }
 
 // R6. Field values keep trailing whitespace (and leading tabs), so `Content-Length: 5 ` is
 // rejected as malformed. RFC 9110 §5.5: OWS around a field value is not part of the value.
-test_review_header_value_ows_trimmed :: () {
+test_header_value_ows_trimmed :: () {
     c: Connection;
     s := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length:\t5 \r\n\r\nhello";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .COMPLETE && c.req.content_length == 5, "R6 header_value_ows_trimmed",
-        "OWS around a field value must be ignored; got % with content_length % (parse_error %)", r, c.req.content_length, c.parse_error);
+    assert(r == .COMPLETE && c.req.content_length == 5, "OWS around a field value must be ignored; got % with content_length % (parse_error %)", r, c.req.content_length, c.parse_error);
+    print("  PASS: test_header_value_ows_trimmed\n");
 }
 
 // R7. A request line longer than the read buffer is refused with 431 (header fields too large).
 // RFC 9112 §3: a request-target longer than the server will parse gets 414 URI Too Long.
-test_review_long_request_target_gets_414 :: () {
+test_long_request_target_gets_414 :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -1774,14 +1763,14 @@ test_review_long_request_target_gets_414 :: () {
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
-    review_check(starts_with(as_string(got), "HTTP/1.1 414 "), "R7 long_request_target_gets_414",
-        "an overlong request line gets 414, got '%'", as_string(got));
+    assert(starts_with(as_string(got), "HTTP/1.1 414 "), "an overlong request line gets 414, got '%'", as_string(got));
+    print("  PASS: test_long_request_target_gets_414\n");
     if c.state == .ACTIVE  close_connection(*w, c);
 }
 
 // R8. Canned 400/408/413/431 replies carry no Date. RFC 9110 §6.6.1: an origin server with a
 // clock MUST send Date in 2xx, 3xx and 4xx responses.
-test_review_canned_replies_carry_date :: () {
+test_canned_replies_carry_date :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -1796,15 +1785,15 @@ test_review_canned_replies_carry_date :: () {
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
-    review_check(starts_with(as_string(got), "HTTP/1.1 400 ") && contains(as_string(got), "\r\nDate: "), "R8 canned_replies_carry_date",
-        "a canned 4xx must carry Date, got '%'", as_string(got));
+    assert(starts_with(as_string(got), "HTTP/1.1 400 ") && contains(as_string(got), "\r\nDate: "), "a canned 4xx must carry Date, got '%'", as_string(got));
+    print("  PASS: test_canned_replies_carry_date\n");
     if c.state == .ACTIVE  close_connection(*w, c);
 }
 
 // R9. accept4 failures other than EAGAIN (EMFILE, ENFILE, ENOMEM, EINVAL, ...) end the accept
 // loop silently. Project standard: no silent failures; they go through log_error. (With an
 // edge-triggered listen socket, a silent EMFILE also strands the backlog until the next SYN.)
-test_review_accept_errors_are_logged :: () {
+test_accept_errors_are_logged :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -1831,27 +1820,27 @@ test_review_accept_errors_are_logged :: () {
     push_context ctx { accept_connections(*w); }
     w.listen_fd = -1;
 
-    review_check(eagain_errors == 0 && rec.errors > 0, "R9 accept_errors_are_logged",
-        "EAGAIN must stay silent (logged %) and a real accept4 failure must log_error (logged %)",
+    assert(eagain_errors == 0 && rec.errors > 0, "EAGAIN must stay silent (logged %) and a real accept4 failure must log_error (logged %)",
         eagain_errors, rec.errors - eagain_errors);
+    print("  PASS: test_accept_errors_are_logged\n");
 }
 
 // R10. A field name with whitespace before the colon is accepted as a different header, so
 // `Content-Length : 5` hides the body length (desync). RFC 9112 §5.1: reject with 400.
-test_review_field_name_whitespace_rejected :: () {
+test_field_name_whitespace_rejected :: () {
     c: Connection;
     s := "POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .ERROR, "R10 field_name_whitespace_rejected",
-        "whitespace between a field name and its colon must be an error; got % with content_length %", r, c.req.content_length);
+    assert(r == .ERROR, "whitespace between a field name and its colon must be an error; got % with content_length %", r, c.req.content_length);
+    print("  PASS: test_field_name_whitespace_rejected\n");
 }
 
 // R11. req.body and req.query_string are never cleared, neither between requests on one
 // connection nor when a pool slot is reused, so a later bodiless request sees the old views into
 // the read buffer: on a recycled slot that is ANOTHER CLIENT'S bytes.
-test_review_request_views_cleared_on_reuse :: () {
+test_request_views_cleared_on_reuse :: () {
     pool: Connection_Pool;
     init_pool(*pool, 1);
     defer destroy_pool(*pool);
@@ -1870,14 +1859,14 @@ test_review_request_views_cleared_on_reuse :: () {
     memcpy(b.buf.data, second.data, second.count);
     b.bytes_used = second.count;
     assert(parse_request(b) == .COMPLETE, "setup: client B's request parses");
-    review_check(b.req.body.count == 0 && b.req.query_string.count == 0, "R11 request_views_cleared_on_reuse",
-        "client B must not see client A's body/query; body='%' query='%'", b.req.body, b.req.query_string);
+    assert(b.req.body.count == 0 && b.req.query_string.count == 0, "client B must not see client A's body/query; body='%' query='%'", b.req.body, b.req.query_string);
+    print("  PASS: test_request_views_cleared_on_reuse\n");
 }
 
 // R12. While a response is pending, every READ refreshes last_activity_ms, which is also the
 // WRITE timeout's clock. A client that never reads but sends a byte every 29 s keeps the slot and
 // its pending tail alive for hours. The WRITE deadline must count from write progress only.
-test_review_reads_do_not_extend_write_timeout :: () {
+test_reads_do_not_extend_write_timeout :: () {
     big_test_body = big_body(262144);
     defer free(big_test_body);
     w: Worker;
@@ -1898,15 +1887,15 @@ test_review_reads_do_not_extend_write_timeout :: () {
     handle_client(*w, c, EPOLLIN);
 
     timed_out, state := is_timed_out(c, stall_ms + 30000);
-    review_check(timed_out && state == .WRITE, "R12 reads_do_not_extend_write_timeout",
-        "30 s after the last write progress the WRITE timeout must fire despite later input; timed_out=% state=%", timed_out, state);
+    assert(timed_out && state == .WRITE, "30 s after the last write progress the WRITE timeout must fire despite later input; timed_out=% state=%", timed_out, state);
+    print("  PASS: test_reads_do_not_extend_write_timeout\n");
     close_connection(*w, c);
 }
 
 // R13. send_canned makes one attempt and ignores EAGAIN and short writes, then the connection
 // closes: under backpressure (an earlier response filled the socket) the 400/408/413/431 never
 // reaches the client and nothing is logged. Deliver it (queue it) or report the failure.
-test_review_canned_reply_survives_backpressure :: () {
+test_canned_reply_survives_backpressure :: () {
     w: Worker;
     make_test_worker(*w, ok_handler);
     defer destroy_test_worker(*w);
@@ -1936,27 +1925,27 @@ test_review_canned_reply_survives_backpressure :: () {
     }
     drain_peer(peer, *got);
     delivered := contains(as_string(got), "HTTP/1.1 400 ");
-    review_check(delivered || rec.errors > 0, "R13 canned_reply_survives_backpressure",
-        "the 400 must reach the peer or its loss must be logged; delivered=% errors=%", delivered, rec.errors);
+    assert(delivered || rec.errors > 0, "the 400 must reach the peer or its loss must be logged; delivered=% errors=%", delivered, rec.errors);
+    print("  PASS: test_canned_reply_survives_backpressure\n");
     if c.state == .ACTIVE  close_connection(*w, c);
 }
 
 // R14. The Connection header is compared as one whole string and only the first field is read,
 // so `Connection: keep-alive, close` keeps the connection open. RFC 9110 §7.6.1: it is a list of
 // options; `close` wins.
-test_review_connection_option_list :: () {
+test_connection_option_list :: () {
     c: Connection;
     s := "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .COMPLETE && !c.req.keep_alive, "R14 connection_option_list",
-        "`close` in a Connection option list must end the connection; keep_alive=%", c.req.keep_alive);
+    assert(r == .COMPLETE && !c.req.keep_alive, "`close` in a Connection option list must end the connection; keep_alive=%", c.req.keep_alive);
+    print("  PASS: test_connection_option_list\n");
 }
 
 // R15. HTTP/1.1 requests without Host, or with two, reach the handler. RFC 9112 §3.2: a server
 // MUST respond 400 to an HTTP/1.1 request that lacks Host or has more than one.
-test_review_host_required_once :: () {
+test_host_required_once :: () {
     statuses: [2] string;
     calls: [2] s32;
     requests := string.["GET / HTTP/1.1\r\n\r\n", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"];
@@ -1977,14 +1966,14 @@ test_review_host_required_once :: () {
         calls[it_index] = test_handler_calls;
         if c.state == .ACTIVE  close_connection(*w, c);
     }
-    review_check(statuses[0] == "400" && statuses[1] == "400" && calls[0] == 0 && calls[1] == 0, "R15 host_required_once",
-        "missing Host and duplicate Host must both get 400 without a handler run; got % and % (handler runs % and %)",
+    assert(statuses[0] == "400" && statuses[1] == "400" && calls[0] == 0 && calls[1] == 0, "missing Host and duplicate Host must both get 400 without a handler run; got % and % (handler runs % and %)",
         statuses[0], statuses[1], calls[0], calls[1]);
+    print("  PASS: test_host_required_once\n");
 }
 
 // R16. 205 Reset Content is sent with its body. RFC 9110 §15.3.6: a server MUST NOT generate
 // content in a 205 response (frame it with Content-Length: 0 or close the connection).
-test_review_205_is_bodiless :: () {
+test_205_is_bodiless :: () {
     server, peer := make_socket_pair();
     defer close(server);
     defer close(peer);
@@ -1998,33 +1987,33 @@ test_review_205_is_bodiless :: () {
     defer array_free(got);
     drain_peer(peer, *got);
     out := as_string(got);
-    review_check(starts_with(out, "HTTP/1.1 205 ") && out.count == index_of(out, "\r\n\r\n") + 4, "R16 205_is_bodiless",
-        "a 205 must carry no content, got '%'", out);
+    assert(starts_with(out, "HTTP/1.1 205 ") && out.count == index_of(out, "\r\n\r\n") + 4, "a 205 must carry no content, got '%'", out);
+    print("  PASS: test_205_is_bodiless\n");
 }
 
 // R20. An empty line before the request line is a 400. RFC 9112 §2.2: a server SHOULD ignore
 // at least one empty line (CRLF) received prior to the request-line.
-test_review_leading_crlf_ignored :: () {
+test_leading_crlf_ignored :: () {
     c: Connection;
     s := "\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .COMPLETE && string_equals(c.req.path, "/a"), "R20 leading_crlf_ignored",
-        "a CRLF before the request line must be skipped; got % (path '%')", r, c.req.path);
+    assert(r == .COMPLETE && string_equals(c.req.path, "/a"), "a CRLF before the request line must be skipped; got % (path '%')", r, c.req.path);
+    print("  PASS: test_leading_crlf_ignored\n");
 }
 
 // R21. Any string is accepted as the HTTP version, so `GET /a JUNK/9` is served (as an
 // HTTP/1.0-style close). RFC 9112 §2.3: HTTP-version is "HTTP/" DIGIT "." DIGIT; reject anything
 // else with 400 (505 is for a well-formed but unsupported major version).
-test_review_bad_version_rejected :: () {
+test_bad_version_rejected :: () {
     c: Connection;
     s := "GET /a JUNK/9\r\nHost: x\r\n\r\n";
     memcpy(c.buf.data, s.data, s.count);
     c.bytes_used = s.count;
     r := parse_request(*c);
-    review_check(r == .ERROR, "R21 bad_version_rejected",
-        "a malformed HTTP-version must be an error; got % (version '%')", r, c.req.http_version);
+    assert(r == .ERROR, "a malformed HTTP-version must be an error; got % (version '%')", r, c.req.http_version);
+    print("  PASS: test_bad_version_rejected\n");
 }
 
 main :: () {
@@ -2054,6 +2043,7 @@ main :: () {
     test_write_response_connection_header_rules();
     test_write_response_date_header();
     test_canned_responses();
+    test_205_is_bodiless();
 
     print("\nEvent handling:\n");
     test_parse_error_classification();
@@ -2066,6 +2056,14 @@ main :: () {
     test_handle_client_malformed_gets_400();
     test_handle_client_half_close_serves_pipelined();
     test_handle_client_header_clock_restarts_at_drain();
+    test_close_with_unread_input_keeps_response();
+    test_too_many_headers_refused();
+    test_transfer_encoding_refused();
+    test_host_required_once();
+    test_long_request_target_gets_414();
+    test_canned_replies_carry_date();
+    test_canned_reply_survives_backpressure();
+    test_accept_errors_are_logged();
 
     print("\nTimeouts:\n");
     test_timeout_state_classification();
@@ -2074,6 +2072,7 @@ main :: () {
     test_check_timeouts_closes_idle_silently();
     test_check_timeouts_sends_408_for_a_slow_header();
     test_check_timeouts_skips_free_slots_and_listener();
+    test_reads_do_not_extend_write_timeout();
 
     print("\nDate header and buffer shift:\n");
     test_format_http_date();
@@ -2097,6 +2096,7 @@ main :: () {
     test_keepalive_http11_explicit_close();
     test_keepalive_http10_explicit_keepalive();
     test_keepalive_case_insensitive();
+    test_connection_option_list();
 
     print("\nHeader helpers:\n");
     test_get_header();
@@ -2110,9 +2110,16 @@ main :: () {
     test_parse_body();
     test_parse_body_incomplete();
     test_parse_body_zero_length();
+    test_content_length_overflow_rejected();
+    test_duplicate_content_length_rejected();
+    test_header_value_ows_trimmed();
+    test_field_name_whitespace_rejected();
+    test_leading_crlf_ignored();
+    test_bad_version_rejected();
 
     print("\nPipelining:\n");
     test_reset_for_next_request();
+    test_request_views_cleared_on_reuse();
 
     print("\nResponse helpers:\n");
     test_response_json();
@@ -2146,27 +2153,6 @@ main :: () {
     test_parse_multipart_with_filename();
     test_parse_multipart_missing_header();
     test_multipart_value_missing();
-
-    print("\nReview findings (2026-10-03):\n");
-    test_review_close_with_unread_input_keeps_response();
-    test_review_content_length_overflow_rejected();
-    test_review_too_many_headers_refused();
-    test_review_duplicate_content_length_rejected();
-    test_review_transfer_encoding_refused();
-    test_review_header_value_ows_trimmed();
-    test_review_long_request_target_gets_414();
-    test_review_canned_replies_carry_date();
-    test_review_accept_errors_are_logged();
-    test_review_field_name_whitespace_rejected();
-    test_review_request_views_cleared_on_reuse();
-    test_review_reads_do_not_extend_write_timeout();
-    test_review_canned_reply_survives_backpressure();
-    test_review_connection_option_list();
-    test_review_host_required_once();
-    test_review_205_is_bodiless();
-    test_review_leading_crlf_ignored();
-    test_review_bad_version_rejected();
-    assert(review_failures == 0, "% review finding(s) still open", review_failures);
 
     print("\nAll tests passed.\n");
 }
