@@ -214,8 +214,23 @@ across 16 workers. Like `MAX_PENDING_BYTES` it is a literal cap: 0 means no tail
   OVER_WORKER_BUDGET. It is a pure function, testable with small numbers. A refusal makes the
   write an ERROR: the connection closes and the client gets a truncated response, exactly what
   the per-connection cap does today.
-- **Refuse, not evict.** The drain-rate floor already forces an attacker's share of the budget
-  to turn over within about 94 s, so evicting the worst tail would add complexity for little.
+- **Refuse, not evict.** First come, first served: a refusal closes the connection that asked,
+  never one already holding budget.
+
+  **Amended after the PR review (finding 1).** The first version justified this by saying the
+  drain-rate floor forces an attacker's share of the budget "to turn over within about 94 s". It
+  does not. A tail that drains is refunded in `flush_pending`, and `resume_after_drain` serves the
+  same connection's next pipelined request in the same `handle_client` call, so `reserve_tail`
+  charges the freed bytes back to it before any other connection runs. And the floor is per tail:
+  `start_write_clock` gives every new tail its own grace, so a pipelining reader keeps a tail of T
+  bytes as long as it reads at T / (30 s + T / `MIN_SEND_RATE`) or more, about 11 KB/s for 1 MB
+  tails. Holding a worker's whole budget therefore costs about 0.7 MB/s of real download per
+  worker (64 connections), about 11 MB/s across 16 workers, and while it lasts every other
+  response on that worker that needs a tail is refused. The floor bounds the memory an attacker
+  pins to about 94 s of its own download rate; it does not make the budget fair. Refuse stays for
+  now: nothing in the library answers with responses big enough to need 1 MB tails yet. The
+  static-file plan, which will, decides eviction (for instance, of the tail furthest behind its
+  deadline) together with zero-copy static bodies, which would not be charged to the budget at all.
 - **Tests.** `standalone_connection` in the tests gets a real one-slot pool, so production code
   never has to handle a connection without a pool.
 
@@ -231,6 +246,15 @@ accept.
   `client_header_timeout` runs from accept and a silent connection is closed without a response.
 - **Once bytes arrive,** the first request's HEADER deadline keeps counting from accept, as in
   nginx, because the read path only sets `request_start_ms` when it is zero.
+
+  **Amended after the PR review (findings 2 and 3).** So does its BODY deadline, which reads the
+  same stamp: BODY is a whole-request budget from the request's start, and a first request starts
+  at accept, at most `HEADER_TIMEOUT_MS` before its first byte. The stamp is now set where a
+  partial request is first parsed (`dispatch_buffered`, when it is zero), not at the read, and
+  `skip_empty_lines` consumes the empty lines RFC 9112 §2.2 says to ignore when nothing else is
+  buffered. Before, a stray CRLF after a request stayed in the buffer and made an idle connection
+  a HEADER wait, closed with an unsolicited 408 ten seconds later (a bug older than this design).
+  Now it leaves a connection NEW or IDLE, including when it arrives behind a stalled response.
 - **Between requests,** a kept-alive connection is IDLE (60 s), unchanged.
 
 ### 4.4 Logging
