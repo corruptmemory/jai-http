@@ -171,8 +171,9 @@ timeout_state :: (c: *Connection) -> Timeout_State {
     if c.lingering                return .LINGER;
     if c.pending.count > 0        return .WRITE;
     if c.bytes_used == 0 {
-        // accept_connections stamps request_start_ms; the read path only sets it when it is zero
-        // and reset_for_next_request clears it, so this combination means nothing has arrived yet.
+        // accept_connections stamps request_start_ms; dispatch_buffered sets it only when it is zero
+        // and a partial request is buffered, and reset_for_next_request clears it, so this
+        // combination means nothing has arrived yet (empty lines are consumed, not buffered).
         if c.request_start_ms != 0  return .NEW;
         return .IDLE;
     }
@@ -187,10 +188,12 @@ timeout_state :: (c: *Connection) -> Timeout_State {
 
 // When `bytes` taken by the peer since `start` stop honoring a minimum average rate after a grace
 // period: start + grace_ms + bytes / rate (rate in bytes per second). The deadline moves forward with
-// every byte the peer takes. 0 when rate <= 0: no floor. Takes its limits as arguments so tests can
-// drive any value.
+// every byte the peer takes. NO_DRAIN_DEADLINE when rate <= 0: no floor, and `now >= deadline` never
+// holds. Takes its limits as arguments so tests can drive any value.
+NO_DRAIN_DEADLINE :: 0x7fff_ffff_ffff_ffff;
+
 drain_deadline :: (start: s64, bytes: s64, grace_ms: s64, rate: s64) -> s64 {
-    if rate <= 0  return 0;
+    if rate <= 0  return NO_DRAIN_DEADLINE;
     return start + grace_ms + bytes * 1000 / rate;
 }
 
@@ -448,7 +451,6 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
 
         c.bytes_used += n;
         c.last_activity_ms = now_ms();
-        if c.request_start_ms == 0  c.request_start_ms = c.last_activity_ms;
         if !dispatch_buffered(w, c)  return false;
     }
     return true;   // unreachable; `while true` alone does not satisfy the return-path check
@@ -459,7 +461,13 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
 dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
     while c.pending.count == 0 {
         result := parse_request(c);
-        if result == .INCOMPLETE  return true;
+        if result == .INCOMPLETE {
+            // A partial request's clock starts when its first bytes are parsed: empty lines were
+            // consumed and start nothing, and bytes read while output was pending are timed from
+            // the drain that lets them be parsed. A NEW connection keeps its stamp from accept.
+            if c.request_start_ms == 0 && c.bytes_used > 0  c.request_start_ms = c.last_activity_ms;
+            return true;
+        }
         if result == .ERROR {
             refuse_and_close(w, c, parse_error_status(c.parse_error));
             return false;

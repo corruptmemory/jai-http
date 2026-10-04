@@ -30,8 +30,11 @@
     MAX_PENDING_PER_WORKER : s64 = 67108864,
     // Timeouts in milliseconds; 0 disables each. See docs/plans/2026-10-03-fib-lifts-design.md §5.
     IDLE_TIMEOUT_MS     : s64 = 60000,    // kept-alive connection between requests
-    HEADER_TIMEOUT_MS   : s64 = 10000,    // from a request's first byte until its headers are complete
-    BODY_TIMEOUT_MS     : s64 = 30000,    // from a request's first byte until its body is complete
+    // HEADER and BODY run from a request's first byte until its headers, then its body, are
+    // complete, except that a connection's first request runs from accept (as nginx does). HEADER
+    // also closes a connection that sends nothing, HEADER_TIMEOUT_MS after accept, without a reply.
+    HEADER_TIMEOUT_MS   : s64 = 10000,
+    BODY_TIMEOUT_MS     : s64 = 30000,
     // A queued response making no progress toward the peer: neither our tail nor the bytes the
     // kernel holds for the peer (TIOCOUTQ) shrank. Also the grace before MIN_SEND_RATE applies, so
     // 0 here makes the floor apply from the first sweep.
@@ -39,7 +42,9 @@
     // Minimum average rate, in bytes per second, at which the peer must take a queued response
     // once the WRITE_TIMEOUT_MS grace has passed, counted from when the tail was queued and
     // including the bytes the kernel already held. A reader at or above it is never cut; one below
-    // it frees its slot and tail. The WRITE timeout alone only catches a stall. 0: no floor.
+    // it loses the connection. The floor is per tail: each new tail gets its own grace, so a
+    // pipelining reader needs only T / (grace + T / MIN_SEND_RATE) to keep a T-byte tail. The
+    // WRITE timeout alone only catches a stall. 0: no floor.
     MIN_SEND_RATE       : s64 = 16384,
     // Lingering close: after a final response the server half-closes and discards input until the
     // peer's EOF, for at most this long, so a close never turns into a reset that destroys the

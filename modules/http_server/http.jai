@@ -94,10 +94,7 @@ set_header :: (response: *Response, name: string, value: string) {
 parse_request :: (c: *Connection) -> Parse_Result {
     // Parse request line: METHOD SP URI SP VERSION \r\n
     if c.parse_state == .REQUEST_LINE {
-        // RFC 9112 §2.2: ignore empty lines received before the request line.
-        while c.parse_offset + 1 < c.bytes_used && c.buf[c.parse_offset] == #char "\r" && c.buf[c.parse_offset + 1] == #char "\n" {
-            c.parse_offset += 2;
-        }
+        skip_empty_lines(c);
         crlf := find_crlf(c.buf.data, c.parse_offset, c.bytes_used);
         if crlf < 0 return .INCOMPLETE;
 
@@ -285,7 +282,8 @@ reset_for_next_request :: (c: *Connection) {
     c.bytes_used = remaining;
     c.parse_offset = 0;
     reset_parse(c);
-    c.request_start_ms = ifx remaining > 0 then now_ms() else 0;   // a pipelined next request is timed from now
+    skip_empty_lines(c);   // a client's stray CRLF after the request is not the next one
+    c.request_start_ms = ifx c.bytes_used > 0 then now_ms() else 0;   // a pipelined next request is timed from now
 }
 
 HTTP_DAY_NAMES   :: string.["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -569,6 +567,19 @@ move_down :: (buf: *u8, dst: s64, src: s64, count: s64) {
     if count <= 0 || dst == src  return;
     if src - dst >= count  memcpy(buf + dst, buf + src, count);
     else                   for i: 0..count-1  buf[dst + i] = buf[src + i];
+}
+
+// RFC 9112 §2.2: ignore empty lines received before a request line. When nothing else is buffered
+// they are consumed outright, so a stray CRLF never counts as the start of a request: the
+// connection stays NEW or IDLE instead of becoming a HEADER wait that ends in a 408.
+skip_empty_lines :: (c: *Connection) {
+    while c.parse_offset + 1 < c.bytes_used && c.buf[c.parse_offset] == #char "\r" && c.buf[c.parse_offset + 1] == #char "\n" {
+        c.parse_offset += 2;
+    }
+    if c.parse_offset == c.bytes_used {
+        c.bytes_used   = 0;
+        c.parse_offset = 0;
+    }
 }
 
 parse_fail :: inline (c: *Connection, e: Parse_Error) -> Parse_Result {

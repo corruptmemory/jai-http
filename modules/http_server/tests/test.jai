@@ -1468,6 +1468,7 @@ attach :: (w: *Worker, fd: s32) -> *Connection {
     assert(c != null, "pool exhausted");
     c.fd = fd;
     c.last_activity_ms = now_ms();
+    c.request_start_ms = c.last_activity_ms;   // NEW, as accept_connections leaves it
     ok := epoll_add_connection(*w.engine, c, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
     assert(ok, "epoll_add_connection failed");
     return c;
@@ -1779,6 +1780,7 @@ test_check_timeouts_closes_idle_silently :: () {
     defer close(peer);
     c := attach(*w, server);
     c.last_activity_ms = 0;
+    c.request_start_ms = 0;   // between requests (IDLE), not a fresh connection (NEW)
 
     closed := check_timeouts(*w, 59999);
     assert(closed == 0 && c.state == .ACTIVE, "not yet");
@@ -2297,7 +2299,9 @@ test_drain_deadline :: () {
     assert(drain_deadline(1000, 1048576, 30000, 16384) == 95000, "1 MB at 16 KB/s: 64 s after the grace");
     assert(drain_deadline(1000, 0, 30000, 16384) == 31000, "an empty tail: just the grace");
     assert(drain_deadline(1000, 100, 0, 1000) == 1100, "no grace: size over rate alone");
-    assert(drain_deadline(1000, 1048576, 30000, 0) == 0, "rate 0: no floor, no deadline");
+    // PR #6 review: "no floor" was 0, and the only use is `now >= deadline`, which 0 satisfies. A
+    // caller without write_too_slow's MIN_SEND_RATE guard would have cut every tail at once.
+    assert(drain_deadline(1000, 1048576, 30000, 0) == NO_DRAIN_DEADLINE && NO_DRAIN_DEADLINE == 0x7fff_ffff_ffff_ffff, "rate 0: no floor, a deadline that never comes; got %", drain_deadline(1000, 1048576, 30000, 0));
     print("  PASS: test_drain_deadline\n");
 }
 
@@ -2496,6 +2500,107 @@ test_new_connection_closed_silently :: () {
     }
     assert(ended == 1 && got.count == 0, "closed without a reply: EOF and no bytes; ended %, got '%'", ended, as_string(got));
     print("  PASS: test_new_connection_closed_silently\n");
+}
+
+// PR #6 review: attach() did not stamp request_start_ms the way accept_connections does, so every
+// fake-worker test began IDLE and no server-level test ran a first request through the read path.
+// A connection's first request is timed from accept: its HEADER wait and its BODY wait both.
+test_first_request_timed_from_accept :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+    assert(timeout_state(c) == .NEW && c.request_start_ms == c.last_activity_ms, "attach leaves a connection as accept does: NEW, timed from accept; state %, request_start_ms %", timeout_state(c), c.request_start_ms);
+    c.request_start_ms -= 5000;   // accepted 5 s ago, so a restamp at the first read would show
+    accepted := c.request_start_ms;
+
+    send_to_server(peer, "POST /u HTTP/1.1\r\nHost: x\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .HEADER && c.request_start_ms == accepted, "first bytes: a HEADER wait, still timed from accept; state %, moved by % ms", timeout_state(c), c.request_start_ms - accepted);
+
+    send_to_server(peer, "Content-Length: 10\r\n\r\nabc");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .BODY && c.request_start_ms == accepted, "headers done: a BODY wait, also timed from accept; state %", timeout_state(c));
+    t, s := is_timed_out(c, accepted + 29999);
+    assert(!t && s == .BODY, "one ms short of BODY_TIMEOUT_MS after accept is fine");
+    t, s = is_timed_out(c, accepted + 30000);
+    assert(t && s == .BODY, "BODY_TIMEOUT_MS after accept, not after the first byte");
+    close_connection(*w, c);
+    print("  PASS: test_first_request_timed_from_accept\n");
+}
+
+// PR #6 review (the bug predates the PR): parse_request skipped empty lines before a request line by
+// moving parse_offset alone, so a buffer holding only "\r\n" was a HEADER wait and drew an
+// unsolicited 408 ten seconds later, which a client reusing the connection can take for the answer
+// to its next request. RFC 9112 §2.2 forbids the extra CRLF to clients but tells servers to ignore it.
+test_trailing_empty_line_leaves_connection_idle :: () {
+    c: Connection;
+    fill_request(*c, "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok\r\n");
+    assert(parse_request(*c) == .COMPLETE, "setup: the POST parses");
+    reset_for_next_request(*c);
+    assert(c.bytes_used == 0 && c.request_start_ms == 0, "the empty line is consumed, not the start of a request; bytes_used %, request_start_ms %", c.bytes_used, c.request_start_ms);
+    assert(timeout_state(*c) == .IDLE, "an idle keep-alive connection, got %", timeout_state(*c));
+    print("  PASS: test_trailing_empty_line_leaves_connection_idle\n");
+}
+
+// The same through the read path, where an empty line arrives in a segment of its own: before any
+// request it must not extend the first request's deadline, and between requests it must not start one.
+test_empty_lines_do_not_start_a_request :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+    accepted := c.request_start_ms;
+
+    send_to_server(peer, "\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .NEW && c.request_start_ms == accepted, "an empty line before any request: still NEW, timed from accept; state %", timeout_state(c));
+
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(test_handler_calls == 1, "the request after the empty line is served, handler ran %", test_handler_calls);
+    send_to_server(peer, "\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .IDLE && c.bytes_used == 0 && c.request_start_ms == 0, "an empty line between requests: IDLE; state %, bytes_used %", timeout_state(c), c.bytes_used);
+    close_connection(*w, c);
+    print("  PASS: test_empty_lines_do_not_start_a_request\n");
+}
+
+// Bytes read while a response is pending are buffered unparsed. Were they stamped at the read, an
+// empty line among them would be consumed at the drain and leave a stale stamp: NEW, not IDLE.
+test_empty_line_behind_a_stalled_response :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response must stall");
+    send_to_server(peer, "\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .WRITE && c.bytes_used == 2, "the empty line waits, unparsed, behind the tail");
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while c.pending.count > 0 {
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(timeout_state(c) == .IDLE && c.bytes_used == 0 && c.request_start_ms == 0, "after the drain: IDLE; state %, bytes_used %, request_start_ms %", timeout_state(c), c.bytes_used, c.request_start_ms);
+    close_connection(*w, c);
+    print("  PASS: test_empty_line_behind_a_stalled_response\n");
 }
 
 test_tail_refusal :: () {
@@ -2924,6 +3029,10 @@ main :: () {
     test_new_connection_state();
     test_new_connection_limit_falls_back_to_idle();
     test_new_connection_closed_silently();
+    test_first_request_timed_from_accept();
+    test_trailing_empty_line_leaves_connection_idle();
+    test_empty_lines_do_not_start_a_request();
+    test_empty_line_behind_a_stalled_response();
     print("\nPending budget:\n");
     test_tail_refusal();
     test_pending_budget_accounting_balances();
