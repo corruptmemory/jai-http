@@ -29,9 +29,18 @@ Handler :: #type (request: *Request, response: *Response);
 Parse_State :: enum u8 #specified {
     REQUEST_LINE :: 0;
     HEADERS      :: 1;
-    BODY         :: 2;
+    BODY         :: 2;   // Content-Length body
     COMPLETE     :: 3;
     ERROR        :: 4;
+    CHUNKED      :: 5;   // chunked body, decoded in place by parse_chunked
+}
+
+// Where parse_chunked is within a chunked body (RFC 9112 §7.1).
+Chunk_Phase :: enum u8 #specified {
+    SIZE      :: 0;   // expecting a chunk-size line, with optional extensions
+    DATA      :: 1;   // moving chunk data down to body_end
+    DATA_CRLF :: 2;   // expecting the CRLF that ends a chunk's data
+    TRAILERS  :: 3;   // after the last chunk: trailer field lines until an empty line
 }
 
 Parse_Result :: enum u8 #specified {
@@ -46,7 +55,7 @@ Parse_Error :: enum u8 #specified {
     MALFORMED             :: 1;   // 400
     BODY_TOO_LARGE        :: 2;   // 413
     TOO_MANY_HEADERS      :: 3;   // 431: more header fields than MAX_HEADERS
-    UNSUPPORTED_FRAMING   :: 4;   // 501: Transfer-Encoding (chunked request bodies are not decoded)
+    UNSUPPORTED_FRAMING   :: 4;   // 501: a transfer coding other than chunked (RFC 9112 §6.1)
     VERSION_NOT_SUPPORTED :: 5;   // 505: a well-formed HTTP-version whose major version is not 1
 }
 
@@ -85,10 +94,7 @@ set_header :: (response: *Response, name: string, value: string) {
 parse_request :: (c: *Connection) -> Parse_Result {
     // Parse request line: METHOD SP URI SP VERSION \r\n
     if c.parse_state == .REQUEST_LINE {
-        // RFC 9112 §2.2: ignore empty lines received before the request line.
-        while c.parse_offset + 1 < c.bytes_used && c.buf[c.parse_offset] == #char "\r" && c.buf[c.parse_offset + 1] == #char "\n" {
-            c.parse_offset += 2;
-        }
+        skip_empty_lines(c);
         crlf := find_crlf(c.buf.data, c.parse_offset, c.bytes_used);
         if crlf < 0 return .INCOMPLETE;
 
@@ -135,14 +141,16 @@ parse_request :: (c: *Connection) -> Parse_Result {
             if crlf == c.parse_offset {
                 // Empty line — end of headers
                 c.parse_offset = crlf + 2;
-                header_error := finish_headers(c);
+                header_error, next := finish_headers(c);
                 if header_error != .NONE  return parse_fail(c, header_error);
-                if c.req.content_length > 0 {
-                    c.parse_state = .BODY;
-                    break;  // Fall through to BODY check below
+                c.parse_state = next;
+                if next == .COMPLETE  return .COMPLETE;
+                if next == .CHUNKED {
+                    c.chunk_phase = .SIZE;
+                    c.body_start  = c.parse_offset;
+                    c.body_end    = c.parse_offset;
                 }
-                c.parse_state = .COMPLETE;
-                return .COMPLETE;
+                break;  // BODY or CHUNKED: continue below
             }
 
             // Find colon separator. RFC 9112 §5.1: the field name is a token with no whitespace
@@ -168,6 +176,8 @@ parse_request :: (c: *Connection) -> Parse_Result {
         }
     }
 
+    if c.parse_state == .CHUNKED  return parse_chunked(c);
+
     // Wait for request body bytes
     if c.parse_state == .BODY {
         body_available := c.bytes_used - c.parse_offset;
@@ -184,6 +194,61 @@ parse_request :: (c: *Connection) -> Parse_Result {
     return parse_fail(c, .MALFORMED);
 }
 
+// Decode a chunked body in place (RFC 9112 §7.1). Chunk data is moved down to body_end and the
+// framing is skipped, so on COMPLETE the body is the contiguous view buf[body_start .. body_end)
+// and parse_offset sits just past the message. Resumable: each call continues from chunk_phase.
+// Expects the state finish_headers leaves: parse_state CHUNKED, phase SIZE, body_start = body_end
+// = parse_offset.
+parse_chunked :: (c: *Connection) -> Parse_Result {
+    while true {
+        if c.chunk_phase == {
+          case .SIZE;
+            crlf := find_crlf(c.buf.data, c.parse_offset, c.bytes_used);
+            if crlf < 0  return .INCOMPLETE;
+            size, size_error := parse_chunk_size_line(make_view(c.buf.data, c.parse_offset, crlf));
+            if size_error != .NONE  return parse_fail(c, size_error);
+            c.parse_offset = crlf + 2;
+            if size == 0 { c.chunk_phase = .TRAILERS; continue; }
+            // The data and its CRLF must fit in what is left of the read buffer.
+            if size > cast(s64) READ_BUFFER_SIZE - c.parse_offset - 2  return parse_fail(c, .BODY_TOO_LARGE);
+            c.chunk_remaining = size;
+            c.chunk_phase = .DATA;
+
+          case .DATA;
+            available := c.bytes_used - c.parse_offset;
+            n := ifx available < c.chunk_remaining then available else c.chunk_remaining;
+            move_down(c.buf.data, c.body_end, c.parse_offset, n);
+            c.body_end        += n;
+            c.parse_offset    += n;
+            c.chunk_remaining -= n;
+            if c.chunk_remaining > 0  return .INCOMPLETE;
+            c.chunk_phase = .DATA_CRLF;
+
+          case .DATA_CRLF;
+            if c.bytes_used - c.parse_offset < 2  return .INCOMPLETE;
+            if c.buf[c.parse_offset] != #char "\r" || c.buf[c.parse_offset + 1] != #char "\n"  return parse_fail(c, .MALFORMED);
+            c.parse_offset += 2;
+            c.chunk_phase = .SIZE;
+
+          case .TRAILERS;
+            crlf := find_crlf(c.buf.data, c.parse_offset, c.bytes_used);
+            if crlf < 0  return .INCOMPLETE;
+            if crlf == c.parse_offset {
+                c.parse_offset       = crlf + 2;
+                c.req.body           = make_view(c.buf.data, c.body_start, c.body_end);
+                c.req.content_length = c.body_end - c.body_start;
+                c.parse_state        = .COMPLETE;
+                return .COMPLETE;
+            }
+            // Validated like a header field, then discarded: a trailer never enters req.headers,
+            // where a framing field could change how the message is read.
+            if !is_field_line(make_view(c.buf.data, c.parse_offset, crlf))  return parse_fail(c, .MALFORMED);
+            c.parse_offset = crlf + 2;
+        }
+    }
+    return .INCOMPLETE;   // unreachable; `while true` alone does not satisfy the return-path check
+}
+
 // Clear every per-request field. The views point into the connection's read buffer, so a stale one
 // would show the next request, or the next client on a recycled slot, bytes it never sent.
 reset_request :: (req: *Request) {
@@ -197,28 +262,28 @@ reset_request :: (req: *Request) {
     req.content_length = 0;
 }
 
+// Return the parser to the start of a request. get_connection and reset_for_next_request both
+// call this, so the per-request fields they clear cannot drift apart (the R11 lesson).
+reset_parse :: (c: *Connection) {
+    c.parse_state     = .REQUEST_LINE;
+    c.parse_error     = .NONE;
+    c.chunk_phase     = .SIZE;
+    c.chunk_remaining = 0;
+    c.body_start      = 0;
+    c.body_end        = 0;
+    reset_request(*c.req);
+}
+
 // Prepare connection for the next request (keep-alive pipelining).
 // Shifts any remaining bytes to the start of the buffer.
 reset_for_next_request :: (c: *Connection) {
     remaining := c.bytes_used - c.parse_offset;
-    if remaining > 0 && c.parse_offset > 0 {
-        if c.parse_offset >= remaining {
-            // Source and destination do not overlap: a plain memcpy is correct (Jai's memcpy is
-            // the LLVM intrinsic, undefined on overlap, and Basic has no memmove).
-            memcpy(c.buf.data, c.buf.data + c.parse_offset, remaining);
-        } else {
-            // Overlapping, destination below source: a forward byte copy is safe.
-            for i: 0..remaining-1 {
-                c.buf[i] = c.buf[c.parse_offset + i];
-            }
-        }
-    }
+    if remaining > 0  move_down(c.buf.data, 0, c.parse_offset, remaining);
     c.bytes_used = remaining;
     c.parse_offset = 0;
-    c.parse_state = .REQUEST_LINE;
-    c.parse_error = .NONE;
-    reset_request(*c.req);
-    c.request_start_ms = ifx remaining > 0 then now_ms() else 0;   // a pipelined next request is timed from now
+    reset_parse(c);
+    skip_empty_lines(c);   // a client's stray CRLF after the request is not the next one
+    c.request_start_ms = ifx c.bytes_used > 0 then now_ms() else 0;   // a pipelined next request is timed from now
 }
 
 HTTP_DAY_NAMES   :: string.["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -343,12 +408,9 @@ write_response :: (c: *Connection, req: *Request, response: *Response, date: str
 
     // Slow path: the socket is full. Header and body live in per-request memory, so the unsent
     // tail is copied into c.pending now, before the worker resets the Pool.
-    unsent := total - sent;
-    if unsent > MAX_PENDING_BYTES {
-        // A failure to serve: the client receives a body shorter than its Content-Length.
-        Basic.log_error("fd %: unsent response tail of % bytes exceeds MAX_PENDING_BYTES (%); closing", c.fd, unsent, MAX_PENDING_BYTES);
-        return .ERROR;
-    }
+    // A refusal is a failure to serve (the client receives a body shorter than its Content-Length).
+    // reserve_tail counts it; worker_sweep reports it.
+    if reserve_tail(c, total - sent) != .NONE  return .ERROR;
     header_sent := ifx sent < header.count then sent else header.count;
     body_sent   := sent - header_sent;
     append_bytes(*c.pending, header.data + header_sent, header.count - header_sent);
@@ -403,10 +465,7 @@ write_or_queue :: (c: *Connection, data: string) -> Write_Result {
         return .ERROR;
     }
     if sent == data.count  return .SENT;
-    if data.count - sent > MAX_PENDING_BYTES {
-        Basic.log_error("fd %: unsent reply tail of % bytes exceeds MAX_PENDING_BYTES (%); closing", c.fd, data.count - sent, MAX_PENDING_BYTES);
-        return .ERROR;
-    }
+    if reserve_tail(c, data.count - sent) != .NONE  return .ERROR;
     append_bytes(*c.pending, data.data + sent, data.count - sent);
     return .PENDING;
 }
@@ -501,6 +560,28 @@ make_view :: inline (data: *u8, start: s64, end: s64) -> string {
     return result;
 }
 
+// Copy `count` bytes from buf+src down to buf+dst (dst <= src). Jai's memcpy is the LLVM
+// intrinsic, undefined on overlap, and Basic has no memmove: memcpy only when the regions are
+// disjoint, otherwise a forward byte copy, which is safe while the destination is below the source.
+move_down :: (buf: *u8, dst: s64, src: s64, count: s64) {
+    if count <= 0 || dst == src  return;
+    if src - dst >= count  memcpy(buf + dst, buf + src, count);
+    else                   for i: 0..count-1  buf[dst + i] = buf[src + i];
+}
+
+// RFC 9112 §2.2: ignore empty lines received before a request line. When nothing else is buffered
+// they are consumed outright, so a stray CRLF never counts as the start of a request: the
+// connection stays NEW or IDLE instead of becoming a HEADER wait that ends in a 408.
+skip_empty_lines :: (c: *Connection) {
+    while c.parse_offset + 1 < c.bytes_used && c.buf[c.parse_offset] == #char "\r" && c.buf[c.parse_offset + 1] == #char "\n" {
+        c.parse_offset += 2;
+    }
+    if c.parse_offset == c.bytes_used {
+        c.bytes_used   = 0;
+        c.parse_offset = 0;
+    }
+}
+
 parse_fail :: inline (c: *Connection, e: Parse_Error) -> Parse_Result {
     c.parse_error = e;
     return .ERROR;
@@ -517,17 +598,30 @@ trim_ows :: (s: string) -> string {
     return r;
 }
 
-// RFC 9110 §5.6.2: token = 1*tchar, tchar = ALPHA / DIGIT / one of the punctuation below.
-is_token :: (s: string) -> bool {
+// Pop the next comma-separated member off `rest`, OWS-trimmed (RFC 9110 §5.6.1). Empty members
+// come back as empty strings; `rest` is empty once the list is exhausted.
+next_list_member :: (rest: *string) -> string {
+    comma := find_byte(rest.data, 0, rest.count, #char ",");
+    end   := ifx comma < 0 then rest.count else comma;
+    member := trim_ows(make_view(rest.data, 0, end));
+    skip  := ifx comma < 0 then rest.count else comma + 1;
+    rest.data  += skip;
+    rest.count -= skip;
+    return member;
+}
+
+// RFC 9110 §5.6.2: tchar = ALPHA / DIGIT / one of the punctuation below.
+is_tchar :: inline (ch: u8) -> bool {
     TCHAR_PUNCTUATION :: "!#$%&'*+-.^_`|~";
+    if (ch >= #char "a" && ch <= #char "z") || (ch >= #char "A" && ch <= #char "Z") || (ch >= #char "0" && ch <= #char "9")  return true;
+    for p: 0..TCHAR_PUNCTUATION.count-1  if ch == TCHAR_PUNCTUATION[p]  return true;
+    return false;
+}
+
+// RFC 9110 §5.6.2: token = 1*tchar.
+is_token :: (s: string) -> bool {
     if s.count == 0  return false;
-    for i: 0..s.count-1 {
-        ch := s[i];
-        if (ch >= #char "a" && ch <= #char "z") || (ch >= #char "A" && ch <= #char "Z") || (ch >= #char "0" && ch <= #char "9")  continue;
-        is_punct := false;
-        for p: 0..TCHAR_PUNCTUATION.count-1  if ch == TCHAR_PUNCTUATION[p] { is_punct = true; break; }
-        if !is_punct  return false;
-    }
+    for i: 0..s.count-1  if !is_tchar(s[i])  return false;
     return true;
 }
 
@@ -566,6 +660,88 @@ is_field_value :: (s: string) -> bool {
     return true;
 }
 
+hex_value :: inline (ch: u8) -> s64 {
+    if ch >= #char "0" && ch <= #char "9"  return cast(s64) (ch - #char "0");
+    if ch >= #char "a" && ch <= #char "f"  return cast(s64) (ch - #char "a") + 10;
+    if ch >= #char "A" && ch <= #char "F"  return cast(s64) (ch - #char "A") + 10;
+    return -1;
+}
+
+// From the opening DQUOTE at s[start], the index just past the closing one, or -1. RFC 9110 §5.6.4:
+// qdtext = HTAB / SP / 0x21 / 0x23-0x5B / 0x5D-0x7E / obs-text; quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ).
+skip_quoted_string :: (s: string, start: s64) -> s64 {
+    i := start + 1;
+    while i < s.count {
+        ch := s[i];
+        if ch == #char "\""  return i + 1;
+        if ch == #char "\\" {
+            if i + 1 >= s.count  return -1;
+            q := s[i + 1];
+            if !(q == #char "\t" || (q >= 0x20 && q != 0x7F))  return -1;
+            i += 2;
+            continue;
+        }
+        if !(ch == #char "\t" || (ch >= 0x20 && ch != 0x7F))  return -1;
+        i += 1;
+    }
+    return -1;
+}
+
+// chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), chunk-ext-val =
+// token / quoted-string (RFC 9112 §7.1.1). Empty is valid. Whitespace is only allowed where the
+// grammar has BWS, so trailing whitespace with no ';' after it fails.
+is_chunk_ext :: (s: string) -> bool {
+    i := 0;
+    while i < s.count {
+        while i < s.count && is_ows(s[i])  i += 1;
+        if i == s.count || s[i] != #char ";"  return false;
+        i += 1;
+        while i < s.count && is_ows(s[i])  i += 1;
+        name_start := i;
+        while i < s.count && is_tchar(s[i])  i += 1;
+        if i == name_start  return false;
+        j := i;
+        while j < s.count && is_ows(s[j])  j += 1;
+        if j < s.count && s[j] == #char "=" {
+            i = j + 1;
+            while i < s.count && is_ows(s[i])  i += 1;
+            if i < s.count && s[i] == #char "\"" {
+                i = skip_quoted_string(s, i);
+                if i < 0  return false;
+            } else {
+                value_start := i;
+                while i < s.count && is_tchar(s[i])  i += 1;
+                if i == value_start  return false;
+            }
+        }
+    }
+    return true;
+}
+
+// chunk-size [ chunk-ext ], from a chunk-size line without its CRLF (RFC 9112 §7.1). More than 15
+// significant hex digits is too large without being computed: 16^15 < 2^63, and arithmetic
+// overflow is FATAL in every build.
+parse_chunk_size_line :: (line: string) -> (size: s64, error: Parse_Error) {
+    digits := 0;
+    while digits < line.count && hex_value(line[digits]) >= 0  digits += 1;
+    if digits == 0  return 0, .MALFORMED;
+    if !is_chunk_ext(make_view(line.data, digits, line.count))  return 0, .MALFORMED;
+    first := 0;   // leading zeros are legal and carry no magnitude
+    while first < digits - 1 && line[first] == #char "0"  first += 1;
+    if digits - first > 15  return 0, .BODY_TOO_LARGE;
+    value: s64 = 0;
+    for i: first..digits-1  value = value * 16 + hex_value(line[i]);
+    return value, .NONE;
+}
+
+// A field line without its CRLF: a token name, ':' with no whitespace before it, and a field value
+// without control bytes (RFC 9112 §5.1, RFC 9110 §5.5). obs-fold starts with SP or HTAB and fails.
+is_field_line :: (line: string) -> bool {
+    colon := find_byte(line.data, 0, line.count, #char ":");
+    if colon < 0  return false;
+    return is_token(make_view(line.data, 0, colon)) && is_field_value(trim_ows(make_view(line.data, colon + 1, line.count)));
+}
+
 // RFC 9112 §3.2 / RFC 3986 §3.2: Host = uri-host [ ":" port ]. Checked as a character set:
 // unreserved, pct-encoded, sub-delims, ':' and the brackets of an IP literal. Empty is legal.
 is_host_value :: (s: string) -> bool {
@@ -580,24 +756,49 @@ is_host_value :: (s: string) -> bool {
     return true;
 }
 
+// How a request carrying Transfer-Encoding is framed (spec §3.1; RFC 9112 §6.1, §6.3). NONE means
+// exactly `chunked`. Codings are collected from every Transfer-Encoding field in order; empty list
+// members are skipped, and only the bare token `chunked` (any case) counts as chunked.
+transfer_coding_error :: (req: *Request, has_content_length: bool) -> Parse_Error {
+    if req.http_version[7] == #char "0"  return .MALFORMED;   // rule 1: on HTTP/1.0 the framing is faulty
+    if has_content_length                return .MALFORMED;   // rule 2: TE with CL, the smuggling shape
+    codings, chunked_count := 0, 0;
+    last_is_chunked := false;
+    for i: 0..cast(s64) req.header_count - 1 {
+        if !string_equals_ci(req.headers[i].name, "Transfer-Encoding")  continue;
+        rest := req.headers[i].value;
+        while rest.count > 0 {
+            coding := next_list_member(*rest);
+            if coding.count == 0  continue;
+            codings += 1;
+            last_is_chunked = string_equals_ci(coding, "chunked");
+            if last_is_chunked  chunked_count += 1;
+        }
+    }
+    if !last_is_chunked   return .MALFORMED;             // rule 3 (no codings at all, too)
+    if chunked_count > 1  return .MALFORMED;             // rule 4: chunked applied twice
+    if codings > 1        return .UNSUPPORTED_FRAMING;   // rule 5: a coding before chunked we cannot undo
+    return .NONE;                                        // rule 6
+}
+
 // Validate the complete header block and settle the request's framing and keep-alive. Framing is
-// checked first, since it decides where the next request starts; then Host.
-finish_headers :: (c: *Connection) -> Parse_Error {
+// checked first, since it decides where the next request starts; then Host. `next` is the state
+// the body is read in: COMPLETE (no body), BODY (Content-Length) or CHUNKED.
+finish_headers :: (c: *Connection) -> (error: Parse_Error, next: Parse_State) {
     req := *c.req;
     content_length: s64 = -1;
     host_count := 0;
     host_valid := true;
+    has_transfer_encoding := false;
     for i: 0..cast(s64) req.header_count - 1 {
         h := *req.headers[i];
-        // Chunked request bodies are not decoded. Ignoring Transfer-Encoding would parse the body
-        // as further requests (desync); RFC 9112 §6.1 answers an unsupported coding with 501.
-        if string_equals_ci(h.name, "Transfer-Encoding")  return .UNSUPPORTED_FRAMING;
+        if string_equals_ci(h.name, "Transfer-Encoding")  has_transfer_encoding = true;
         if string_equals_ci(h.name, "Content-Length") {
             value, valid, too_large := parse_content_length(h.value);
-            if !valid      return .MALFORMED;
-            if too_large   return .BODY_TOO_LARGE;
+            if !valid      return .MALFORMED, .ERROR;
+            if too_large   return .BODY_TOO_LARGE, .ERROR;
             // RFC 9112 §6.3: differing Content-Length values make the framing unrecoverable.
-            if content_length >= 0 && value != content_length  return .MALFORMED;
+            if content_length >= 0 && value != content_length  return .MALFORMED, .ERROR;
             content_length = value;
         }
         if string_equals_ci(h.name, "Host") {
@@ -605,15 +806,21 @@ finish_headers :: (c: *Connection) -> Parse_Error {
             if !is_host_value(h.value)  host_valid = false;
         }
     }
-    if content_length > 0 {
-        if content_length > cast(s64) READ_BUFFER_SIZE - c.parse_offset  return .BODY_TOO_LARGE;   // won't fit
+    next := Parse_State.COMPLETE;
+    if has_transfer_encoding {
+        te_error := transfer_coding_error(req, content_length >= 0);
+        if te_error != .NONE  return te_error, .ERROR;
+        next = .CHUNKED;
+    } else if content_length > 0 {
+        if content_length > cast(s64) READ_BUFFER_SIZE - c.parse_offset  return .BODY_TOO_LARGE, .ERROR;   // won't fit
         req.content_length = content_length;
+        next = .BODY;
     }
     // RFC 9112 §3.2: 400 for more than one Host, an invalid one, and an HTTP/1.1 request without one.
-    if host_count > 1 || !host_valid  return .MALFORMED;
-    if host_count == 0 && req.http_version[7] != #char "0"  return .MALFORMED;
+    if host_count > 1 || !host_valid  return .MALFORMED, .ERROR;
+    if host_count == 0 && req.http_version[7] != #char "0"  return .MALFORMED, .ERROR;
     determine_keep_alive(req);
-    return .NONE;
+    return .NONE, next;
 }
 
 // HTTP/1.1 (and any later 1.x) defaults to keep-alive, HTTP/1.0 to close. Every Connection field is
@@ -623,14 +830,10 @@ determine_keep_alive :: (req: *Request) {
     for i: 0..cast(s64) req.header_count - 1 {
         if !string_equals_ci(req.headers[i].name, "Connection")  continue;
         rest := req.headers[i].value;
-        while true {
-            comma := find_byte(rest.data, 0, rest.count, #char ",");
-            option := trim_ows(make_view(rest.data, 0, ifx comma < 0 then rest.count else comma));
+        while rest.count > 0 {
+            option := next_list_member(*rest);
             if string_equals_ci(option, "close")       saw_close = true;
             if string_equals_ci(option, "keep-alive")  saw_keep_alive = true;
-            if comma < 0  break;
-            rest.data  += comma + 1;
-            rest.count -= comma + 1;
         }
     }
     req.keep_alive = req.http_version[7] != #char "0";

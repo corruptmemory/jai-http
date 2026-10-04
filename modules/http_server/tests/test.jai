@@ -432,6 +432,334 @@ test_parse_body_zero_length :: () {
 
 // -- Pipelining tests --
 
+// -- Chunked bodies --
+
+CHUNK_PREFIX :: "[the request head]";   // stands in for the header bytes in front of the body
+
+// Set c up as finish_headers leaves a chunked request (the body starts right after CHUNK_PREFIX),
+// then feed `raw` to parse_chunked, whole (step 0) or `step` bytes per call. Returns the first
+// result other than INCOMPLETE, or INCOMPLETE once everything is fed.
+decode_chunked_body :: (c: *Connection, raw: string, step: s64 = 0) -> Parse_Result {
+    memcpy(c.buf.data, CHUNK_PREFIX.data, CHUNK_PREFIX.count);
+    c.bytes_used   = CHUNK_PREFIX.count;
+    c.parse_offset = CHUNK_PREFIX.count;
+    c.parse_state  = .CHUNKED;
+    c.chunk_phase  = .SIZE;
+    c.body_start   = CHUNK_PREFIX.count;
+    c.body_end     = CHUNK_PREFIX.count;
+    if step <= 0  step = raw.count;
+    fed := 0;
+    r := Parse_Result.INCOMPLETE;
+    while fed < raw.count {
+        n := ifx raw.count - fed < step then raw.count - fed else step;
+        memcpy(c.buf.data + c.bytes_used, raw.data + fed, n);
+        c.bytes_used += n;
+        fed += n;
+        r = parse_chunked(c);
+        if r != .INCOMPLETE  return r;
+    }
+    return r;
+}
+
+expect_decoded :: (raw: string, want: string, step: s64) {
+    c := New(Connection);
+    defer free(c);
+    r := decode_chunked_body(c, raw, step);
+    assert(r == .COMPLETE, "'%' (step %): expected COMPLETE, got % (%)", raw, step, r, c.parse_error);
+    assert(string_equals(c.req.body, want), "'%' (step %): body '%', want '%'", raw, step, c.req.body, want);
+    assert(c.req.content_length == want.count, "'%' (step %): content_length %, want %", raw, step, c.req.content_length, want.count);
+    assert(c.parse_offset == CHUNK_PREFIX.count + raw.count, "'%' (step %): the whole message and no more is consumed: offset % of %", raw, step, c.parse_offset, CHUNK_PREFIX.count + raw.count);
+    assert(c.req.header_count == 0, "'%': trailers never enter req.headers", raw);
+    head: string;
+    head.data  = c.buf.data;
+    head.count = CHUNK_PREFIX.count;
+    assert(string_equals(head, CHUNK_PREFIX), "'%': decoding wrote below body_start: '%'", raw, head);
+}
+
+expect_refused :: (raw: string, want: Parse_Error, step: s64) {
+    c := New(Connection);
+    defer free(c);
+    r := decode_chunked_body(c, raw, step);
+    assert(r == .ERROR && c.parse_error == want, "'%' (step %): expected ERROR %, got % (%)", raw, step, want, r, c.parse_error);
+}
+
+// `s` with every '~' replaced by the control byte 0x01 (there is no portable escape for it).
+with_ctl :: (s: string) -> string {
+    r := copy_string(s);
+    for i: 0..r.count-1  if r[i] == #char "~"  r[i] = 0x01;
+    return r;
+}
+
+Chunked_Case :: struct { raw: string; want: string; }
+
+test_chunked_decodes_in_place :: () {
+    cases := Chunked_Case.[
+        .{"5\r\nhello\r\n0\r\n\r\n", "hello"},
+        .{"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world"},
+        .{"0005\r\nhello\r\n000\r\n\r\n", "hello"},                           // leading zeros, last-chunk "000"
+        .{"a\r\n0123456789\r\nA\r\nabcdefghij\r\n0\r\n\r\n", "0123456789abcdefghij"},   // lower and upper hex
+        .{"5;name=value\r\nhello\r\n0;x\r\n\r\n", "hello"},                   // token extensions, ignored
+        .{"5 ; q=\"a \\\"b\\\" c\"\r\nhello\r\n0\r\n\r\n", "hello"},          // BWS, quoted-string with quoted-pairs
+        .{"5\r\nhello\r\n0\r\nExpires: never\r\nX-Sum:\tabc \r\n\r\n", "hello"},   // trailers, discarded
+        .{"0\r\n\r\n", ""},                                                   // empty body
+    ];
+    for tc: cases {
+        expect_decoded(tc.raw, tc.want, 0);
+        expect_decoded(tc.raw, tc.want, 1);   // one byte per call: resumable at every split point
+    }
+    print("  PASS: test_chunked_decodes_in_place\n");
+}
+
+Chunk_Refusal :: struct { raw: string; want: Parse_Error; }
+
+test_chunked_grammar_refused :: () {
+    cases := Chunk_Refusal.[
+        .{"0x5\r\nhello\r\n0\r\n\r\n", .MALFORMED},            // no 0x prefix
+        .{"+5\r\nhello\r\n0\r\n\r\n", .MALFORMED},             // no sign
+        .{"-5\r\nhello\r\n0\r\n\r\n", .MALFORMED},
+        .{" 5\r\nhello\r\n0\r\n\r\n", .MALFORMED},             // no leading whitespace
+        .{"5 \r\nhello\r\n0\r\n\r\n", .MALFORMED},             // trailing whitespace without ';'
+        .{"5\nhello\r\n0\r\n\r\n", .MALFORMED},                // bare LF ends no line
+        .{"5\r\nhello\n0\r\n\r\n", .MALFORMED},                // LF-only after the data
+        .{"5\r\nhelloX\r\n0\r\n\r\n", .MALFORMED},             // data longer than its size
+        .{"5\r\nhell\r\n0\r\n\r\n", .MALFORMED},               // data shorter than its size
+        .{"5;a@b\r\nhello\r\n0\r\n\r\n", .MALFORMED},          // '@' is not a token byte
+        .{"5;\r\nhello\r\n0\r\n\r\n", .MALFORMED},             // an extension needs a name
+        .{"5;a=\"open\r\nhello\r\n0\r\n\r\n", .MALFORMED},     // unterminated quoted-string
+        .{"5;a= \r\nhello\r\n0\r\n\r\n", .MALFORMED},          // '=' needs a value
+        .{"5\r\nhello\r\n0\r\nBad Name: x\r\n\r\n", .MALFORMED},   // trailer name with a space
+        .{"5\r\nhello\r\n0\r\nX-A: 1\r\n folded\r\n\r\n", .MALFORMED},   // obs-fold trailer
+        .{"5\r\nhello\r\n0\r\nNoColon\r\n\r\n", .MALFORMED},
+    ];
+    for tc: cases {
+        expect_refused(tc.raw, tc.want, 0);
+        expect_refused(tc.raw, tc.want, 1);
+    }
+    ctl := with_ctl("5\r\nhello\r\n0\r\nX-A: a~b\r\n\r\n");   // a control byte in a trailer value
+    defer free(ctl);
+    expect_refused(ctl, .MALFORMED, 0);
+    print("  PASS: test_chunked_grammar_refused\n");
+}
+
+test_chunk_size_limits :: () {
+    // A size larger than the rest of the read buffer is refused as soon as its line is complete.
+    expect_refused("1000\r\n", .BODY_TOO_LARGE, 0);                // 4096 bytes cannot fit after the head
+    expect_refused("FFFFFFFFFFFFFFF\r\n", .BODY_TOO_LARGE, 0);     // 15 digits: computed (no overflow), too large
+    // Leading zeros carry no magnitude: 19 digits, one significant.
+    c := New(Connection);
+    defer free(c);
+    r := decode_chunked_body(c, "0000000000000000001\r\n");
+    assert(r == .INCOMPLETE && c.chunk_phase == .DATA && c.chunk_remaining == 1, "leading zeros are not significant digits; got % in % with % remaining (%)",
+        r, c.chunk_phase, c.chunk_remaining, c.parse_error);
+    print("  PASS: test_chunk_size_limits\n");
+}
+
+// 16 hex digits is the first width that can overflow s64; overflow is FATAL in every build, so a
+// broken digit guard would kill the process. Parsed in a forked child, as R2 does.
+test_chunk_size_overflow_rejected :: () {
+    pid := fork();
+    if pid == 0 {
+        c := New(Connection);
+        r := decode_chunked_body(c, "FFFFFFFFFFFFFFFF\r\n");
+        _exit(100 + 10 * cast(s32) r + cast(s32) c.parse_error);   // result and cause in one code
+    }
+    status: s32;
+    waitpid(pid, *status, 0);
+    exited := (status & 0x7f) == 0;
+    code := (status >> 8) & 0xff;
+    what := ifx !exited then "died on a signal" else ifx code == 1 then "PANICKED (arithmetic overflow; a live server dies)"
+            else tprint("returned exit code % (100 + 10 * Parse_Result + Parse_Error)", code);
+    assert(exited && code == 100 + 10 * cast(s32) Parse_Result.ERROR + cast(s32) Parse_Error.BODY_TOO_LARGE,
+        "a 16-hex-digit chunk size must be BODY_TOO_LARGE; the parse %", what);
+    print("  PASS: test_chunk_size_overflow_rejected\n");
+}
+
+Framing_Case :: struct { fields: string; want: Parse_Error; }
+
+// Spec §3.1: the first matching rule decides. Rules 1-4 are 400 (MALFORMED), rule 5 is 501.
+test_transfer_encoding_rules :: () {
+    cases := Framing_Case.[
+        .{"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", .MALFORMED},    // rule 2: TE with CL
+        .{"Transfer-Encoding: gzip\r\n", .MALFORMED},                            // rule 3: last coding is not chunked
+        .{"Transfer-Encoding: chunked, gzip\r\n", .MALFORMED},
+        .{"Transfer-Encoding: xchunked\r\n", .MALFORMED},
+        .{"Transfer-Encoding: chunked;x=1\r\n", .MALFORMED},
+        .{"Transfer-Encoding:\r\n", .MALFORMED},                                 // no codings at all
+        .{"Transfer-Encoding: chunked, chunked\r\n", .MALFORMED},                // rule 4: chunked twice
+        .{"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", .MALFORMED},
+        .{"Transfer-Encoding: gzip, chunked\r\n", .UNSUPPORTED_FRAMING},         // rule 5: unknown coding first
+        .{"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", .UNSUPPORTED_FRAMING},
+        .{"Transfer-Encoding: Chunked\r\n", .NONE},                              // rule 6: case-insensitive
+        .{"Transfer-Encoding: , chunked ,\r\n", .NONE},                          // empty members are skipped
+    ];
+    for tc: cases {
+        c := New(Connection);
+        defer free(c);
+        fill_request(c, tprint("POST / HTTP/1.1\r\nHost: x\r\n%\r\n0\r\n\r\n", tc.fields));
+        r := parse_request(c);
+        if tc.want == .NONE  assert(r == .COMPLETE && c.req.body.count == 0, "'%': expected an empty decoded body, got % (%)", tc.fields, r, c.parse_error);
+        else                 assert(r == .ERROR && c.parse_error == tc.want, "'%': expected %, got % (%)", tc.fields, tc.want, r, c.parse_error);
+    }
+    // Rule 1: any Transfer-Encoding on HTTP/1.0 is faulty framing.
+    c := New(Connection);
+    defer free(c);
+    fill_request(c, "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    r := parse_request(c);
+    assert(r == .ERROR && c.parse_error == .MALFORMED, "TE on HTTP/1.0 must be MALFORMED, got % (%)", r, c.parse_error);
+    print("  PASS: test_transfer_encoding_rules\n");
+}
+
+// Review focus 2. A trailer named Content-Length or Transfer-Encoding is discarded; it must not
+// reframe anything. The pipelined request behind it parses intact.
+test_chunked_trailers_cannot_reframe :: () {
+    c := New(Connection);
+    defer free(c);
+    fill_request(c, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    r := parse_request(c);
+    assert(r == .COMPLETE && string_equals(c.req.body, "hello") && c.req.header_count == 2, "first request: got % body '%' with % headers (%)", r, c.req.body, c.req.header_count, c.parse_error);
+    reset_for_next_request(c);
+    r = parse_request(c);
+    assert(r == .COMPLETE && string_equals(c.req.method, "GET") && string_equals(c.req.path, "/b") && c.req.body.count == 0, "the pipelined GET parses intact: got % % '%' (%)",
+        r, c.req.method, c.req.path, c.parse_error);
+    assert(c.parse_offset == c.bytes_used, "nothing is left over: offset % of %", c.parse_offset, c.bytes_used);
+    print("  PASS: test_chunked_trailers_cannot_reframe\n");
+}
+
+test_chunked_pipelined_with_get :: () {
+    w: Worker;
+    make_test_worker(*w, body_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(test_handler_calls == 2 && count_occurrences(as_string(got), "HTTP/1.1 200 OK\r\n") == 2, "both requests served; handler ran %, got '%'", test_handler_calls, as_string(got));
+    close_connection(*w, c);
+    print("  PASS: test_chunked_pipelined_with_get\n");
+}
+
+// Review focus 3.
+test_chunked_then_partial_next_request :: () {
+    w: Worker;
+    make_test_worker(*w, body_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /b HTTP/1.1\r\nHo");
+    handle_client(*w, c, EPOLLIN);
+    assert(test_handler_calls == 1 && string_equals(last_body(), "abc"), "the chunked request is served; handler ran %, body '%'", test_handler_calls, last_body());
+    assert(c.parse_state == .HEADERS, "the partial GET waits in the buffer, got %", c.parse_state);
+
+    send_to_server(peer, "st: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(test_handler_calls == 2 && last_body_len == 0, "the completed GET is served with no body; handler ran %, body '%'", test_handler_calls, last_body());
+
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(count_occurrences(as_string(got), "HTTP/1.1 200 OK\r\n") == 2, "two responses, got '%'", as_string(got));
+    close_connection(*w, c);
+    print("  PASS: test_chunked_then_partial_next_request\n");
+}
+
+// Review focus 4. The chunked request waits behind a stalled response and is decoded after the drain.
+test_chunked_behind_stalled_response :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, mixed_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET /big HTTP/1.1\r\nHost: x\r\n\r\nPOST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0 && test_handler_calls == 1, "setup: the first response stalls and the chunked request waits; handler ran %", test_handler_calls);
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while test_handler_calls < 2 || c.pending.count > 0 {
+        got.count = 0;
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(string_equals(last_body(), "hello"), "decoded after the drain, got '%'", last_body());
+    close_connection(*w, c);
+    print("  PASS: test_chunked_behind_stalled_response\n");
+}
+
+// Review focus 1. Exactly READ_BUFFER_SIZE (4096) is served; one byte more is 413.
+test_chunked_buffer_edge :: () {
+    head := "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // head + "<3 hex digits>\r\n" + data + "\r\n" + "0\r\n\r\n" = 4096
+    fits := 4096 - head.count - 3 - 2 - 2 - 5;
+    assert(hex(fits).count == 3 && hex(fits + 1).count == 3, "setup: the size line has 3 hex digits");
+    for extra: 0..1 {
+        w: Worker;
+        make_test_worker(*w, body_handler);
+        defer destroy_test_worker(*w);
+        server, peer := make_socket_pair();
+        defer close(peer);
+        c := attach(*w, server);
+
+        data := big_body(fits + extra);
+        defer free(data);
+        msg := concat(head, hex(fits + extra), "\r\n", data, "\r\n0\r\n\r\n");
+        defer free(msg);
+        assert(msg.count == 4096 + extra, "setup: message is % bytes", msg.count);
+        send_to_server(peer, msg);
+        handle_client(*w, c, EPOLLIN);
+
+        got: [..] u8;
+        defer array_free(got);
+        drain_peer(peer, *got);
+        if extra == 0 {
+            assert(starts_with(as_string(got), "HTTP/1.1 200 ") && last_body_len == fits, "a 4096-byte chunked request is served: got '%', body %", as_string(got), last_body_len);
+        } else {
+            assert(starts_with(as_string(got), "HTTP/1.1 413 ") && test_handler_calls == 0, "4097 bytes is 413: got '%'", as_string(got));
+        }
+        if c.state == .ACTIVE  close_connection(*w, c);
+    }
+    print("  PASS: test_chunked_buffer_edge\n");
+}
+
+test_chunked_trickle_gets_408 :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.parse_state == .CHUNKED && timeout_state(c) == .BODY, "setup: mid-chunk, timed as BODY; got % / %", c.parse_state, timeout_state(c));
+    c.request_start_ms = 0;   // pretend it started at the epoch
+
+    closed := check_timeouts(*w, 29999);
+    assert(closed == 0, "not yet");
+    closed = check_timeouts(*w, 30000);
+    assert(closed == 1 && (c.state == .FREE || c.lingering), "a trickled chunked body is reaped at 30 s, got closed=%", closed);
+    got: [..] u8;
+    defer array_free(got);
+    drain_peer(peer, *got);
+    assert(starts_with(as_string(got), "HTTP/1.1 408 "), "a body timeout gets 408, got '%'", as_string(got));
+    if c.state == .ACTIVE  close_connection(*w, c);
+    print("  PASS: test_chunked_trickle_gets_408\n");
+}
+
 test_reset_for_next_request :: () {
     c: Connection;
     // Simulate two pipelined requests
@@ -724,6 +1052,7 @@ test_pending_defaults_and_release :: () {
     defer destroy_pool(*pool);
 
     c := get_connection(*pool);
+    assert(c.pool == *pool, "init_pool points every connection at its pool");
     assert(c.pending.count == 0 && c.pending_offset == 0, "fresh connection has no pending output");
     assert(c.pending.allocator.proc != null, "pending allocator must be pinned at init_pool");
     assert(!c.close_after_send && !c.read_stalled, "send-path flags start clear");
@@ -739,6 +1068,7 @@ test_pending_defaults_and_release :: () {
     free_connection(*pool, c);
     assert(c.pending.count == 0 && c.pending.data == null, "free_connection must release pending");
     assert(c.pending.allocator.proc != null, "release keeps the pinned allocator");
+    assert(pool.pending_total == 0, "a tail appended without a reservation is never charged, so nothing is refunded");
 
     print("  PASS: test_pending_defaults_and_release\n");
 }
@@ -826,10 +1156,16 @@ count_byte :: (s: string, b: u8) -> s64 {
     return n;
 }
 
-// A Connection outside any pool with its pending allocator pinned, for writer-level tests.
+// Accounting home for standalone connections: the writer charges every queued tail to the
+// connection's pool and release_pending refunds it. A shared zero-slot pool, not a real one:
+// tests free() standalone connections individually.
+standalone_pool: Connection_Pool;
+
+// A Connection outside any worker with its pending allocator pinned, for writer-level tests.
 standalone_connection :: (fd: s32) -> *Connection {
     c := New(Connection);
     c.pending.allocator = context.allocator;
+    c.pool = *standalone_pool;
     c.fd = fd;
     return c;
 }
@@ -920,9 +1256,11 @@ test_write_response_cap_exceeded :: () {
     req  := Request.{ method = "GET", http_version = "HTTP/1.1", keep_alive = true };
     resp := Response.{ status_code = 200, body = body };
 
+    before := standalone_pool.refused_over_connection;
     r := write_response(c, *req, *resp, "");
     assert(r == .ERROR, "a tail past MAX_PENDING_BYTES must be an ERROR, got %", r);
     assert(c.pending.count == 0, "nothing may be queued on ERROR, got %", c.pending.count);
+    assert(standalone_pool.refused_over_connection == before + 1, "the refusal is counted for the sweep's report");
     print("  PASS: test_write_response_cap_exceeded\n");
 }
 
@@ -1060,6 +1398,54 @@ big_handler :: (req: *Request, resp: *Response) {
     resp.body = big_test_body;
 }
 
+last_body_buf: [4096] u8;
+last_body_len: s64;
+
+// Counts the call and records the request body (copied: the view dies with the buffer shift).
+body_handler :: (req: *Request, resp: *Response) {
+    test_handler_calls += 1;
+    last_body_len = req.body.count;
+    memcpy(last_body_buf.data, req.body.data, req.body.count);
+    resp.status_code = 200;
+    resp.body = "ok";
+}
+
+last_body :: () -> string {
+    s: string;
+    s.data  = last_body_buf.data;
+    s.count = last_body_len;
+    return s;
+}
+
+// body_handler plus a large response for /big, so a test can stall the first of two requests.
+mixed_handler :: (req: *Request, resp: *Response) {
+    body_handler(req, resp);
+    if string_equals(req.path, "/big")  resp.body = big_test_body;
+}
+
+// Lower-case hex digits of n >= 0 (formatInt is soft-deprecated in beta 0.2.030).
+hex :: (n: s64) -> string {
+    DIGITS :: "0123456789abcdef";
+    if n == 0  return "0";
+    digits: [16] u8;
+    i := digits.count;
+    v := n;
+    while v > 0 { i -= 1; digits[i] = DIGITS[v % 16]; v /= 16; }
+    s := alloc_string(digits.count - i);
+    memcpy(s.data, digits.data + i, s.count);
+    return s;
+}
+
+// Concatenate `parts` (the String module's join is not imported here; see index_of).
+concat :: (parts: ..string) -> string {
+    total := 0;
+    for parts  total += it.count;
+    s := alloc_string(total);
+    at := 0;
+    for parts { memcpy(s.data + at, it.data, it.count); at += it.count; }
+    return s;
+}
+
 make_test_worker :: (w: *Worker, handler: Handler) {
     ok := init_event_engine(*w.engine);
     assert(ok, "init_event_engine failed");
@@ -1082,6 +1468,7 @@ attach :: (w: *Worker, fd: s32) -> *Connection {
     assert(c != null, "pool exhausted");
     c.fd = fd;
     c.last_activity_ms = now_ms();
+    c.request_start_ms = c.last_activity_ms;   // NEW, as accept_connections leaves it
     ok := epoll_add_connection(*w.engine, c, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
     assert(ok, "epoll_add_connection failed");
     return c;
@@ -1393,6 +1780,7 @@ test_check_timeouts_closes_idle_silently :: () {
     defer close(peer);
     c := attach(*w, server);
     c.last_activity_ms = 0;
+    c.request_start_ms = 0;   // between requests (IDLE), not a fresh connection (NEW)
 
     closed := check_timeouts(*w, 59999);
     assert(closed == 0 && c.state == .ACTIVE, "not yet");
@@ -1723,28 +2111,27 @@ test_duplicate_content_length_rejected :: () {
     print("  PASS: test_duplicate_content_length_rejected\n");
 }
 
-// R5. Transfer-Encoding is ignored: a chunked body is not read as a body, so its first chunk line
-// is parsed as the next request (desync; with Content-Length also present it is the classic
-// CL.TE smuggling shape). Until chunked decoding exists, refuse: RFC 9112 §6.1 says 501 for a
-// transfer coding the server does not understand.
-test_transfer_encoding_refused :: () {
+// R5, superseded. Transfer-Encoding used to be ignored, so a chunked body was parsed as further
+// requests (desync); PR #5 refused it with 501. Now the body is decoded and the handler sees it.
+test_chunked_request_decoded :: () {
     w: Worker;
-    make_test_worker(*w, ok_handler);
+    make_test_worker(*w, body_handler);
     defer destroy_test_worker(*w);
     server, peer := make_socket_pair();
     defer close(peer);
     c := attach(*w, server);
 
-    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    send_to_server(peer, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     handle_client(*w, c, EPOLLIN);
 
     got: [..] u8;
     defer array_free(got);
     drain_peer(peer, *got);
-    assert(starts_with(as_string(got), "HTTP/1.1 501 ") && test_handler_calls == 0, "a chunked request must be refused (or decoded), never served bodiless with the chunks re-parsed; handler ran %, got '%'",
-        test_handler_calls, as_string(got));
-    print("  PASS: test_transfer_encoding_refused\n");
-    if c.state == .ACTIVE  close_connection(*w, c);
+    assert(starts_with(as_string(got), "HTTP/1.1 200 ") && test_handler_calls == 1, "a chunked request is served once; handler ran %, got '%'", test_handler_calls, as_string(got));
+    assert(string_equals(last_body(), "hello world"), "the handler sees the decoded body, got '%'", last_body());
+    assert(c.state == .ACTIVE && !c.lingering, "the connection stays open after a chunked request");
+    close_connection(*w, c);
+    print("  PASS: test_chunked_request_decoded\n");
 }
 
 // R6. Field values keep trailing whitespace (and leading tabs), so `Content-Length: 5 ` is
@@ -1905,6 +2292,412 @@ test_reads_do_not_extend_write_timeout :: () {
     assert(timed_out && state == .WRITE, "30 s after the last write progress the WRITE timeout must fire despite later input; timed_out=% state=%", timed_out, state);
     print("  PASS: test_reads_do_not_extend_write_timeout\n");
     close_connection(*w, c);
+}
+
+test_drain_deadline :: () {
+    assert(drain_deadline(1000, 16384, 30000, 16384) == 32000, "16 KB at 16 KB/s: one second after the grace");
+    assert(drain_deadline(1000, 1048576, 30000, 16384) == 95000, "1 MB at 16 KB/s: 64 s after the grace");
+    assert(drain_deadline(1000, 0, 30000, 16384) == 31000, "an empty tail: just the grace");
+    assert(drain_deadline(1000, 100, 0, 1000) == 1100, "no grace: size over rate alone");
+    // PR #6 review: "no floor" was 0, and the only use is `now >= deadline`, which 0 satisfies. A
+    // caller without write_too_slow's MIN_SEND_RATE guard would have cut every tail at once.
+    assert(drain_deadline(1000, 1048576, 30000, 0) == NO_DRAIN_DEADLINE && NO_DRAIN_DEADLINE == 0x7fff_ffff_ffff_ffff, "rate 0: no floor, a deadline that never comes; got %", drain_deadline(1000, 1048576, 30000, 0));
+    print("  PASS: test_drain_deadline\n");
+}
+
+// A stack Connection has fd -1, so the kernel part of owed_bytes is 0 and owed is the tail alone.
+test_start_write_clock_records_owed :: () {
+    c: Connection;
+    c.pending.count = 32768;   // synthetic tail
+    start_write_clock(*c, 5000);
+    assert(c.last_write_ms == 5000 && c.write_start_ms == 5000, "both clocks start now, got % / %", c.last_write_ms, c.write_start_ms);
+    assert(c.owed_at_start == 32768 && c.owed == 32768, "owed is the tail plus the kernel's share, got % / %", c.owed_at_start, c.owed);
+    c.pending.count = 0;
+    print("  PASS: test_start_write_clock_records_owed\n");
+}
+
+// Defaults asserted as literals: MIN_SEND_RATE 16384, WRITE_TIMEOUT_MS 30000.
+test_rate_floor_catches_a_steady_trickle :: () {
+    c: Connection;
+    c.pending.count  = 1;          // synthetic tail; owed is set directly
+    c.write_start_ms = 1000;
+    c.owed_at_start  = 4000000;
+    // The peer took 60 s worth at the floor: the deadline is 1000 + 30000 + 60000.
+    c.owed          = 4000000 - 16384 * 60;
+    c.last_write_ms = 90000;       // recent progress: not a stall
+    t, s := is_timed_out(*c, 90999);
+    assert(!t && s == .WRITE, "before the floor's deadline a progressing tail is fine");
+    c.last_write_ms = 90500;
+    t, s = is_timed_out(*c, 91000);
+    assert(t && s == .WRITE, "a peer that keeps taking bytes below the floor is cut at the deadline");
+    // A peer exactly at the floor is never cut: its deadline stays the grace ahead of now.
+    c.owed          = 4000000 - 16384 * 200;   // 200 s at the floor
+    c.last_write_ms = 200500;
+    t, s = is_timed_out(*c, 201000);
+    assert(!t, "a peer at the floor is never cut (deadline % vs now 201000)", drain_deadline(1000, 16384 * 200, 30000, 16384));
+    c.write_start_ms = 0;          // no tail clock: only a stall counts
+    t, s = is_timed_out(*c, 230000);
+    assert(!t, "without a drain clock, recent progress never times out");
+    c.pending.count = 0;
+    print("  PASS: test_rate_floor_catches_a_steady_trickle\n");
+}
+
+// Review focus 5 (deadline half). A 400 queued behind a full socket is a tail like any other.
+test_canned_tail_starts_the_drain_clock :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    filler: [1024] u8;
+    while send(server, filler.data, filler.count, .NOSIGNAL) > 0 {}   // the socket is full
+    send_to_server(peer, "GARBAGE\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0 && c.close_after_send, "setup: the 400 is queued behind the full socket");
+    assert(c.write_start_ms == c.last_write_ms && c.write_start_ms > 0, "a queued canned reply starts the drain clock");
+    assert(c.owed_at_start >= c.pending.count && c.owed == c.owed_at_start, "owed covers the tail and the kernel's share: % / % for a % byte tail",
+        c.owed_at_start, c.owed, c.pending.count);
+    close_connection(*w, c);
+    print("  PASS: test_canned_tail_starts_the_drain_clock\n");
+}
+
+test_check_timeouts_closes_a_slow_drain :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response stalls");
+    assert(c.write_start_ms == c.last_write_ms && c.owed_at_start >= c.pending.count, "the dispatch path starts the drain clock");
+
+    rec: Error_Recorder;
+    ctx := context;
+    ctx.logger      = record_errors;
+    ctx.logger_data = *rec;
+    now := c.write_start_ms + 30000;   // the grace is over and the peer has taken nothing
+    c.last_write_ms = now - 1000;      // progress a second ago: not a stall
+    closed: s32;
+    push_context ctx { closed = check_timeouts(*w, now); }
+    assert(closed == 1 && c.state == .FREE, "a tail past its drain deadline is closed; closed=% state=%", closed, c.state);
+    assert(rec.errors == 0, "a slow client is the client's doing: info, not an error (got % errors)", rec.errors);
+    print("  PASS: test_check_timeouts_closes_a_slow_drain\n");
+}
+
+// The kernel's count of bytes the peer has not taken yet (TIOCOUTQ: unsent plus unacknowledged on TCP).
+kernel_outq :: (fd: s32) -> s64 {
+    n: s32;
+    if ioctl(fd, TIOCOUTQ, *n) != 0  return -1;
+    return n;
+}
+
+// I1 (final review). With a large kernel send buffer, EPOLLOUT comes only after about a third of it
+// has drained, so a reader can take bytes for a long time while our tail never moves. Bytes leaving
+// the kernel toward the peer are progress: the stall check must not cut such a reader.
+test_kernel_drain_counts_as_progress :: () {
+    big_test_body = big_body(524288);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, client := make_tcp_pair(server_sndbuf = 65536, client_rcvbuf = 65536);
+    defer close(client);
+    c := attach(*w, server);
+
+    send_to_server(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response stalls");
+    t0 := c.last_write_ms;
+
+    // The client reads; handle_client(EPOLLOUT) is deliberately not called, as if no edge had come.
+    outq_before := kernel_outq(server);
+    assert(outq_before > 0, "setup: the kernel holds response bytes (TIOCOUTQ %)", outq_before);
+    got: [..] u8;
+    defer array_free(got);
+    spins := 0;
+    while kernel_outq(server) >= outq_before {
+        got.count = 0;
+        client_read(client, *got);
+        spins += 1;
+        assert(spins < 10000000, "setup: the kernel never reported the client's reads");
+    }
+
+    closed := check_timeouts(*w, t0 + 30000);
+    assert(closed == 0 && c.state == .ACTIVE, "a peer taking bytes is progress, flushed or not; closed=% state=%", closed, c.state);
+    assert(c.last_write_ms == t0 + 30000, "the observed drain restarts the WRITE clock, got %", c.last_write_ms);
+    close_connection(*w, c);
+    print("  PASS: test_kernel_drain_counts_as_progress\n");
+}
+
+// Defaults asserted as literals: HEADER_TIMEOUT_MS 10000.
+test_new_connection_state :: () {
+    c: Connection;
+    c.request_start_ms = 5000;   // as accept_connections leaves a fresh connection
+    assert(timeout_state(*c) == .NEW, "accepted, nothing received: NEW, got %", timeout_state(*c));
+    t, s := is_timed_out(*c, 5000 + 9999);
+    assert(!t && s == .NEW, "one ms short of 10 s is fine");
+    t, s = is_timed_out(*c, 5000 + 10000);
+    assert(t && s == .NEW, "a silent new connection times out HEADER_TIMEOUT_MS after accept");
+    c.bytes_used  = 3;
+    c.parse_state = .REQUEST_LINE;
+    t, s = is_timed_out(*c, 5000 + 10000);
+    assert(t && s == .HEADER, "once bytes arrive it is a HEADER wait, still timed from accept");
+    print("  PASS: test_new_connection_state\n");
+}
+
+// M1 (final review, re-graded Important). With HEADER_TIMEOUT_MS = 0 a NEW connection had no limit
+// and a silent socket held its slot forever; before the NEW state it was IDLE and reaped at 60 s.
+// The limits are compile-time parameters, so the rule is a pure helper.
+test_new_connection_limit_falls_back_to_idle :: () {
+    assert(new_connection_limit(10000, 60000) == 10000, "the header limit applies from accept");
+    assert(new_connection_limit(0, 60000) == 60000, "header timeouts off: a silent connection is still reaped as idle");
+    assert(new_connection_limit(0, 0) == 0, "both off: no limit, as configured");
+    print("  PASS: test_new_connection_limit_falls_back_to_idle\n");
+}
+
+test_new_connection_closed_silently :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    lfd := socket(AF_INET, .SOCK_STREAM | .SOCK_NONBLOCK | .SOCK_CLOEXEC, 0);
+    assert(lfd >= 0 && bind(lfd, "127.0.0.1", 0) == 0 && listen(lfd, 16) == 0, "setup: listen socket");
+    defer close(lfd);
+    addr: sockaddr_in;
+    len: socklen_t = size_of(sockaddr_in);
+    getsockname(lfd, cast(*sockaddr) *addr, *len);
+    client := socket(AF_INET, .SOCK_STREAM | .SOCK_CLOEXEC, 0);
+    defer close(client);
+    assert(connect(client, cast(*sockaddr) *addr, len) == 0, "setup: connect");
+    fcntl(client, F_SETFL, O_NONBLOCK);
+
+    w.listen_fd = lfd;
+    accept_connections(*w);
+    w.listen_fd = -1;
+    c: *Connection;
+    for * w.pool.connections  if it.state == .ACTIVE  c = it;
+    assert(c != null && c.request_start_ms > 0 && timeout_state(c) == .NEW, "an accepted connection that sent nothing is NEW, timed from accept");
+    accepted_at := c.request_start_ms;
+
+    closed := check_timeouts(*w, accepted_at + 9999);
+    assert(closed == 0 && c.state == .ACTIVE, "not yet");
+    closed = check_timeouts(*w, accepted_at + 10000);
+    assert(closed == 1 && c.state == .FREE, "closed HEADER_TIMEOUT_MS after accept; closed=% state=%", closed, c.state);
+
+    got: [..] u8;
+    defer array_free(got);
+    n: s64;
+    ended, err: s32;
+    for 1..1000000 {   // the FIN is already on its way; no sleeping
+        n, ended, err = client_read(client, *got);
+        if ended != 0  break;
+    }
+    assert(ended == 1 && got.count == 0, "closed without a reply: EOF and no bytes; ended %, got '%'", ended, as_string(got));
+    print("  PASS: test_new_connection_closed_silently\n");
+}
+
+// PR #6 review: attach() did not stamp request_start_ms the way accept_connections does, so every
+// fake-worker test began IDLE and no server-level test ran a first request through the read path.
+// A connection's first request is timed from accept: its HEADER wait and its BODY wait both.
+test_first_request_timed_from_accept :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+    assert(timeout_state(c) == .NEW && c.request_start_ms == c.last_activity_ms, "attach leaves a connection as accept does: NEW, timed from accept; state %, request_start_ms %", timeout_state(c), c.request_start_ms);
+    c.request_start_ms -= 5000;   // accepted 5 s ago, so a restamp at the first read would show
+    accepted := c.request_start_ms;
+
+    send_to_server(peer, "POST /u HTTP/1.1\r\nHost: x\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .HEADER && c.request_start_ms == accepted, "first bytes: a HEADER wait, still timed from accept; state %, moved by % ms", timeout_state(c), c.request_start_ms - accepted);
+
+    send_to_server(peer, "Content-Length: 10\r\n\r\nabc");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .BODY && c.request_start_ms == accepted, "headers done: a BODY wait, also timed from accept; state %", timeout_state(c));
+    t, s := is_timed_out(c, accepted + 29999);
+    assert(!t && s == .BODY, "one ms short of BODY_TIMEOUT_MS after accept is fine");
+    t, s = is_timed_out(c, accepted + 30000);
+    assert(t && s == .BODY, "BODY_TIMEOUT_MS after accept, not after the first byte");
+    close_connection(*w, c);
+    print("  PASS: test_first_request_timed_from_accept\n");
+}
+
+// PR #6 review (the bug predates the PR): parse_request skipped empty lines before a request line by
+// moving parse_offset alone, so a buffer holding only "\r\n" was a HEADER wait and drew an
+// unsolicited 408 ten seconds later, which a client reusing the connection can take for the answer
+// to its next request. RFC 9112 §2.2 forbids the extra CRLF to clients but tells servers to ignore it.
+test_trailing_empty_line_leaves_connection_idle :: () {
+    c: Connection;
+    fill_request(*c, "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok\r\n");
+    assert(parse_request(*c) == .COMPLETE, "setup: the POST parses");
+    reset_for_next_request(*c);
+    assert(c.bytes_used == 0 && c.request_start_ms == 0, "the empty line is consumed, not the start of a request; bytes_used %, request_start_ms %", c.bytes_used, c.request_start_ms);
+    assert(timeout_state(*c) == .IDLE, "an idle keep-alive connection, got %", timeout_state(*c));
+    print("  PASS: test_trailing_empty_line_leaves_connection_idle\n");
+}
+
+// The same through the read path, where an empty line arrives in a segment of its own: before any
+// request it must not extend the first request's deadline, and between requests it must not start one.
+test_empty_lines_do_not_start_a_request :: () {
+    w: Worker;
+    make_test_worker(*w, ok_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair();
+    defer close(peer);
+    c := attach(*w, server);
+    accepted := c.request_start_ms;
+
+    send_to_server(peer, "\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .NEW && c.request_start_ms == accepted, "an empty line before any request: still NEW, timed from accept; state %", timeout_state(c));
+
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(test_handler_calls == 1, "the request after the empty line is served, handler ran %", test_handler_calls);
+    send_to_server(peer, "\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .IDLE && c.bytes_used == 0 && c.request_start_ms == 0, "an empty line between requests: IDLE; state %, bytes_used %", timeout_state(c), c.bytes_used);
+    close_connection(*w, c);
+    print("  PASS: test_empty_lines_do_not_start_a_request\n");
+}
+
+// Bytes read while a response is pending are buffered unparsed. Were they stamped at the read, an
+// empty line among them would be consumed at the drain and leave a stale stamp: NEW, not IDLE.
+test_empty_line_behind_a_stalled_response :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+
+    send_to_server(peer, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(c.pending.count > 0, "setup: the response must stall");
+    send_to_server(peer, "\r\n");
+    handle_client(*w, c, EPOLLIN);
+    assert(timeout_state(c) == .WRITE && c.bytes_used == 2, "the empty line waits, unparsed, behind the tail");
+
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while c.pending.count > 0 {
+        drain_peer(peer, *got);
+        handle_client(*w, c, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(timeout_state(c) == .IDLE && c.bytes_used == 0 && c.request_start_ms == 0, "after the drain: IDLE; state %, bytes_used %, request_start_ms %", timeout_state(c), c.bytes_used, c.request_start_ms);
+    close_connection(*w, c);
+    print("  PASS: test_empty_line_behind_a_stalled_response\n");
+}
+
+test_tail_refusal :: () {
+    assert(tail_refusal(100, 0, 1000, 5000) == .NONE, "small tail, empty worker");
+    assert(tail_refusal(1000, 0, 1000, 5000) == .NONE, "exactly the connection cap fits");
+    assert(tail_refusal(1001, 0, 1000, 5000) == .OVER_CONNECTION_CAP, "one byte over the connection cap");
+    assert(tail_refusal(1000, 4000, 1000, 5000) == .NONE, "exactly the worker budget fits");
+    assert(tail_refusal(1000, 4001, 1000, 5000) == .OVER_WORKER_BUDGET, "one byte over the worker budget");
+    assert(tail_refusal(2000, 4500, 1000, 5000) == .OVER_CONNECTION_CAP, "the connection cap is checked first");
+    assert(tail_refusal(1, 0, 0, 5000) == .OVER_CONNECTION_CAP, "a cap of 0 queues nothing");
+    print("  PASS: test_tail_refusal\n");
+}
+
+// The test that matters most: a refund missed on any path would leak budget until the worker
+// refused every large response, a slow-motion outage. Review focus 5 (charge half) is step 3.
+test_pending_budget_accounting_balances :: () {
+    assert(standalone_pool.pending_total == 0, "the writer tests left % bytes charged", standalone_pool.pending_total);
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    s1, p1 := make_socket_pair(server_sndbuf = 4096);
+    defer close(p1);
+    s2, p2 := make_socket_pair(server_sndbuf = 4096);
+    defer close(p2);
+    c1 := attach(*w, s1);
+    c2 := attach(*w, s2);
+
+    send_to_server(p1, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    send_to_server(p2, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    handle_client(*w, c1, EPOLLIN);
+    handle_client(*w, c2, EPOLLIN);
+    assert(c1.pending.count > 0 && c2.pending.count > 0, "setup: both responses stall");
+    assert(c1.pending_charge == c1.pending.allocated && c2.pending_charge == c2.pending.allocated, "each tail is charged its reservation");
+    assert(w.pool.pending_total == c1.pending_charge + c2.pending_charge, "the pool total is the sum of its tails: % vs % + %",
+        w.pool.pending_total, c1.pending_charge, c2.pending_charge);
+
+    // 1. A drained tail is refunded.
+    got: [..] u8;
+    defer array_free(got);
+    rounds := 0;
+    while c1.pending.count > 0 {
+        got.count = 0;
+        drain_peer(p1, *got);
+        handle_client(*w, c1, EPOLLOUT);
+        rounds += 1;
+        assert(rounds < 100000, "never drained");
+    }
+    assert(c1.pending_charge == 0 && w.pool.pending_total == c2.pending_charge, "a drained tail is refunded, total now %", w.pool.pending_total);
+
+    // 2. A connection closed with its tail queued is refunded.
+    close_connection(*w, c2);
+    assert(w.pool.pending_total == 0, "a closed connection's tail is refunded, total now %", w.pool.pending_total);
+
+    // 3. A canned reply queued behind a full socket is charged and refunded the same way.
+    filler: [1024] u8;
+    while send(s1, filler.data, filler.count, .NOSIGNAL) > 0 {}
+    send_to_server(p1, "GARBAGE\r\n\r\n");
+    handle_client(*w, c1, EPOLLIN);
+    assert(c1.pending.count > 0 && c1.pending_charge > 0 && w.pool.pending_total == c1.pending_charge, "a queued canned reply is charged: total % vs charge %",
+        w.pool.pending_total, c1.pending_charge);
+    close_connection(*w, c1);
+    assert(w.pool.pending_total == 0, "and refunded, total now %", w.pool.pending_total);
+    print("  PASS: test_pending_budget_accounting_balances\n");
+}
+
+// Defaults asserted as literals: MAX_PENDING_PER_WORKER 67108864.
+test_pending_budget_refuses_and_reports :: () {
+    big_test_body = big_body(262144);
+    defer free(big_test_body);
+    w: Worker;
+    make_test_worker(*w, big_handler);
+    defer destroy_test_worker(*w);
+    server, peer := make_socket_pair(server_sndbuf = 4096);
+    defer close(peer);
+    c := attach(*w, server);
+    w.pool.pending_total = 67108864 - 1000;   // synthetic: the worker budget is all but spent
+
+    rec: Error_Recorder;
+    ctx := context;
+    ctx.logger      = record_errors;
+    ctx.logger_data = *rec;
+    send_to_server(peer, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    push_context ctx { handle_client(*w, c, EPOLLIN); }
+    assert(c.state == .FREE, "a tail over the worker budget closes its connection");
+    assert(w.pool.refused_over_budget == 1 && w.pool.refused_over_connection == 0, "counted as a budget refusal: % / %", w.pool.refused_over_budget, w.pool.refused_over_connection);
+    assert(w.pool.pending_total == 67108864 - 1000, "a refused tail charges nothing");
+    assert(rec.errors == 0, "the refusal itself logs nothing; the sweep reports it (got %)", rec.errors);
+
+    push_context ctx { worker_sweep(*w, now_ms()); }
+    assert(rec.errors == 1, "one summary line per sweep, got %", rec.errors);
+    assert(w.pool.refused_over_budget == 0, "the sweep resets the counts");
+    push_context ctx { worker_sweep(*w, now_ms()); }
+    assert(rec.errors == 1, "nothing to report, nothing logged (got %)", rec.errors);
+    w.pool.pending_total = 0;
+    print("  PASS: test_pending_budget_refuses_and_reports\n");
 }
 
 // R13. send_canned makes one attempt and ignores EAGAIN and short writes, then the connection
@@ -2211,7 +3004,6 @@ main :: () {
     test_handle_client_header_clock_restarts_at_drain();
     test_close_with_unread_input_keeps_response();
     test_too_many_headers_refused();
-    test_transfer_encoding_refused();
     test_host_required_once();
     test_long_request_target_gets_414();
     test_canned_replies_carry_date();
@@ -2228,6 +3020,23 @@ main :: () {
     test_check_timeouts_sends_408_for_a_slow_header();
     test_check_timeouts_skips_free_slots_and_listener();
     test_reads_do_not_extend_write_timeout();
+    test_drain_deadline();
+    test_start_write_clock_records_owed();
+    test_rate_floor_catches_a_steady_trickle();
+    test_canned_tail_starts_the_drain_clock();
+    test_check_timeouts_closes_a_slow_drain();
+    test_kernel_drain_counts_as_progress();
+    test_new_connection_state();
+    test_new_connection_limit_falls_back_to_idle();
+    test_new_connection_closed_silently();
+    test_first_request_timed_from_accept();
+    test_trailing_empty_line_leaves_connection_idle();
+    test_empty_lines_do_not_start_a_request();
+    test_empty_line_behind_a_stalled_response();
+    print("\nPending budget:\n");
+    test_tail_refusal();
+    test_pending_budget_accounting_balances();
+    test_pending_budget_refuses_and_reports();
 
     print("\nDate header and buffer shift:\n");
     test_format_http_date();
@@ -2274,6 +3083,19 @@ main :: () {
     test_field_value_controls_rejected();
     test_host_syntax_validated();
     test_zero_padded_content_length();
+    print("\nChunked bodies:\n");
+    test_chunked_decodes_in_place();
+    test_chunked_grammar_refused();
+    test_chunk_size_limits();
+    test_chunk_size_overflow_rejected();
+    test_transfer_encoding_rules();
+    test_chunked_request_decoded();
+    test_chunked_trailers_cannot_reframe();
+    test_chunked_pipelined_with_get();
+    test_chunked_then_partial_next_request();
+    test_chunked_behind_stalled_response();
+    test_chunked_buffer_edge();
+    test_chunked_trickle_gets_408();
 
     print("\nPipelining:\n");
     test_reset_for_next_request();

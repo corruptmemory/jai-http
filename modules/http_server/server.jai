@@ -153,9 +153,9 @@ refresh_date :: (w: *Worker) {
 //
 // A connection is bounded by one timeout at a time, chosen by what it is waiting for. A request
 // that has fully arrived has no deadline: the handler runs synchronously and request_start_ms is
-// cleared before dispatch. Sweeps run once a second from worker_run when any timeout is enabled.
+// cleared before dispatch. Sweeps run once a second from worker_run.
 
-TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0 || LINGER_TIMEOUT_MS > 0;
+TIMEOUTS_ENABLED :: IDLE_TIMEOUT_MS > 0 || HEADER_TIMEOUT_MS > 0 || BODY_TIMEOUT_MS > 0 || WRITE_TIMEOUT_MS > 0 || LINGER_TIMEOUT_MS > 0 || MIN_SEND_RATE > 0;
 
 Timeout_State :: enum u8 #specified {
     NONE   :: 0;
@@ -164,24 +164,96 @@ Timeout_State :: enum u8 #specified {
     BODY   :: 3;   // headers complete, body incomplete
     WRITE  :: 4;   // response tail pending
     LINGER :: 5;   // lingering close: final response sent, discarding input until EOF
+    NEW    :: 6;   // accepted, no byte received yet: the first request's HEADER clock, from accept
 }
 
 timeout_state :: (c: *Connection) -> Timeout_State {
     if c.lingering                return .LINGER;
     if c.pending.count > 0        return .WRITE;
-    if c.bytes_used == 0          return .IDLE;
-    if c.parse_state == .BODY     return .BODY;
+    if c.bytes_used == 0 {
+        // accept_connections stamps request_start_ms; dispatch_buffered sets it only when it is zero
+        // and a partial request is buffered, and reset_for_next_request clears it, so this
+        // combination means nothing has arrived yet (empty lines are consumed, not buffered).
+        if c.request_start_ms != 0  return .NEW;
+        return .IDLE;
+    }
+    if c.parse_state == .BODY || c.parse_state == .CHUNKED  return .BODY;
     if c.parse_state == .COMPLETE return .NONE;   // never observed by the sweep; defensive
     return .HEADER;
 }
 
+// drain_deadline multiplies the bytes a peer has taken (at most a tail plus the kernel's send
+// buffer) by 1000, and arithmetic overflow is FATAL in every build.
+#assert MAX_PENDING_BYTES <= 9000000000000 "MAX_PENDING_BYTES is too large for drain_deadline's arithmetic";
+
+// When `bytes` taken by the peer since `start` stop honoring a minimum average rate after a grace
+// period: start + grace_ms + bytes / rate (rate in bytes per second). The deadline moves forward with
+// every byte the peer takes. NO_DRAIN_DEADLINE when rate <= 0: no floor, and `now >= deadline` never
+// holds. Takes its limits as arguments so tests can drive any value.
+NO_DRAIN_DEADLINE :: 0x7fff_ffff_ffff_ffff;
+
+drain_deadline :: (start: s64, bytes: s64, grace_ms: s64, rate: s64) -> s64 {
+    if rate <= 0  return NO_DRAIN_DEADLINE;
+    return start + grace_ms + bytes * 1000 / rate;
+}
+
+// Bytes still owed to the peer: what is left of our tail plus what the kernel holds for it (TIOCOUTQ:
+// unsent and unacknowledged bytes on TCP). A flush moves bytes from the tail into the kernel without
+// changing this; only the peer taking bytes lowers it. If the query fails, the kernel part counts as
+// 0 and progress falls back to our own flushes.
+owed_bytes :: (c: *Connection) -> s64 {
+    kernel: s32;
+    if ioctl(c.fd, TIOCOUTQ, *kernel) != 0  kernel = 0;
+    return (c.pending.count - c.pending_offset) + kernel;
+}
+
+// A response tail was just queued: start the clocks the WRITE timeout and the rate floor read.
+start_write_clock :: (c: *Connection, now: s64) {
+    c.last_write_ms  = now;
+    c.write_start_ms = now;
+    c.owed_at_start  = owed_bytes(c);
+    c.owed           = c.owed_at_start;
+}
+
+// The sweep's look at a connection with a queued tail. Bytes leaving the kernel toward the peer are
+// progress even when no EPOLLOUT edge has let us flush: with a multi-megabyte send buffer that edge
+// comes only after about a third of the buffer has drained, tens of seconds for a slow reader.
+observe_drain :: (c: *Connection, now: s64) {
+    o := owed_bytes(c);
+    if o < c.owed  c.last_write_ms = now;
+    c.owed = o;
+}
+
+// The rate floor: once the WRITE_TIMEOUT_MS grace has passed, the peer must have taken at least
+// MIN_SEND_RATE bytes per second, on average, since the tail started. Counted in bytes the peer took
+// (including those the kernel already held), so a reader at or above the floor is never cut.
+write_too_slow :: inline (c: *Connection, now: s64) -> bool {
+    if MIN_SEND_RATE <= 0 || c.write_start_ms == 0  return false;
+    taken := c.owed_at_start - c.owed;
+    if taken < 0  taken = 0;
+    return now >= drain_deadline(c.write_start_ms, taken, WRITE_TIMEOUT_MS, MIN_SEND_RATE);
+}
+
+// The NEW limit: HEADER_TIMEOUT_MS from accept, or IDLE_TIMEOUT_MS when header timeouts are off, so
+// a silent connection is never held forever (it was IDLE before the NEW state existed). 0 only when
+// both are off.
+new_connection_limit :: (header_ms: s64, idle_ms: s64) -> s64 {
+    return ifx header_ms > 0 then header_ms else idle_ms;
+}
+
 is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_State) {
     state := timeout_state(c);
+    if state == .WRITE {
+        // Two limits on a queued tail: a stall (no progress for WRITE_TIMEOUT_MS; input does not
+        // count) and the rate floor (not drained by its deadline, however steadily it trickles).
+        stalled := WRITE_TIMEOUT_MS > 0 && now - c.last_write_ms >= WRITE_TIMEOUT_MS;
+        return stalled || write_too_slow(c, now), state;
+    }
     limit: s64 = 0;
     since: s64 = 0;
     if state == {
         case .IDLE;   limit = IDLE_TIMEOUT_MS;   since = c.last_activity_ms;
-        case .WRITE;  limit = WRITE_TIMEOUT_MS;  since = c.last_write_ms;   // write progress only; input does not count
+        case .NEW;    limit = new_connection_limit(HEADER_TIMEOUT_MS, IDLE_TIMEOUT_MS); since = c.request_start_ms;   // from accept
         case .HEADER; limit = HEADER_TIMEOUT_MS; since = c.request_start_ms;
         case .BODY;   limit = BODY_TIMEOUT_MS;   since = c.request_start_ms;
         case .LINGER; limit = LINGER_TIMEOUT_MS; since = c.last_activity_ms;   // set on entering linger
@@ -192,28 +264,46 @@ is_timed_out :: (c: *Connection, now: s64) -> (timed_out: bool, state: Timeout_S
 }
 
 // Close every active connection whose timeout has passed. Returns how many were closed. A slow
-// request gets a 408 through refuse_and_close: the client may still be sending, so the reply
-// needs the same drain-before-close to survive.
+// request gets a 408 through refuse_and_close (which logs it): the client may still be sending, so
+// the reply needs the same drain-before-close to survive. Every other timeout closes silently.
 check_timeouts :: (w: *Worker, now: s64) -> s32 {
     closed: s32 = 0;
     for * w.pool.connections {
         c := it;
         if c.state != .ACTIVE || c == w.listen_conn  continue;
+        if timeout_state(c) == .WRITE  observe_drain(c, now);   // before judging: the peer may have taken bytes
         timed_out, state := is_timed_out(c, now);
         if !timed_out  continue;
-        Basic.log("fd %: % timeout; closing", c.fd, state);
-        if state == .HEADER || state == .BODY  refuse_and_close(w, c, 408);
-        else                                   close_connection(w, c);
+        if state == .HEADER || state == .BODY {
+            refuse_and_close(w, c, 408);
+        } else {
+            detail := ifx state == .WRITE && write_too_slow(c, now) then " (drained slower than MIN_SEND_RATE)" else "";
+            Basic.log("fd %: % timeout%; closing", c.fd, state, detail);
+            close_connection(w, c);
+        }
         closed += 1;
     }
     return closed;
 }
 
-// The once-a-second work of worker_run: timeouts, and retrying accepts paused by fd or memory
-// exhaustion (an edge-triggered listen socket would not report the waiting backlog again).
+// The once-a-second work of worker_run: timeouts, retrying accepts paused by fd or memory
+// exhaustion (an edge-triggered listen socket would not report the waiting backlog again), and the
+// tail-refusal report.
 worker_sweep :: (w: *Worker, now: s64) {
     #if TIMEOUTS_ENABLED  check_timeouts(w, now);
     if w.accept_paused  accept_connections(w);
+    report_refused_tails(w);
+}
+
+// Tail refusals are a failure to serve, but a client can trigger one per request: one log_error
+// line per worker per second with the counts, not one per refusal.
+report_refused_tails :: (w: *Worker) {
+    p := *w.pool;
+    if p.refused_over_connection == 0 && p.refused_over_budget == 0  return;
+    Basic.log_error("Worker %: closed % connection(s) whose response tail exceeded MAX_PENDING_BYTES (%) and % that would have exceeded MAX_PENDING_PER_WORKER (%) in the last second",
+        w.id, p.refused_over_connection, MAX_PENDING_BYTES, p.refused_over_budget, MAX_PENDING_PER_WORKER);
+    p.refused_over_connection = 0;
+    p.refused_over_budget     = 0;
 }
 
 accept_connections :: (w: *Worker) {
@@ -254,6 +344,7 @@ accept_connections :: (w: *Worker) {
         }
         c.fd = conn_fd;
         c.last_activity_ms = now_ms();
+        c.request_start_ms = c.last_activity_ms;   // NEW: the first request is timed from accept, as nginx does
 
         // Write interest is armed once for the connection's whole life. Edge-triggered OUT only
         // fires on the full-to-writable transition, so it costs nothing while there is room, and
@@ -332,10 +423,11 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
                 c.read_stalled = true;
                 return true;
             }
-            // A full buffer with no complete request: the request line (414) or the header block
-            // (431) alone exceeds READ_BUFFER_SIZE.
+            // A full buffer with no complete request: the request line (414), the header block
+            // (431) or a chunked body (413) alone exceeds READ_BUFFER_SIZE.
             status: u16 = 431;
             if c.parse_state == .REQUEST_LINE  status = 414;
+            if c.parse_state == .CHUNKED       status = 413;
             refuse_and_close(w, c, status);
             return false;
         }
@@ -359,7 +451,6 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
 
         c.bytes_used += n;
         c.last_activity_ms = now_ms();
-        if c.request_start_ms == 0  c.request_start_ms = c.last_activity_ms;
         if !dispatch_buffered(w, c)  return false;
     }
     return true;   // unreachable; `while true` alone does not satisfy the return-path check
@@ -370,7 +461,13 @@ read_and_dispatch :: (w: *Worker, c: *Connection) -> bool {
 dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
     while c.pending.count == 0 {
         result := parse_request(c);
-        if result == .INCOMPLETE  return true;
+        if result == .INCOMPLETE {
+            // A partial request's clock starts when its first bytes are parsed: empty lines were
+            // consumed and start nothing, and bytes read while output was pending are timed from
+            // the drain that lets them be parsed. A NEW connection keeps its stamp from accept.
+            if c.request_start_ms == 0 && c.bytes_used > 0  c.request_start_ms = c.last_activity_ms;
+            return true;
+        }
         if result == .ERROR {
             refuse_and_close(w, c, parse_error_status(c.parse_error));
             return false;
@@ -396,9 +493,8 @@ dispatch_buffered :: (w: *Worker, c: *Connection) -> bool {
         Pool_Module.reset(*w.request_pool);   // recycle this request's Pool blocks (handler + header)
         now := now_ms();
         c.last_activity_ms = now;
-        c.last_write_ms    = now;   // a tail queued now starts the WRITE clock
-
         if wr == .ERROR { close_connection(w, c); return false; }
+        if wr == .PENDING  start_write_clock(c, now);   // the WRITE and drain-rate clocks
         keep_alive := c.req.keep_alive;
         reset_for_next_request(c);
         if wr == .PENDING {
@@ -418,7 +514,7 @@ refuse_and_close :: (w: *Worker, c: *Connection, status: u16) {
     if r == .ERROR { close_connection(w, c); return; }
     if r == .PENDING {
         c.close_after_send = true;
-        c.last_write_ms    = now_ms();
+        start_write_clock(c, now_ms());
         return;
     }
     linger_close(w, c);
@@ -518,9 +614,9 @@ worker_listen :: (w: *Worker, address: string, port: u16) -> bool {
 worker_run :: (w: *Worker) {
     last_sweep := now_ms();
     while w.running {
-        wait_ms: s32 = -1;
-        if TIMEOUTS_ENABLED || w.accept_paused  wait_ms = 1000;
-        nfds := epoll_process_events(*w.engine, timeout_ms = wait_ms);
+        // Wake at least once a second, whatever is enabled, so the sweep always runs: a refusal
+        // count must never be stranded. A 1 Hz wakeup per worker costs nothing measurable.
+        nfds := epoll_process_events(*w.engine, timeout_ms = 1000);
         if nfds < 0 {
             err := errno();
             if err == EINTR continue;
